@@ -1,0 +1,35 @@
+[package]
+name = "git-remote-e2ee"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "End-to-end encrypted Git remote helper for untrusted storage"
+repository = "https://github.com/combinatrix-ai/git-remote-e2ee"
+homepage = "https://github.com/combinatrix-ai/git-remote-e2ee"
+documentation = "https://docs.rs/git-remote-e2ee"
+readme = "README.md"
+autobins = false
+
+[[bin]]
+name = "git-e2ee"
+path = "src/main.rs"
+
+[[bin]]
+name = "git-remote-e2ee"
+path = "src/bin/git-remote-e2ee.rs"
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+chacha20poly1305 = "0.10"
+clap = { version = "4.5", features = ["derive"] }
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+fs2 = "0.4"
+hex = "0.4"
+rand = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2.0"
+tempfile = "3.14"
+zeroize = { version = "1.8", features = ["derive"] }
