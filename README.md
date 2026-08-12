@@ -38,6 +38,41 @@ Git packs, and a backend-neutral compare-and-swap storage contract. In
 particular, the carrier-Git backend does not require uploading the entire inner
 repository on every update.
 
+## Comparison with existing tools
+
+These projects solve two different problems. File-filter tools keep an ordinary
+Git repository useful to its host while hiding selected blob contents. Encrypted
+remote helpers hide the repository as a whole, which also removes server-side
+diffs, pull requests, search, and CI over the plaintext.
+
+| | [`git-crypt`](https://github.com/AGWA/git-crypt) | [`transcrypt`](https://github.com/elasticdog/transcrypt) | [`git-remote-gcrypt`](https://github.com/spwhitton/git-remote-gcrypt) | `git-remote-e2ee` |
+|---|---|---|---|---|
+| Primary use | Encrypt selected files | Encrypt selected files | Encrypt a complete Git remote | Encrypt a complete Git remote |
+| Integration | Git clean/smudge filters | Git clean/smudge filters | Git remote helper | Git remote helper |
+| Hidden from host | Selected blob contents | Selected blob contents | Inner objects, refs, and encrypted manifest contents | Inner objects, refs, paths, authors, messages, and manifest contents |
+| Host retains normal Git features | Yes, for visible repository data | Yes, for visible repository data | No | No |
+| Update granularity | Per encrypted file; a changed encrypted file is stored again | Per encrypted file | Backend-dependent; Git and SFTP backends may retransmit full history | Incremental Git packs on filesystem and carrier-Git backends |
+| Integrity model | Git repository integrity plus deterministic encrypted blobs | Git repository integrity plus encrypted blobs | Encrypted and signed manifest; ciphertext-addressed packs | AEAD packs/manifests, Ed25519 manifest chain, and per-client history pinning |
+| Key and collaborator model | Symmetric key or GPG users | Shared passphrase | GPG participants and symmetric mode | Single repository key file today; multi-device authorization is planned |
+| Maturity | Established | Established | Established | Experimental prototype |
+
+The closest comparison is `git-remote-gcrypt`. It already supports participant
+management and several transports, making it the more mature choice today.
+`git-remote-e2ee` is exploring a different storage protocol: immutable
+incremental packs plus an explicit compare-and-swap head, modern AEAD, and a
+signed history chain that returning clients pin locally. According to
+`git-remote-gcrypt`'s
+[`PERFORMANCE` documentation](https://manpages.debian.org/trixie/git-remote-gcrypt/git-remote-gcrypt.1.en.html#PERFORMANCE),
+its arbitrary Git and SFTP transports upload the complete repository history on
+each push; its rsync backend behaves differently. The comparison is therefore
+backend-specific, not a claim that every `git-remote-gcrypt` update is a full
+upload.
+
+If you need to protect a few secrets while retaining GitHub or GitLab features,
+use a file-filter tool. If the storage provider must not learn the repository
+structure or metadata, use a whole-remote encryption design—and, for now, treat
+this project as research-grade software.
+
 ## Current features
 
 - Normal Git remote-helper workflow for clone, fetch, pull, and push
