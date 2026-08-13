@@ -33,8 +33,9 @@ This differs from [`git-crypt`](https://github.com/AGWA/git-crypt), which is
 designed to encrypt selected files inside an otherwise normal repository. It is
 closer to
 [`git-remote-gcrypt`](https://github.com/spwhitton/git-remote-gcrypt), but uses
-modern authenticated encryption, an explicit signed manifest chain, incremental
-Git packs, and a backend-neutral compare-and-swap storage contract. In
+modern authenticated encryption, a signed policy and manifest chain,
+per-device keys, incremental Git packs, and a backend-neutral compare-and-swap
+storage contract. In
 particular, the carrier-Git backend does not require uploading the entire inner
 repository on every update.
 
@@ -52,8 +53,8 @@ diffs, pull requests, search, and CI over the plaintext.
 | Hidden from host | Selected blob contents | Selected blob contents | Inner objects, refs, and encrypted manifest contents | Inner objects, refs, paths, authors, messages, and manifest contents |
 | Host retains normal Git features | Yes, for visible repository data | Yes, for visible repository data | No | No |
 | Update granularity | Per encrypted file; a changed encrypted file is stored again | Per encrypted file | Backend-dependent; Git and SFTP backends may retransmit full history | Incremental Git packs on filesystem and carrier-Git backends |
-| Integrity model | Git repository integrity plus deterministic encrypted blobs | Git repository integrity plus encrypted blobs | Encrypted and signed manifest; ciphertext-addressed packs | AEAD packs/manifests, Ed25519 manifest chain, and per-client history pinning |
-| Key and collaborator model | Symmetric key or GPG users | Shared passphrase | GPG participants and symmetric mode | Single repository key file today; multi-device authorization is planned |
+| Integrity model | Git repository integrity plus deterministic encrypted blobs | Git repository integrity plus encrypted blobs | Encrypted and signed manifest; ciphertext-addressed packs | AEAD packs/manifests, signed policy and manifest chains, and per-client history pinning |
+| Key and collaborator model | Symmetric key or GPG users | Shared passphrase | GPG participants and symmetric mode | Per-repository device keys; any authorized device can decrypt independently; writers and administrators are separate roles |
 | Maturity | Established | Established | Established | Experimental prototype |
 
 The closest comparison is `git-remote-gcrypt`. It already supports participant
@@ -76,13 +77,20 @@ this project as research-grade software.
 ## Current features
 
 - Normal Git remote-helper workflow for clone, fetch, pull, and push
-- XChaCha20-Poly1305 authenticated encryption for Git packs and manifests
-- Ed25519-signed, append-only manifest chain
+- Per-device HPKE (X25519/HKDF-SHA-256/ChaCha20-Poly1305) epoch-key envelopes
+- Random per-pack and per-manifest keys with XChaCha20-Poly1305 encryption
+- Ed25519-signed, append-only policy and manifest chains
+- 1-of-N recipient access: each authorized device unlocks with only its own key
+- Separate reader, writer, and administrator authorization
+- Atomic device revocation, epoch rotation, and pack-key rewrapping without
+  re-encrypting pack ciphertext
 - Incremental Git packs rather than full repository snapshots
 - Client-side fast-forward enforcement and explicit force push
 - Atomic stale-writer rejection through compare-and-swap
 - Per-client rollback and manifest-fork detection after first observation
-- Complete manifest-chain and ciphertext verification
+- Complete current pack-ciphertext verification plus signed manifest-header and
+  policy-chain verification (newly added devices use their add checkpoint for
+  encrypted history they were not previously wrapped into)
 - Filesystem storage backend
 - Carrier-Git backend for GitHub, GitLab, a bare repository, or another ordinary
   Git remote
@@ -127,6 +135,53 @@ git fetch private
 The key path is local Git configuration. The key file is never written to the
 encrypted remote and must never be committed.
 
+## Add and revoke devices
+
+Each device has a different private key. Only the small public device file is
+given to an administrator. If machine A created the repository, set up machine
+B like this (substitute the repository root printed by A's `keygen`):
+
+```console
+# Machine B
+git-e2ee keygen \
+  --repository-root <repository-root> \
+  --output /safe/place/machine-b.key.json
+git-e2ee device-export \
+  --key /safe/place/machine-b.key.json \
+  --output machine-b.public.json
+
+# Machine A, after receiving only machine-b.public.json
+git-e2ee device-add \
+  --storage /srv/encrypted/example \
+  --key /safe/place/repository.key.json \
+  --device machine-b.public.json
+```
+
+The default added device can read and write but cannot change policy. Pass
+`--admin` to grant administration too. `git-e2ee device-list` prints opaque
+device IDs; revoke one with:
+
+```console
+git-e2ee device-revoke \
+  --storage /srv/encrypted/example \
+  --key /safe/place/repository.key.json \
+  --device-id <device-id>
+```
+
+For a carrier-Git backend, use `--remote <carrier-url>` instead of `--storage`
+with `device-add`, `device-list`, and `device-revoke`.
+
+Adding a device wraps the current epoch key to it and does not rewrite packs.
+Revoking a reader creates a new epoch key and rewraps every small pack key in
+one compare-and-swap publication; the large encrypted packs stay unchanged.
+The CLI keeps an administrative continuity pin next to the administrator key as
+`<key-file>.admin-state.json`. Preserve that file together with the key.
+
+This is deliberately **not multisig**. The current implementation accepts one
+authorized administrator signature for a policy change. The wire format has an
+administrator threshold and signature array so a future version can add M-of-N,
+but this version fails closed on any threshold other than 1.
+
 ## Carrier-Git backend
 
 An ordinary Git repository can act as the ciphertext carrier. It may be empty
@@ -162,7 +217,8 @@ refs/heads/git-remote-e2ee
 └── e2ee/
     ├── HEAD
     ├── objects/aa/<opaque-id>/00000000
-    └── manifests/bb/<opaque-id>/00000000
+    ├── manifests/bb/<opaque-id>/00000000
+    └── policies/cc/<opaque-id>/00000000
 ```
 
 Ciphertext is divided into 32 MiB chunks so it can be carried as ordinary Git
@@ -182,6 +238,8 @@ The current security claim is:
 - confidentiality of inner repository contents and Git metadata;
 - authenticity and integrity of fetched repository state;
 - continuity from the state previously observed by the same local clone.
+- forward confidentiality exclusion after an atomic device revocation and
+  epoch rotation.
 
 It does **not** independently prevent:
 
@@ -190,12 +248,24 @@ It does **not** independently prevent:
 - freezing a client at its last valid state;
 - deletion or denial of service by storage;
 - destructive changes made by an authorized writer;
-- disclosure after the repository key is compromised.
+- disclosure of data a revoked device could access before its revocation;
+- retroactive disclosure of every epoch ever wrapped to a later-compromised
+  device key (the protocol has no forward secrecy for stored history);
+- a revoked writer and colluding storage presenting a pre-revocation fork to a
+  fresh or stale client;
+- policy rollback, freezing, or equivocation presented to a fresh client.
 
 Global rollback and equivocation resistance require gossip or an external
-transparency anchor. The current key file is also a single-writer prototype; a
-device registry, recovery policy, and key revocation hierarchy are not yet
-implemented.
+transparency anchor. A returning clone pins both manifest and policy generation.
+The administrative CLI also pins its last published state and does not
+automatically retry a lost CAS race; inspect the winner and rerun the operation.
+
+Policy objects must remain plaintext-structured so a newly added device can
+find its encrypted epoch-key envelope without already knowing that epoch key.
+Consequently the storage host can see device count, per-repository public keys,
+roles, revocation events, policy generation, and epoch number. Device keys
+should never be reused between repositories. Inner refs, object IDs, paths,
+authors, messages, pack keys, and contents remain encrypted.
 
 ## Storage protocol
 
@@ -229,6 +299,8 @@ The test suite includes:
 - incremental push and reconstruction into a fresh repository;
 - native clone, fetch, pull, push, dry-run, refspec, and force-push behavior;
 - rollback, same-generation fork, and ciphertext-tampering rejection;
+- independent device add/read/write, non-admin rejection, genesis-substitution
+  rejection, administrative rollback pinning, and multi-pack revoke/rewrap;
 - two independent carrier writers racing real `git push` processes, with
   exactly one winner;
 - plaintext-absence checks across carrier history;
@@ -243,8 +315,8 @@ request limits, and provider-specific policy.
 
 ## Roadmap
 
-- Multi-device writer registry and recovery authorization
-- KEK/DEK hierarchy, device envelopes, rotation, and revocation
+- M-of-N administrative authorization (future format version; threshold 1 only today)
+- Recovery and device-key replacement workflows
 - Automatic stale-push fetch/retry workflow
 - Persistent partial-clone cache for large carrier repositories
 - S3 conditional-write backend and provider compatibility suite

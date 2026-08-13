@@ -39,6 +39,19 @@ fn commit(repo: &Path, contents: &str, message: &str) -> String {
     git(repo, &["rev-parse", "HEAD"])
 }
 
+fn copy_tree(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination).unwrap();
+    for entry in fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let target = destination.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
 #[test]
 fn pushes_incrementally_and_fetches_into_another_repository() {
     let temporary = tempfile::tempdir().unwrap();
@@ -230,6 +243,7 @@ fn rejects_same_generation_manifest_fork_after_fetch_pins_history() {
         .join(&fork_head);
     fs::create_dir_all(remote_manifest.parent().unwrap()).unwrap();
     fs::copy(fork_manifest, remote_manifest).unwrap();
+    copy_tree(&fork_path.join("policies"), &remote_path.join("policies"));
     fs::write(remote_path.join("HEAD"), format!("{fork_head}\n")).unwrap();
 
     let error = encrypted.fetch_into(&destination, "encrypted").unwrap_err();

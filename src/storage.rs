@@ -28,6 +28,7 @@ pub trait Storage {
 pub enum ObjectKind {
     Pack,
     Manifest,
+    Policy,
 }
 
 impl ObjectKind {
@@ -35,6 +36,7 @@ impl ObjectKind {
         match self {
             Self::Pack => "objects",
             Self::Manifest => "manifests",
+            Self::Policy => "policies",
         }
     }
 }
@@ -52,6 +54,7 @@ impl FilesystemStorage {
     pub fn initialize(&self) -> Result<()> {
         fs::create_dir_all(self.root.join("objects"))?;
         fs::create_dir_all(self.root.join("manifests"))?;
+        fs::create_dir_all(self.root.join("policies"))?;
         Ok(())
     }
 

@@ -53,6 +53,19 @@ fn initialize_git(repo: &Path) {
     );
 }
 
+fn copy_tree(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination).unwrap();
+    for entry in fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let target = destination.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
 #[test]
 fn native_git_push_and_fetch_use_the_remote_helper() {
     let temporary = tempfile::tempdir().unwrap();
@@ -290,6 +303,7 @@ fn native_git_fetch_rejects_same_generation_manifest_fork() {
         .join(&fork_head);
     fs::create_dir_all(remote_manifest.parent().unwrap()).unwrap();
     fs::copy(fork_manifest, remote_manifest).unwrap();
+    copy_tree(&fork_path.join("policies"), &remote_path.join("policies"));
     fs::write(remote_path.join("HEAD"), format!("{fork_head}\n")).unwrap();
 
     let output = git_output(&destination, &["fetch", "private"], true);
