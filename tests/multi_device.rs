@@ -92,12 +92,14 @@ fn two_devices_can_decrypt_and_push_independently() {
 }
 
 #[test]
-fn revocation_rotates_generation_key_without_rewriting_history() {
+fn revoked_reader_cannot_reach_later_history_but_keeps_prior_snapshot() {
     let temp = tempfile::tempdir().unwrap();
     let remote = temp.path().join("remote");
     let source = temp.path().join("source");
+    let client_b = temp.path().join("client-b");
     let admin_pin = temp.path().join("a-admin-state.json");
     initialize_git(&source);
+    initialize_git(&client_b);
 
     let key_a = KeyFile::generate();
     let key_b = KeyFile::generate_for_repository(key_a.repository_root.clone()).unwrap();
@@ -105,9 +107,9 @@ fn revocation_rotates_generation_key_without_rewriting_history() {
     let repo_a = EncryptedRepository::new(FilesystemStorage::new(&remote), key_a.clone());
     repo_a.initialize().unwrap();
     repo_a.pin_admin_state(&admin_pin).unwrap();
-    commit(&source, "before revoke\n", "before revoke");
+    let before = commit(&source, "before revoke\n", "before revoke");
     repo_a.push_ref(&source, "refs/heads/main", false).unwrap();
-    commit(&source, "second pack\n", "second pack");
+    let before_tip = commit(&source, "second pack\n", "second pack");
     repo_a.push_ref(&source, "refs/heads/main", false).unwrap();
     assert_eq!(count_files(&remote.join("objects")), 2);
     repo_a
@@ -118,17 +120,85 @@ fn revocation_rotates_generation_key_without_rewriting_history() {
         )
         .unwrap();
     assert_eq!(count_files(&remote.join("objects")), 2);
+    let repo_b = EncryptedRepository::new(FilesystemStorage::new(&remote), key_b.clone());
+    repo_b.fetch_into(&client_b, "e2ee").unwrap();
+    assert_eq!(
+        git(&client_b, &["show", "refs/remotes/e2ee/main:note.md"]),
+        "second pack"
+    );
+    git(
+        &client_b,
+        &["switch", "-q", "-c", "main", "refs/remotes/e2ee/main"],
+    );
     let before_revoke = temp.path().join("before-revoke");
     copy_directory(&remote, &before_revoke);
+    let old_objects = snapshot_files(&remote.join("objects"));
 
     repo_a
         .revoke_device(&key_b.device_id().unwrap(), &admin_pin)
         .unwrap();
     assert_eq!(count_files(&remote.join("objects")), 2);
-    let repo_b = EncryptedRepository::new(FilesystemStorage::new(&remote), key_b.clone());
     assert!(repo_b.current_manifest().is_err());
-    let old_repo_b = EncryptedRepository::new(FilesystemStorage::new(&before_revoke), key_b);
-    assert_eq!(old_repo_b.current_manifest().unwrap().1.total_pack_count, 2);
+
+    let after = commit(&source, "after revoke secret\n", "after revoke");
+    repo_a.push_ref(&source, "refs/heads/main", false).unwrap();
+    assert_eq!(count_files(&remote.join("objects")), 3);
+    for (path, contents) in old_objects {
+        assert_eq!(fs::read(path).unwrap(), contents);
+    }
+
+    let fetch_error = repo_b
+        .fetch_into(&client_b, "e2ee")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        fetch_error.contains("not an active reader"),
+        "unexpected fetch error: {fetch_error}"
+    );
+    assert_eq!(
+        git(&client_b, &["rev-parse", "refs/remotes/e2ee/main"]),
+        before_tip
+    );
+    assert!(!git_status(&client_b, &["cat-file", "-e", &after]));
+
+    commit(&client_b, "revoked writer\n", "revoked writer");
+    let push_error = repo_b
+        .push_update_for_remote(
+            &client_b,
+            "e2ee",
+            "refs/heads/main",
+            "refs/heads/main",
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        push_error.contains("not an active reader"),
+        "unexpected push error: {push_error}"
+    );
+    assert!(repo_b.verify().is_err());
+
+    let snapshot_destination = temp.path().join("snapshot-destination");
+    initialize_git(&snapshot_destination);
+    let old_repo_b =
+        EncryptedRepository::new(FilesystemStorage::new(&before_revoke), key_b.clone());
+    old_repo_b
+        .fetch_into(&snapshot_destination, "snapshot")
+        .unwrap();
+    assert_eq!(
+        git(
+            &snapshot_destination,
+            &["show", "refs/remotes/snapshot/main:note.md"]
+        ),
+        "second pack"
+    );
+    assert_eq!(
+        git(
+            &snapshot_destination,
+            &["show", &format!("{before}:note.md")]
+        ),
+        "before revoke"
+    );
 
     repo_a
         .add_device(
@@ -137,16 +207,20 @@ fn revocation_rotates_generation_key_without_rewriting_history() {
             &admin_pin,
         )
         .unwrap();
-    assert_eq!(count_files(&remote.join("objects")), 2);
+    assert_eq!(count_files(&remote.join("objects")), 3);
     let destination = temp.path().join("destination");
     initialize_git(&destination);
     let repo_c = EncryptedRepository::new(FilesystemStorage::new(&remote), key_c);
     let manifest = repo_c.fetch_into(&destination, "e2ee").unwrap();
     repo_c.verify().unwrap();
-    assert_eq!(manifest.total_pack_count, 2);
+    assert_eq!(manifest.total_pack_count, 3);
     assert_eq!(
         git(&destination, &["show", "refs/remotes/e2ee/main:note.md"]),
-        "second pack"
+        "after revoke secret"
+    );
+    assert_eq!(
+        git(&destination, &["show", &format!("{before}:note.md")]),
+        "before revoke"
     );
 }
 
@@ -292,4 +366,31 @@ fn count_files(path: &Path) -> usize {
             }
         })
         .sum()
+}
+
+fn snapshot_files(path: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    let mut files = Vec::new();
+    if !path.exists() {
+        return files;
+    }
+    for entry in fs::read_dir(path).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            files.extend(snapshot_files(&entry.path()));
+        } else {
+            files.push((entry.path(), fs::read(entry.path()).unwrap()));
+        }
+    }
+    files
+}
+
+fn git_status(repo: &Path, args: &[&str]) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .unwrap()
+        .status
+        .success()
 }

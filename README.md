@@ -350,6 +350,13 @@ request limits, and provider-specific policy.
 - Optional gossip or transparency-log anchoring
 - Shallow and partial clone support
 
+## Performance benchmarks
+
+An opt-in local harness measures initial encryption, fresh reconstruction,
+verification, and incremental updates without contacting the source
+repository's configured remote. See [BENCHMARKS.md](BENCHMARKS.md). Benchmark
+outputs, repository keys, and reconstructed data must not be committed.
+
 ## License
 
 Licensed under either of

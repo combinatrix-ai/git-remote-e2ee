@@ -657,6 +657,85 @@ mod tests {
     }
 
     #[test]
+    fn signed_extra_envelope_for_revoked_reader_is_rejected() {
+        let owner = KeyFile::generate();
+        let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
+        let (genesis, _) = PolicyState::genesis(&owner).unwrap();
+        let with_reader = add_reader(&owner, &genesis, &reader);
+        let mut devices = with_reader.body.devices.clone();
+        devices
+            .iter_mut()
+            .find(|device| device.public.device_id == reader.device_id().unwrap())
+            .unwrap()
+            .revoked_at = Some(with_reader.body.generation + 1);
+        let (revoked, _) = PolicyState::successor(&with_reader, devices, &owner).unwrap();
+        revoked.validate_successor(&with_reader).unwrap();
+
+        let generation_key = random_key();
+        let manifest = Manifest {
+            format_version: FORMAT_VERSION,
+            repository_root: owner.repository_root.clone(),
+            generation: 2,
+            previous: Some("00".repeat(32)),
+            policy_id: revoked.id.clone(),
+            policy_generation: revoked.body.generation,
+            authorization: ManifestAuthorization::PolicyTransition,
+            total_pack_count: 0,
+            refs: BTreeMap::new(),
+            new_packs: Vec::new(),
+            predecessor_key_wrap: Some(BASE64.encode([0_u8; 64])),
+        };
+        let bytes = seal_manifest(
+            &owner,
+            &revoked,
+            &generation_key,
+            ManifestAuthorization::PolicyTransition,
+            manifest,
+        )
+        .unwrap();
+        let mut outer: ManifestEnvelope = serde_json::from_slice(&bytes).unwrap();
+        let mut header: ManifestHeader =
+            serde_json::from_slice(&BASE64.decode(&outer.header).unwrap()).unwrap();
+        let public = reader.public_device().unwrap();
+        let aad = generation_key_aad(
+            &header.repository_root,
+            header.generation,
+            &header.policy_id,
+            &public.device_id,
+            &header.key_commitment,
+        );
+        let (encapsulated, ciphertext) =
+            wrap_generation_key(&public.wrapping_public_key, &generation_key, &aad).unwrap();
+        header.generation_key_envelopes.push(GenerationKeyEnvelope {
+            device_id: public.device_id,
+            encapsulated_key: BASE64.encode(encapsulated),
+            ciphertext: BASE64.encode(ciphertext),
+        });
+        header
+            .generation_key_envelopes
+            .sort_by(|a, b| a.device_id.cmp(&b.device_id));
+        let exact_header = serde_json::to_vec(&header).unwrap();
+        let body_ciphertext = BASE64.decode(&outer.body_ciphertext).unwrap();
+        outer.header = BASE64.encode(&exact_header);
+        outer.signature = BASE64.encode(
+            owner
+                .sign_domain(
+                    MANIFEST_SIGNATURE_DOMAIN,
+                    &manifest_signed_bytes(&exact_header, &body_ciphertext),
+                )
+                .unwrap(),
+        );
+        let malicious = serde_json::to_vec(&outer).unwrap();
+        let error = read_manifest_header(&malicious, &revoked, Some(&with_reader))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("must match active readers exactly"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn wrong_recipient_key_is_rejected_by_signed_commitment() {
         let owner = KeyFile::generate();
         let (policy, _) = PolicyState::genesis(&owner).unwrap();

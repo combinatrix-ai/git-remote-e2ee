@@ -377,4 +377,45 @@ mod tests {
             PolicyState::successor(&with_collaborator, malformed_devices, &owner).unwrap();
         assert!(malformed.validate_successor(&with_collaborator).is_err());
     }
+
+    #[test]
+    fn successor_cannot_reactivate_a_revoked_device() {
+        let owner = KeyFile::generate();
+        let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
+        let (genesis, _) = PolicyState::genesis(&owner).unwrap();
+        let mut devices = genesis.body.devices.clone();
+        devices.push(DeviceRecord {
+            public: reader.public_device().unwrap(),
+            roles: DeviceRoles::collaborator(),
+            revoked_at: None,
+        });
+        let (with_reader, _) = PolicyState::successor(&genesis, devices, &owner).unwrap();
+        with_reader.validate_successor(&genesis).unwrap();
+
+        let mut revoked_devices = with_reader.body.devices.clone();
+        revoked_devices
+            .iter_mut()
+            .find(|device| device.public.device_id == reader.device_id().unwrap())
+            .unwrap()
+            .revoked_at = Some(with_reader.body.generation + 1);
+        let (revoked, _) = PolicyState::successor(&with_reader, revoked_devices, &owner).unwrap();
+        revoked.validate_successor(&with_reader).unwrap();
+
+        let mut reactivated_devices = revoked.body.devices.clone();
+        reactivated_devices
+            .iter_mut()
+            .find(|device| device.public.device_id == reader.device_id().unwrap())
+            .unwrap()
+            .revoked_at = None;
+        let (reactivated, _) =
+            PolicyState::successor(&revoked, reactivated_devices, &owner).unwrap();
+        let error = reactivated
+            .validate_successor(&revoked)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("changed or reactivated"),
+            "unexpected error: {error}"
+        );
+    }
 }
