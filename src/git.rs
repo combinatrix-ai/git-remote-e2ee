@@ -109,6 +109,46 @@ pub fn import_pack(repo: &Path, pack: &[u8]) -> Result<()> {
     Ok(())
 }
 
+pub fn ensure_refs_connected(repo: &Path, refs: &BTreeMap<String, String>) -> Result<()> {
+    if refs.is_empty() {
+        return Ok(());
+    }
+    for (reference, object) in refs {
+        let expression = format!("{object}^{{commit}}");
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["cat-file", "-e", &expression])
+            .output()?;
+        if !output.status.success() {
+            bail!("fetched ref {reference} does not resolve to a complete commit")
+        }
+    }
+
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-list", "--objects", "--missing=print"]);
+    for object in refs.values() {
+        command.arg(object);
+    }
+    let output = command.output()?;
+    if !output.status.success() {
+        bail!(
+            "git connectivity check failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }
+    if String::from_utf8(output.stdout)?
+        .lines()
+        .any(|line| line.starts_with('?'))
+    {
+        bail!("fetched refs contain missing Git objects")
+    }
+    Ok(())
+}
+
 pub fn update_ref(repo: &Path, reference: &str, object: &str) -> Result<()> {
     let output = Command::new("git")
         .arg("-C")

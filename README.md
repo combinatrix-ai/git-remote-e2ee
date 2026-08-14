@@ -17,10 +17,10 @@ names, commit IDs, paths, authors, or messages.
 > format is unstable and there are no compatibility guarantees between
 > versions. Keep an independent copy of every repository and key.
 
-The [current implemented v2 design](DESIGN.md) uses a shared epoch key between
-per-device envelopes and per-payload keys. The [target protocol](SPEC.md) is a
-separate proposal that removes that shared secret and wraps every payload key
-directly to each active reader. It is not implemented yet.
+The implemented v3 protocol gives every published generation a fresh random
+root key. Each active reader receives one small public-key envelope for that
+generation; pack ciphertext is stored only once, independent of reader count.
+See the [design overview](DESIGN.md) and [normative specification](SPEC.md).
 
 ## Why this exists
 
@@ -82,20 +82,21 @@ this project as research-grade software.
 ## Current features
 
 - Normal Git remote-helper workflow for clone, fetch, pull, and push
-- Per-device HPKE (X25519/HKDF-SHA-256/ChaCha20-Poly1305) epoch-key envelopes
-- Random per-pack and per-manifest keys with XChaCha20-Poly1305 encryption
+- Per-device HPKE (X25519/HKDF-SHA-256/ChaCha20-Poly1305) generation-key envelopes
+- A fresh random generation root for every successful HEAD publication
+- Domain-separated HKDF subkeys and XChaCha20-Poly1305 payload encryption
 - Ed25519-signed, append-only policy and manifest chains
 - 1-of-N recipient access: each authorized device unlocks with only its own key
 - Separate reader, writer, and administrator authorization
-- Atomic device revocation, epoch rotation, and pack-key rewrapping without
-  re-encrypting pack ciphertext
-- Incremental Git packs rather than full repository snapshots
+- Atomic device addition and revocation without rewriting historical packs
+- An authenticated backward key chain: the current key unlocks earlier
+  generations, while an earlier key cannot unlock later generations
+- Delta manifests and incremental Git packs rather than full repository snapshots
 - Client-side fast-forward enforcement and explicit force push
 - Atomic stale-writer rejection through compare-and-swap
 - Per-client rollback and manifest-fork detection after first observation
-- Complete current pack-ciphertext verification plus signed manifest-header and
-  policy-chain verification (newly added devices use their add checkpoint for
-  encrypted history they were not previously wrapped into)
+- Complete signed history, ciphertext, and reconstructed Git object-graph
+  verification before refs or continuity pins move
 - Filesystem storage backend
 - Carrier-Git backend for GitHub, GitLab, a bare repository, or another ordinary
   Git remote
@@ -176,9 +177,12 @@ git-e2ee device-revoke \
 For a carrier-Git backend, use `--remote <carrier-url>` instead of `--storage`
 with `device-add`, `device-list`, and `device-revoke`.
 
-Adding a device wraps the current epoch key to it and does not rewrite packs.
-Revoking a reader creates a new epoch key and rewraps every small pack key in
-one compare-and-swap publication; the large encrypted packs stay unchanged.
+Adding or revoking a device publishes a fresh generation key in one
+compare-and-swap operation. Its header contains one small envelope for each
+active reader, while all historical manifests and packs stay unchanged. A newly
+added reader can use the current key's authenticated backward links to decrypt
+the complete history. A revoked reader retains the snapshot it could already
+decrypt but receives no key for the new generation or later ones.
 The CLI keeps an administrative continuity pin next to the administrator key as
 `<key-file>.admin-state.json`. Preserve that file together with the key.
 
@@ -243,8 +247,7 @@ The current security claim is:
 - confidentiality of inner repository contents and Git metadata;
 - authenticity and integrity of fetched repository state;
 - continuity from the state previously observed by the same local clone.
-- forward confidentiality exclusion after an atomic device revocation and
-  epoch rotation.
+- future-generation exclusion after an atomic device revocation.
 
 It does **not** independently prevent:
 
@@ -254,8 +257,8 @@ It does **not** independently prevent:
 - deletion or denial of service by storage;
 - destructive changes made by an authorized writer;
 - disclosure of data a revoked device could access before its revocation;
-- retroactive disclosure of every epoch ever wrapped to a later-compromised
-  device key (the protocol has no forward secrecy for stored history);
+- disclosure of the complete historical snapshot at or before any leaked
+  generation key;
 - a revoked writer and colluding storage presenting a pre-revocation fork to a
   fresh or stale client;
 - policy rollback, freezing, or equivocation presented to a fresh client.
@@ -265,12 +268,26 @@ transparency anchor. A returning clone pins both manifest and policy generation.
 The administrative CLI also pins its last published state and does not
 automatically retry a lost CAS race; inspect the winner and rerun the operation.
 
-Policy objects must remain plaintext-structured so a newly added device can
-find its encrypted epoch-key envelope without already knowing that epoch key.
+Generation headers and policy objects must remain plaintext-structured so a
+device can find its envelope without already knowing the generation key.
 Consequently the storage host can see device count, per-repository public keys,
-roles, revocation events, policy generation, and epoch number. Device keys
-should never be reused between repositories. Inner refs, object IDs, paths,
-authors, messages, pack keys, and contents remain encrypted.
+roles, policy changes, and generation numbers. Device keys should never be
+reused between repositories. Inner refs, object IDs, paths, authors, messages,
+generation keys, derived subkeys, and contents remain encrypted.
+
+A generation key is intentionally a transferable snapshot capability: leaking
+`K_t` exposes generations `0..=t` through the backward links. It does not expose
+generation `t+1` or later. Continued future disclosure therefore requires a
+reader's private device key, repeated release of each later generation key or
+plaintext, or continued access to an authorized device. This is key regression,
+not forward secrecy for already published history.
+
+If two authorized writers race, each may locally create a valid generation key
+and ciphertext, but compare-and-swap permits only one HEAD update. The loser
+must discard its unpublished generation and retry from the winning HEAD. Anyone
+who received the loser's key can decrypt that losing unpublished snapshot; CAS
+prevents it from becoming repository history but cannot retract already shared
+plaintext or keys.
 
 ## Storage protocol
 
@@ -305,7 +322,10 @@ The test suite includes:
 - native clone, fetch, pull, push, dry-run, refspec, and force-push behavior;
 - rollback, same-generation fork, and ciphertext-tampering rejection;
 - independent device add/read/write, non-admin rejection, genesis-substitution
-  rejection, administrative rollback pinning, and multi-pack revoke/rewrap;
+  rejection, administrative rollback pinning, device revocation without pack
+  rewrites, and multi-generation offline catch-up;
+- malformed predecessor-link, generation-key commitment, recipient-set, and
+  signed-but-incomplete Git object-graph rejection;
 - two independent carrier writers racing real `git push` processes, with
   exactly one winner;
 - plaintext-absence checks across carrier history;
@@ -326,6 +346,7 @@ request limits, and provider-specific policy.
 - Persistent partial-clone cache for large carrier repositories
 - S3 conditional-write backend and provider compatibility suite
 - Safe compaction and garbage collection
+- Signed checkpoint transitions for compaction without ambiguous key-chain semantics
 - Optional gossip or transparency-log anchoring
 - Shallow and partial clone support
 

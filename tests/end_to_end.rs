@@ -2,7 +2,12 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use git_remote_e2ee::crypto::KeyFile;
+use git_remote_e2ee::crypto::{KeyFile, object_id, random_key};
+use git_remote_e2ee::manifest::{
+    Manifest, ManifestAuthorization, open_manifest, peek_manifest_header, seal_manifest,
+    unwrap_generation_key, wrap_predecessor_key,
+};
+use git_remote_e2ee::policy::PolicyState;
 use git_remote_e2ee::repository::EncryptedRepository;
 use git_remote_e2ee::storage::FilesystemStorage;
 
@@ -71,7 +76,7 @@ fn pushes_incrementally_and_fetches_into_another_repository() {
         .unwrap();
     let first_state = encrypted.verify().unwrap();
     assert_eq!(first_state.generation, 1);
-    assert_eq!(first_state.packs.len(), 1);
+    assert_eq!(first_state.total_pack_count, 1);
 
     let second = commit(&source, "second\n", "second");
     encrypted
@@ -79,7 +84,7 @@ fn pushes_incrementally_and_fetches_into_another_repository() {
         .unwrap();
     let second_state = encrypted.verify().unwrap();
     assert_eq!(second_state.generation, 2);
-    assert_eq!(second_state.packs.len(), 2);
+    assert_eq!(second_state.total_pack_count, 2);
     assert_eq!(second_state.refs["refs/heads/main"], second);
 
     encrypted.fetch_into(&destination, "encrypted").unwrap();
@@ -95,6 +100,124 @@ fn pushes_incrementally_and_fetches_into_another_repository() {
         git(&destination, &["show", &format!("{second}:note.md")]),
         "second"
     );
+}
+
+#[test]
+fn returning_client_fetches_multiple_offline_generations_from_deltas() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let destination = temporary.path().join("destination");
+    let remote = temporary.path().join("remote");
+    initialize_git(&source);
+    initialize_git(&destination);
+    let key = KeyFile::generate();
+    let repository = EncryptedRepository::new(FilesystemStorage::new(&remote), key);
+    repository.initialize().unwrap();
+
+    commit(&source, "one\n", "one");
+    repository
+        .push_ref(&source, "refs/heads/main", false)
+        .unwrap();
+    repository.fetch_into(&destination, "e2ee").unwrap();
+
+    for value in ["two\n", "three\n", "four\n"] {
+        commit(&source, value, value.trim());
+        repository
+            .push_ref(&source, "refs/heads/main", false)
+            .unwrap();
+    }
+    let latest = repository.fetch_into(&destination, "e2ee").unwrap();
+    assert_eq!(latest.total_pack_count, 4);
+    assert_eq!(
+        git(&destination, &["show", "refs/remotes/e2ee/main:note.md"]),
+        "four"
+    );
+}
+
+#[test]
+fn signed_ref_advance_without_its_pack_is_rejected_by_connectivity() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let destination = temporary.path().join("destination");
+    let remote = temporary.path().join("remote");
+    initialize_git(&source);
+    initialize_git(&destination);
+    let key = KeyFile::generate();
+    let repository = EncryptedRepository::new(FilesystemStorage::new(&remote), key.clone());
+    repository.initialize().unwrap();
+    commit(&source, "valid\n", "valid");
+    repository
+        .push_ref(&source, "refs/heads/main", false)
+        .unwrap();
+
+    let head = fs::read_to_string(remote.join("HEAD"))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let manifest_bytes = read_stored_object(&remote, "manifests", &head);
+    let header = peek_manifest_header(&manifest_bytes).unwrap();
+    let policy_bytes = read_stored_object(&remote, "policies", &header.policy_id);
+    let policy = PolicyState::parse(&policy_bytes).unwrap();
+    policy.validate_genesis(&key.repository_root).unwrap();
+    let current_key = unwrap_generation_key(&header, &key).unwrap();
+    let current = open_manifest(&manifest_bytes, &policy, None, &current_key).unwrap();
+
+    let next_key = random_key();
+    let generation = current.generation + 1;
+    let mut refs = current.refs.clone();
+    refs.insert("refs/heads/main".to_owned(), "1".repeat(40));
+    let malicious = Manifest {
+        format_version: current.format_version,
+        repository_root: current.repository_root.clone(),
+        generation,
+        previous: Some(head.clone()),
+        policy_id: policy.id.clone(),
+        policy_generation: policy.body.generation,
+        authorization: ManifestAuthorization::Writer,
+        total_pack_count: current.total_pack_count,
+        refs,
+        new_packs: Vec::new(),
+        predecessor_key_wrap: Some(
+            wrap_predecessor_key(
+                &next_key,
+                &current_key,
+                &current.repository_root,
+                generation,
+                &head,
+            )
+            .unwrap(),
+        ),
+    };
+    let malicious_bytes = seal_manifest(
+        &key,
+        &policy,
+        &next_key,
+        ManifestAuthorization::Writer,
+        malicious,
+    )
+    .unwrap();
+    let malicious_id = object_id(&malicious_bytes);
+    write_stored_object(&remote, "manifests", &malicious_id, &malicious_bytes);
+    fs::write(remote.join("HEAD"), format!("{malicious_id}\n")).unwrap();
+
+    let error = repository
+        .fetch_into(&destination, "e2ee")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("does not resolve") || error.contains("missing Git objects"),
+        "unexpected connectivity error: {error}"
+    );
+}
+
+fn read_stored_object(root: &Path, kind: &str, id: &str) -> Vec<u8> {
+    fs::read(root.join(kind).join(&id[..2]).join(id)).unwrap()
+}
+
+fn write_stored_object(root: &Path, kind: &str, id: &str, bytes: &[u8]) {
+    let directory = root.join(kind).join(&id[..2]);
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join(id), bytes).unwrap();
 }
 
 #[test]
@@ -174,7 +297,7 @@ fn detects_tampered_pack_ciphertext() {
         .push_ref(&source, "refs/heads/main", false)
         .unwrap();
     let manifest = encrypted.verify().unwrap();
-    let id = &manifest.packs[0].id;
+    let id = &manifest.new_packs[0].id;
     let path = remote_path.join("objects").join(&id[..2]).join(id);
     let mut bytes = fs::read(&path).unwrap();
     let last = bytes.len() - 1;
@@ -255,11 +378,9 @@ fn writer_can_add_branch_without_having_other_remote_branch_objects() {
     let temporary = tempfile::tempdir().unwrap();
     let first_writer = temporary.path().join("first-writer");
     let second_writer = temporary.path().join("second-writer");
-    let destination = temporary.path().join("destination");
     let remote_path = temporary.path().join("remote");
     initialize_git(&first_writer);
     initialize_git(&second_writer);
-    initialize_git(&destination);
 
     let key = KeyFile::generate();
     let encrypted = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key);
@@ -268,20 +389,49 @@ fn writer_can_add_branch_without_having_other_remote_branch_objects() {
     encrypted
         .push_ref(&first_writer, "refs/heads/main", false)
         .unwrap();
+    encrypted.fetch_into(&second_writer, "encrypted").unwrap();
+    git(
+        &second_writer,
+        &["switch", "-q", "-c", "other", "refs/remotes/encrypted/main"],
+    );
 
-    git(&second_writer, &["switch", "-c", "other"]);
-    let other = commit(&second_writer, "other\n", "other");
+    git(&first_writer, &["switch", "-q", "-c", "feature"]);
+    let feature = commit(&first_writer, "feature\n", "feature");
     encrypted
-        .push_ref(&second_writer, "refs/heads/other", false)
+        .push_ref(&first_writer, "refs/heads/feature", false)
         .unwrap();
 
-    encrypted.fetch_into(&destination, "encrypted").unwrap();
+    let other = commit(&second_writer, "other\n", "other");
+    encrypted
+        .push_update_for_remote(
+            &second_writer,
+            "encrypted",
+            "refs/heads/other",
+            "refs/heads/other",
+            false,
+        )
+        .unwrap();
+
+    encrypted.fetch_into(&second_writer, "encrypted").unwrap();
     assert_eq!(
-        git(&destination, &["rev-parse", "refs/remotes/encrypted/main"]),
+        git(
+            &second_writer,
+            &["rev-parse", "refs/remotes/encrypted/main"]
+        ),
         main
     );
     assert_eq!(
-        git(&destination, &["rev-parse", "refs/remotes/encrypted/other"]),
+        git(
+            &second_writer,
+            &["rev-parse", "refs/remotes/encrypted/feature"]
+        ),
+        feature
+    );
+    assert_eq!(
+        git(
+            &second_writer,
+            &["rev-parse", "refs/remotes/encrypted/other"]
+        ),
         other
     );
 }

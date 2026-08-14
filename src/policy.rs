@@ -7,11 +7,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::crypto::{
     KeyFile, PublicDevice, object_id, repository_root_for_device, validate_public_device,
-    verify_domain, wrap_epoch_key,
+    verify_domain,
 };
 
-pub const POLICY_FORMAT_VERSION: u32 = 1;
-const POLICY_SIGNATURE_DOMAIN: &[u8] = b"git-remote-e2ee policy v2\0";
+pub const POLICY_FORMAT_VERSION: u32 = 2;
+const POLICY_SIGNATURE_DOMAIN: &[u8] = b"git-remote-e2ee policy v3\0";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -56,23 +56,13 @@ impl DeviceRecord {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct EpochWrap {
-    pub device_id: String,
-    pub encapsulated_key: String,
-    pub ciphertext: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PolicyBody {
     pub format_version: u32,
     pub repository_root: String,
     pub generation: u64,
     pub previous: Option<String>,
-    pub epoch: u64,
     pub admin_threshold: u32,
     pub devices: Vec<DeviceRecord>,
-    pub epoch_wraps: Vec<EpochWrap>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,31 +88,26 @@ pub struct PolicyState {
 }
 
 impl PolicyState {
-    pub fn genesis(key: &KeyFile) -> Result<(Self, [u8; 32], Vec<u8>)> {
-        let epoch_key = crate::crypto::random_key();
+    pub fn genesis(key: &KeyFile) -> Result<(Self, Vec<u8>)> {
         let public = key.public_device()?;
         let body = PolicyBody {
             format_version: POLICY_FORMAT_VERSION,
             repository_root: key.repository_root.clone(),
             generation: 0,
             previous: None,
-            epoch: 0,
             admin_threshold: 1,
             devices: vec![DeviceRecord {
                 public,
                 roles: DeviceRoles::owner(),
                 revoked_at: None,
             }],
-            epoch_wraps: Vec::new(),
         };
-        Self::create(body, &epoch_key, key)
+        Self::create(body, key)
     }
 
     pub fn successor(
         parent: &PolicyState,
         mut devices: Vec<DeviceRecord>,
-        epoch: u64,
-        epoch_key: &[u8; 32],
         signer: &KeyFile,
     ) -> Result<(Self, Vec<u8>)> {
         devices.sort_by(|a, b| a.public.device_id.cmp(&b.public.device_id));
@@ -131,39 +116,16 @@ impl PolicyState {
             repository_root: parent.body.repository_root.clone(),
             generation: parent.body.generation + 1,
             previous: Some(parent.id.clone()),
-            epoch,
             admin_threshold: 1,
             devices,
-            epoch_wraps: Vec::new(),
         };
-        let (state, _, bytes) = Self::create(body, epoch_key, signer)?;
-        Ok((state, bytes))
+        Self::create(body, signer)
     }
 
-    fn create(
-        mut body: PolicyBody,
-        epoch_key: &[u8; 32],
-        signer: &KeyFile,
-    ) -> Result<(Self, [u8; 32], Vec<u8>)> {
+    fn create(body: PolicyBody, signer: &KeyFile) -> Result<(Self, Vec<u8>)> {
         validate_devices(&body.devices)?;
         validate_device_roots(&body)?;
-        let aad = epoch_aad(&body.repository_root, body.generation, body.epoch);
-        let mut wraps = Vec::new();
-        for device in body
-            .devices
-            .iter()
-            .filter(|device| device.active() && device.roles.reader)
-        {
-            let (encapsulated, ciphertext) =
-                wrap_epoch_key(&device.public.wrapping_public_key, epoch_key, &aad)?;
-            wraps.push(EpochWrap {
-                device_id: device.public.device_id.clone(),
-                encapsulated_key: BASE64.encode(encapsulated),
-                ciphertext: BASE64.encode(ciphertext),
-            });
-        }
-        wraps.sort_by(|a, b| a.device_id.cmp(&b.device_id));
-        body.epoch_wraps = wraps;
+        validate_active_roles(&body)?;
         let exact_body = serde_json::to_vec(&body)?;
         let signature = PolicySignature {
             device_id: signer.device_id()?,
@@ -180,7 +142,7 @@ impl PolicyState {
             exact_body,
             signatures: vec![signature],
         };
-        Ok((state, *epoch_key, bytes))
+        Ok((state, bytes))
     }
 
     pub fn parse(bytes: &[u8]) -> Result<Self> {
@@ -192,7 +154,7 @@ impl PolicyState {
         }
         validate_devices(&body.devices)?;
         validate_device_roots(&body)?;
-        validate_wraps(&body)?;
+        validate_active_roles(&body)?;
         Ok(Self {
             id: object_id(bytes),
             body,
@@ -235,6 +197,7 @@ impl PolicyState {
             bail!("only single-admin policy threshold 1 is supported")
         }
         self.verify_against_admins(&parent.body.devices)?;
+
         for old in &parent.body.devices {
             let new = self
                 .body
@@ -266,28 +229,7 @@ impl PolicyState {
                 bail!("device revocation generation is invalid")
             }
         }
-        if !self
-            .body
-            .devices
-            .iter()
-            .any(|d| d.active() && d.roles.administrator)
-        {
-            bail!("policy must retain at least one active administrator")
-        }
-        let removed_reader = parent.body.devices.iter().any(|old| {
-            old.active()
-                && old.roles.reader
-                && !self.body.devices.iter().any(|new| {
-                    new.public.device_id == old.public.device_id && new.active() && new.roles.reader
-                })
-        });
-        if removed_reader && self.body.epoch <= parent.body.epoch {
-            bail!("reader removal requires an epoch rotation")
-        }
-        if self.body.epoch < parent.body.epoch || self.body.epoch > parent.body.epoch + 1 {
-            bail!("policy epoch must stay unchanged or advance by one")
-        }
-        Ok(())
+        validate_active_roles(&self.body)
     }
 
     fn verify_against_admins(&self, devices: &[DeviceRecord]) -> Result<()> {
@@ -303,34 +245,11 @@ impl PolicyState {
                     && device.roles.administrator
             })
             .context("policy was not signed by an active parent administrator")?;
-        let bytes = BASE64.decode(&signature.signature)?;
         verify_domain(
             &signer.public.signing_public_key,
             POLICY_SIGNATURE_DOMAIN,
             &self.exact_body,
-            &bytes,
-        )
-    }
-
-    pub fn unwrap_epoch(&self, key: &KeyFile) -> Result<[u8; 32]> {
-        if key.repository_root != self.body.repository_root {
-            bail!("key file belongs to a different repository")
-        }
-        let device_id = key.device_id()?;
-        let wrap = self
-            .body
-            .epoch_wraps
-            .iter()
-            .find(|wrap| wrap.device_id == device_id)
-            .context("device is not an active reader in the current policy")?;
-        key.unwrap_epoch_key(
-            &BASE64.decode(&wrap.encapsulated_key)?,
-            &BASE64.decode(&wrap.ciphertext)?,
-            &epoch_aad(
-                &self.body.repository_root,
-                self.body.generation,
-                self.body.epoch,
-            ),
+            &BASE64.decode(&signature.signature)?,
         )
     }
 
@@ -369,20 +288,20 @@ fn validate_devices(devices: &[DeviceRecord]) -> Result<()> {
     Ok(())
 }
 
-fn validate_wraps(body: &PolicyBody) -> Result<()> {
-    let active_readers: HashSet<_> = body
+fn validate_active_roles(body: &PolicyBody) -> Result<()> {
+    if !body
         .devices
         .iter()
-        .filter(|device| device.active() && device.roles.reader)
-        .map(|device| device.public.device_id.as_str())
-        .collect();
-    let wrapped: HashSet<_> = body
-        .epoch_wraps
+        .any(|device| device.active() && device.roles.reader)
+    {
+        bail!("policy must retain at least one active reader")
+    }
+    if !body
+        .devices
         .iter()
-        .map(|wrap| wrap.device_id.as_str())
-        .collect();
-    if wrapped.len() != body.epoch_wraps.len() || wrapped != active_readers {
-        bail!("policy epoch wraps must match the active reader set exactly")
+        .any(|device| device.active() && device.roles.administrator)
+    {
+        bail!("policy must retain at least one active administrator")
     }
     Ok(())
 }
@@ -398,68 +317,64 @@ fn validate_device_roots(body: &PolicyBody) -> Result<()> {
     Ok(())
 }
 
-fn epoch_aad(root: &str, generation: u64, epoch: u64) -> Vec<u8> {
-    format!("git-remote-e2ee epoch v2\0{root}\0{generation}\0{epoch}").into_bytes()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn genesis_is_self_signed_and_epoch_is_recipient_wrapped() {
+    fn genesis_is_self_signed_and_contains_no_content_key() {
         let key = KeyFile::generate();
-        let (policy, epoch, bytes) = PolicyState::genesis(&key).unwrap();
+        let (policy, bytes) = PolicyState::genesis(&key).unwrap();
         let parsed = PolicyState::parse(&bytes).unwrap();
         parsed.validate_genesis(&key.repository_root).unwrap();
-        assert_eq!(parsed.unwrap_epoch(&key).unwrap(), epoch);
         assert_eq!(parsed.id, policy.id);
+        assert!(!String::from_utf8(bytes).unwrap().contains("epoch"));
     }
 
     #[test]
     fn successor_is_authorized_by_parent_admin() {
         let admin = KeyFile::generate();
         let outsider = KeyFile::generate_for_repository(admin.repository_root.clone()).unwrap();
-        let (parent, epoch, _) = PolicyState::genesis(&admin).unwrap();
-        let (policy, bytes) =
-            PolicyState::successor(&parent, parent.body.devices.clone(), 0, &epoch, &outsider)
-                .unwrap();
-        let parsed = PolicyState::parse(&bytes).unwrap();
-        assert_eq!(parsed.id, policy.id);
-        assert!(parsed.validate_successor(&parent).is_err());
+        let (parent, _) = PolicyState::genesis(&admin).unwrap();
+        let result = PolicyState::successor(&parent, parent.body.devices.clone(), &outsider);
+        assert!(result.is_ok());
+        let (unauthorized, _) = result.unwrap();
+        assert!(unauthorized.validate_successor(&parent).is_err());
     }
 
     #[test]
     fn genesis_cannot_be_substituted_under_a_known_repository_root() {
-        let owner = KeyFile::generate();
-        let attacker = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
-        let (_, _, forged_bytes) = PolicyState::genesis(&attacker).unwrap();
-        let forged = PolicyState::parse(&forged_bytes).unwrap();
-        assert!(forged.validate_genesis(&owner.repository_root).is_err());
+        let expected = KeyFile::generate();
+        let attacker = KeyFile::generate();
+        let (substitute, _) = PolicyState::genesis(&attacker).unwrap();
+        assert!(
+            substitute
+                .validate_genesis(&expected.repository_root)
+                .is_err()
+        );
     }
 
     #[test]
     fn successor_rejects_incorrect_revocation_generation() {
         let owner = KeyFile::generate();
-        let second = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
-        let (parent, epoch, _) = PolicyState::genesis(&owner).unwrap();
+        let (parent, _) = PolicyState::genesis(&owner).unwrap();
+        let collaborator = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
         let mut devices = parent.body.devices.clone();
         devices.push(DeviceRecord {
-            public: second.public_device().unwrap(),
+            public: collaborator.public_device().unwrap(),
             roles: DeviceRoles::collaborator(),
-            revoked_at: Some(parent.body.generation),
+            revoked_at: None,
         });
-        let body = PolicyBody {
-            format_version: POLICY_FORMAT_VERSION,
-            repository_root: parent.body.repository_root.clone(),
-            generation: parent.body.generation + 1,
-            previous: Some(parent.id.clone()),
-            epoch: parent.body.epoch,
-            admin_threshold: 1,
-            devices,
-            epoch_wraps: Vec::new(),
-        };
-        let (malformed, _, _) = PolicyState::create(body, &epoch, &owner).unwrap();
-        assert!(malformed.validate_successor(&parent).is_err());
+        let (with_collaborator, _) = PolicyState::successor(&parent, devices, &owner).unwrap();
+        with_collaborator.validate_successor(&parent).unwrap();
+        let mut malformed_devices = with_collaborator.body.devices.clone();
+        malformed_devices
+            .iter_mut()
+            .find(|device| device.public.device_id == collaborator.device_id().unwrap())
+            .unwrap()
+            .revoked_at = Some(with_collaborator.body.generation + 2);
+        let (malformed, _) =
+            PolicyState::successor(&with_collaborator, malformed_devices, &owner).unwrap();
+        assert!(malformed.validate_successor(&with_collaborator).is_err());
     }
 }

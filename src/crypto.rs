@@ -8,6 +8,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use hkdf::Hkdf;
 use hpke::aead::ChaCha20Poly1305;
 use hpke::kdf::HkdfSha256;
 use hpke::kem::X25519HkdfSha256;
@@ -17,14 +18,27 @@ use rand::rngs::OsRng;
 use rand_09::{SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use subtle::ConstantTimeEq;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-const SYMMETRIC_MAGIC: &[u8; 8] = b"E2EES02\0";
-const HPKE_INFO: &[u8] = b"git-remote-e2ee epoch key v2";
+const SYMMETRIC_MAGIC: &[u8; 8] = b"E2EES03\0";
+const HPKE_INFO: &[u8] = b"git-remote-e2ee generation key v3";
+const KEY_COMMITMENT_DOMAIN: &[u8] = b"git-remote-e2ee generation key commitment v3\0";
+const SUBKEY_SALT: &[u8] = b"git-remote-e2ee subkey derivation v3\0";
 
 type HpkeKem = X25519HkdfSha256;
 type HpkeKdf = HkdfSha256;
 type HpkeAead = ChaCha20Poly1305;
+
+pub type SecretKey = Zeroizing<[u8; 32]>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SubkeyKind {
+    ManifestBody = 1,
+    Pack = 2,
+    PredecessorLink = 3,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -54,7 +68,7 @@ impl KeyFile {
             wrapping_public.to_bytes().as_slice(),
         );
         Self {
-            format_version: 2,
+            format_version: 3,
             repository_root,
             signing_private_key: BASE64.encode(signing_key.to_bytes()),
             wrapping_private_key: BASE64.encode(wrapping_private.to_bytes()),
@@ -67,7 +81,7 @@ impl KeyFile {
         let mut rng = StdRng::from_os_rng();
         let (wrapping_private, _) = HpkeKem::gen_keypair(&mut rng);
         Ok(Self {
-            format_version: 2,
+            format_version: 3,
             repository_root,
             signing_private_key: BASE64.encode(signing_key.to_bytes()),
             wrapping_private_key: BASE64.encode(wrapping_private.to_bytes()),
@@ -94,7 +108,7 @@ impl KeyFile {
     pub fn read(path: &Path) -> Result<Self> {
         let bytes = fs::read(path).with_context(|| format!("read key file {}", path.display()))?;
         let key: Self = serde_json::from_slice(&bytes).context("parse key file")?;
-        if key.format_version != 2 {
+        if key.format_version != 3 {
             bail!("unsupported key file format {}", key.format_version)
         }
         validate_root(&key.repository_root)?;
@@ -107,7 +121,8 @@ impl KeyFile {
         let signing_public = self.signing_key()?.verifying_key().to_bytes();
         let wrapping_private = self.wrapping_private_key()?;
         let wrapping_public = HpkeKem::sk_to_pk(&wrapping_private).to_bytes();
-        let mut identity = Vec::with_capacity(64);
+        let mut identity = Vec::with_capacity(96);
+        identity.extend_from_slice(b"git-remote-e2ee device id v3\0");
         identity.extend_from_slice(&signing_public);
         identity.extend_from_slice(&wrapping_public);
         Ok(PublicDevice {
@@ -130,27 +145,31 @@ impl KeyFile {
         Ok(self.signing_key()?.sign(&message).to_bytes().to_vec())
     }
 
-    pub fn unwrap_epoch_key(
+    pub fn unwrap_generation_key(
         &self,
         encapsulated_key: &[u8],
         ciphertext: &[u8],
         aad: &[u8],
-    ) -> Result<[u8; 32]> {
+    ) -> Result<SecretKey> {
         let encapsulated = <HpkeKem as Kem>::EncappedKey::from_bytes(encapsulated_key)
             .map_err(|_| anyhow::anyhow!("invalid HPKE encapsulated key"))?;
         let private = self.wrapping_private_key()?;
-        let plaintext = hpke::single_shot_open::<HpkeAead, HpkeKdf, HpkeKem>(
-            &OpModeR::Base,
-            &private,
-            &encapsulated,
-            HPKE_INFO,
-            ciphertext,
-            aad,
-        )
-        .map_err(|_| anyhow::anyhow!("device is not able to unwrap the repository epoch key"))?;
-        plaintext
+        let plaintext = Zeroizing::new(
+            hpke::single_shot_open::<HpkeAead, HpkeKdf, HpkeKem>(
+                &OpModeR::Base,
+                &private,
+                &encapsulated,
+                HPKE_INFO,
+                ciphertext,
+                aad,
+            )
+            .map_err(|_| anyhow::anyhow!("device is not able to unwrap the generation key"))?,
+        );
+        let key = plaintext
+            .as_slice()
             .try_into()
-            .map_err(|_| anyhow::anyhow!("invalid epoch key length"))
+            .map_err(|_| anyhow::anyhow!("invalid generation key length"))?;
+        Ok(Zeroizing::new(key))
     }
 
     fn signing_key(&self) -> Result<SigningKey> {
@@ -211,9 +230,9 @@ pub fn verify_domain(
         .context("signature verification failed")
 }
 
-pub fn wrap_epoch_key(
+pub fn wrap_generation_key(
     public_key: &str,
-    epoch_key: &[u8; 32],
+    generation_key: &[u8; 32],
     aad: &[u8],
 ) -> Result<(Vec<u8>, Vec<u8>)> {
     let public_bytes = BASE64.decode(public_key)?;
@@ -224,18 +243,57 @@ pub fn wrap_epoch_key(
         &OpModeS::Base,
         &public,
         HPKE_INFO,
-        epoch_key,
+        generation_key,
         aad,
         &mut rng,
     )
-    .map_err(|_| anyhow::anyhow!("HPKE epoch-key wrapping failed"))?;
+    .map_err(|_| anyhow::anyhow!("HPKE generation-key wrapping failed"))?;
     Ok((encapsulated.to_bytes().to_vec(), ciphertext))
 }
 
-pub fn random_key() -> [u8; 32] {
+pub fn random_key() -> SecretKey {
     let mut key = [0_u8; 32];
     OsRng.fill_bytes(&mut key);
-    key
+    Zeroizing::new(key)
+}
+
+pub fn commit_key(key: &[u8; 32]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(KEY_COMMITMENT_DOMAIN);
+    hasher.update(key);
+    hex::encode(hasher.finalize())
+}
+
+pub fn verify_key_commitment(key: &[u8; 32], commitment: &str) -> Result<()> {
+    let expected = hex::decode(commitment).context("decode generation key commitment")?;
+    let actual = hex::decode(commit_key(key)).expect("hex digest");
+    if expected.len() != actual.len() || !bool::from(expected.ct_eq(&actual)) {
+        bail!("generation key does not match the signed commitment")
+    }
+    Ok(())
+}
+
+pub fn derive_subkey(
+    generation_key: &[u8; 32],
+    repository_root: &str,
+    generation: u64,
+    kind: SubkeyKind,
+    ordinal: u64,
+) -> Result<SecretKey> {
+    let root = hex::decode(repository_root).context("decode repository root for HKDF")?;
+    if root.len() != 32 {
+        bail!("invalid repository root length for HKDF")
+    }
+    let hkdf = Hkdf::<Sha256>::new(Some(SUBKEY_SALT), generation_key);
+    let mut info = Vec::with_capacity(32 + 8 + 1 + 8);
+    info.extend_from_slice(&root);
+    info.extend_from_slice(&generation.to_le_bytes());
+    info.push(kind as u8);
+    info.extend_from_slice(&ordinal.to_le_bytes());
+    let mut output = [0_u8; 32];
+    hkdf.expand(&info, &mut output)
+        .map_err(|_| anyhow::anyhow!("HKDF subkey derivation failed"))?;
+    Ok(Zeroizing::new(output))
 }
 
 pub fn seal_with_key(key: &[u8; 32], plaintext: &[u8], associated_data: &[u8]) -> Result<Vec<u8>> {
@@ -293,7 +351,8 @@ pub fn validate_public_device(device: &PublicDevice) -> Result<()> {
     validate_root(&device.repository_root)?;
     let signing = decode_public_key(&device.signing_public_key)?;
     let wrapping = decode_public_key(&device.wrapping_public_key)?;
-    let mut identity = Vec::with_capacity(64);
+    let mut identity = Vec::with_capacity(96);
+    identity.extend_from_slice(b"git-remote-e2ee device id v3\0");
     identity.extend_from_slice(&signing);
     identity.extend_from_slice(&wrapping);
     if device.device_id != hex::encode(Sha256::digest(&identity)) {
@@ -339,23 +398,38 @@ mod tests {
     }
 
     #[test]
-    fn hpke_epoch_wrap_is_recipient_specific() {
+    fn hpke_generation_wrap_is_recipient_specific() {
         let first = KeyFile::generate();
         let second = KeyFile::generate_for_repository(first.repository_root.clone()).unwrap();
-        let epoch = random_key();
+        let generation_key = random_key();
         let public = first.public_device().unwrap();
         let (enc, ciphertext) =
-            wrap_epoch_key(&public.wrapping_public_key, &epoch, b"policy").unwrap();
+            wrap_generation_key(&public.wrapping_public_key, &generation_key, b"manifest").unwrap();
         assert_eq!(
             first
-                .unwrap_epoch_key(&enc, &ciphertext, b"policy")
+                .unwrap_generation_key(&enc, &ciphertext, b"manifest")
                 .unwrap(),
-            epoch
+            generation_key
         );
         assert!(
             second
-                .unwrap_epoch_key(&enc, &ciphertext, b"policy")
+                .unwrap_generation_key(&enc, &ciphertext, b"manifest")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn derived_subkeys_are_context_separated_and_committed() {
+        let key = random_key();
+        let root = KeyFile::generate().repository_root.clone();
+        let body = derive_subkey(&key, &root, 4, SubkeyKind::ManifestBody, 0).unwrap();
+        let pack = derive_subkey(&key, &root, 4, SubkeyKind::Pack, 0).unwrap();
+        let next_pack = derive_subkey(&key, &root, 4, SubkeyKind::Pack, 1).unwrap();
+        assert_ne!(*body, *pack);
+        assert_ne!(*pack, *next_pack);
+        let commitment = commit_key(&key);
+        verify_key_commitment(&key, &commitment).unwrap();
+        let wrong = random_key();
+        assert!(verify_key_commitment(&wrong, &commitment).is_err());
     }
 }

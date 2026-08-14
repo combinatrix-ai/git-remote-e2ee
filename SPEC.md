@@ -1,372 +1,315 @@
-# Target protocol specification
+# Protocol specification
 
-> [!IMPORTANT]
-> This document describes the **target protocol**, not the format implemented
-> by the current release. [`DESIGN.md`](DESIGN.md) remains the description of
-> the implemented v2 epoch-key protocol. The target format will require a new
-> version and an explicit migration path.
+> [!WARNING]
+> This document specifies the experimental v3 format implemented by the current
+> prototype. The format is incompatible with v2. There is no automatic
+> migration; keep an independent plaintext copy and every device key.
 
-## 1. Goals
+## 1. Requirements
 
-The target protocol keeps ordinary Git semantics on trusted clients while an
-untrusted storage provider stores only authenticated ciphertext and a small
-amount of routing and authorization metadata.
+The protocol keeps Git semantics on trusted clients and reduces an untrusted
+storage provider to immutable object storage plus one compare-and-swap pointer.
 
-It is designed to provide:
+It is designed to satisfy all of the following:
 
-- confidentiality for the inner Git object graph, refs, commit IDs, paths,
-  authors, messages, and file contents;
-- independent per-device private keys, with no shared repository decryption
-  secret that collaborators must copy between machines;
-- repository-wide 1-of-N read access: every active reader can decrypt with
-  only its own device private key;
-- administrator-controlled membership, separate writer and administrator
-  roles, and a format that can later support M-of-N administration;
-- incremental encrypted Git packs and compare-and-swap publication;
-- integrity, authenticity, and rollback/fork continuity for returning clients;
-- compatibility with a filesystem byte store and with an ordinary Git remote
-  used as a ciphertext carrier.
+1. Every user has a repository-specific device private key. Collaborators
+   exchange public device records, not private keys.
+2. Disclosing one content capability does not grant perpetual future access.
+   Future leakage requires either compromise/disclosure of an active device
+   private key or continued cooperation that releases each later generation
+   key or plaintext.
+3. A publication never rewrites or retransmits historical Git packs.
+4. Pack ciphertext is stored once, independent of reader count. Only small key
+   envelopes scale with the active-reader set.
+5. A newly admitted reader receives full history by default.
+6. Concurrent publications have exactly one visible winner.
 
-The central key-hierarchy change from v2 is:
+The protocol provides confidentiality, authenticity, integrity, and continuity
+from state pinned by the same client. It does not provide global freshness or
+prevent an authorized reader from exporting plaintext.
 
-```text
-implemented v2: device key -> shared epoch key -> payload DEK -> ciphertext
-target format:  device key ---------------------> payload DEK -> ciphertext
-```
-
-There is no repository-wide epoch key in the target format. Every encrypted
-payload has an independent random data-encryption key (DEK), and that DEK is
-wrapped directly to each active reader's public key.
-
-## 2. Non-goals and unavoidable limits
-
-- An authorized reader can always copy plaintext or disclose a DEK after
-  decryption. A normal local Git checkout cannot cryptographically prevent
-  this.
-- Revocation cannot erase plaintext or keys previously obtained by a device.
-  It only excludes that device from future payloads.
-- Read authorization is repository-wide. Branch-level read confidentiality is
-  not supported; data requiring a different reader set belongs in another
-  repository or a future explicit compartment.
-- The storage host is not metadata-oblivious. It can observe ciphertext sizes,
-  object counts, update timing, and total growth. The authorization format may
-  also reveal device public keys, roles, reader count, membership changes, and
-  the number of recipient envelopes.
-- Native hosting features cannot inspect the inner repository. GitHub or
-  GitLab can carry the ciphertext, but their web diffs, code search, and
-  plaintext pull-request review do not apply to it.
-- Storage alone cannot prove global freshness. A fresh client needs an
-  authenticated checkpoint, and prevention of freeze or equivocation across
-  all clients requires gossip, a transparency service, or another external
-  anchor.
-
-## 3. Terminology
+## 2. Terminology
 
 - **Inner repository**: the decrypted Git repository used locally.
-- **Carrier**: an ordinary Git repository used only to transport protocol
-  objects.
-- **Payload**: an encrypted Git pack or encrypted manifest body.
-- **Payload DEK**: a fresh random symmetric key used for exactly one payload.
-- **Access set**: the signed collection of per-recipient HPKE envelopes for one
-  payload DEK.
+- **Carrier**: an ordinary Git repository used to transport protocol objects.
+- **Generation**: one successful `HEAD` publication. Every content push and
+  every membership-only transition advances the generation exactly once.
+- **Generation root key**, `K_t`: a fresh random 256-bit secret for generation
+  `t`.
+- **Generation envelope**: an HPKE encryption of `K_t` to one active reader.
+- **Object subkey**: an HKDF-derived key used for one manifest body, pack, or
+  predecessor-key link.
+- **Predecessor link**: authenticated encryption of `K_(t-1)` under a dedicated
+  subkey derived from `K_t`.
 - **Policy**: the signed device registry and role assignment.
-- **Manifest**: the signed state transition that selects the current policy,
-  refs, pack inventory, and access sets.
-- **Repository root**: the stable repository identity derived from the genesis
-  administrator public keys.
-- **Device ID**: a domain-separated SHA-256 digest of one device's Ed25519 and
-  HPKE public keys. Device keys and IDs are unique to one repository.
-- **Payload kind**: a closed, domain-separated identifier. The initial target
-  version defines exactly `pack` and `manifest-body`.
+- **Manifest**: the signed generation transition, containing an encrypted body.
+- **Repository root**: the stable identity derived from the genesis owner's
+  Ed25519 and HPKE public keys.
+- **Device ID**: a domain-separated digest of one device's two public keys.
 
-## 4. Cryptographic building blocks
+## 3. Cryptographic construction
 
-The initial target version should retain the currently used primitives:
+The initial v3 format uses:
 
-- Ed25519 for signatures;
-- X25519/HKDF-SHA-256/ChaCha20-Poly1305 HPKE for recipient envelopes;
-- XChaCha20-Poly1305 for payload encryption;
-- SHA-256 for content-addressed object identifiers.
+- Ed25519 signatures;
+- X25519/HKDF-SHA-256/ChaCha20-Poly1305 HPKE Base mode;
+- HKDF-SHA-256 for object subkeys;
+- XChaCha20-Poly1305 for manifest, pack, and predecessor-link encryption;
+- SHA-256 for content IDs and generation-key commitments.
 
-Every signature and encryption operation must use a protocol-versioned domain
-separator. Signatures cover the digest of the exact stored bytes, not a
-re-serialized interpretation of a data structure.
+Every successful publisher samples `K_t` independently from the operating
+system CSPRNG. Repository content, commit IDs, previous keys, timestamps, or a
+forward KDF MUST NOT be used as the entropy source. In particular, a holder of
+`K_(t-1)` must not be able to compute `K_t`.
 
-Every pack and every manifest body receives an independently random DEK. DEKs
-must not be derived from previous DEKs, device keys, commit IDs, branch names,
-or another repository secret.
+The publisher derives distinct subkeys using an injective, fixed-width context:
 
-XChaCha20-Poly1305 payload encryption uses a fresh random 24-byte nonce stored
-with the ciphertext. Its associated data binds at least the protocol version,
-repository root, and payload kind. Nonce generation failure must abort the
-operation before publication.
+```text
+HKDF-SHA-256(
+  input_key = K_t,
+  salt = protocol-specific v3 domain,
+  info = repository_root || generation_u64_le || kind_u8 || ordinal_u64_le
+)
+```
 
-## 5. Stored object model
+The defined kinds are `manifest-body`, `pack`, and `predecessor-link`. A key is
+used for one logical message only. Each XChaCha20-Poly1305 envelope also carries
+a fresh random 24-byte nonce. Associated data binds the v3 domain, repository
+root, generation, object kind, and ordinal or parent manifest ID as applicable.
 
-All objects except `HEAD` are immutable and content-addressed:
+The signed header contains the full, untruncated commitment:
+
+```text
+C_t = SHA-256("git-remote-e2ee generation key commitment v3" || K_t)
+```
+
+Commitments are compared in constant time before the corresponding key is used
+for AEAD decryption. XChaCha20-Poly1305 itself is not treated as key-committing.
+
+## 4. Backward key chain
+
+For every `t > 0`, the manifest body contains:
+
+```text
+Enc(derive(K_t, predecessor-link), K_(t-1))
+```
+
+The encryption direction is normative. `K_t` opens `K_(t-1)`; `K_(t-1)` never
+opens or derives `K_t`.
+
+After decrypting a predecessor link, a client MUST compare the recovered key
+against `C_(t-1)` in the parent manifest's signed header before using it. The
+link AAD binds the repository root, current generation, and exact parent
+manifest ID. A missing link, extra link, wrong parent, or commitment mismatch is
+fatal.
+
+Consequences:
+
+- `K_t` is a transferable snapshot capability for all history through `t`.
+- A disclosed `K_t` grants no access to `t+1`.
+- Continued future leakage requires disclosure of each later key/plaintext or
+  compromise of a device private key that remains an active recipient.
+- A new reader given `K_t` can traverse to genesis and therefore always gets
+  full history.
+- Future-only onboarding is not supported by v3 because the predecessor link is
+  available to every reader of the current generation.
+
+## 5. Stored objects
+
+All objects except `HEAD` are immutable and named by SHA-256 of their exact
+stored bytes:
 
 ```text
 objects/<hash>       encrypted incremental Git packs
-states/<hash>        encrypted manifest bodies
-access/<hash>        signed access sets containing per-reader DEK envelopes
-manifests/<hash>     signed headers referencing encrypted state bodies
-policies/<hash>      signed device registry and roles
-HEAD                 opaque ID of the newest manifest
+manifests/<hash>     signed header plus inline encrypted delta body
+policies/<hash>      signed plaintext device registry and roles
+HEAD                 opaque newest-manifest ID
 ```
 
-An implementation may shard or batch access metadata without changing the
-logical model. The first implementation should prefer one access set per
-payload because it is simple to validate. A later format may use recipient
-indexes or append-only grant batches to reduce onboarding cost.
+Private device keys and decrypted generation keys are never stored remotely or
+in client continuity pins.
 
-Private device keys exist only on trusted clients. Public device keys, roles,
-signatures, and encrypted DEK envelopes are stored remotely.
+Policies and manifest headers are plaintext-structured to avoid a key-discovery
+cycle. This intentionally exposes reader count, repository-specific public
+keys, roles, policy changes, ciphertext size, and update timing. Inner refs,
+Git object IDs, paths, authors, messages, pack contents, generation keys, and
+predecessor-link plaintext remain encrypted.
 
-Policies and access sets are plaintext-structured. A client must be able to
-locate its recipient envelope by device ID without first decrypting any
-repository payload. This avoids a key-discovery cycle and intentionally leaks
-the authorization metadata described in section 2.
+## 6. Policy
 
-### 5.1 Pack object
+A policy contains:
 
-A pack object contains one Git pack encrypted under a fresh payload DEK. Its
-object ID is the hash of the exact ciphertext bytes.
+- format version, repository root, generation, and previous policy ID;
+- administrator threshold and signature array;
+- immutable historical device records with public keys, roles, and optional
+  revocation generation.
 
-The protocol's encryption unit is a generated Git pack, not an individual
-inner Git commit. One push can therefore encrypt several commits under one
-pack DEK.
+Roles are:
 
-### 5.2 Access set
+- **reader**: receives generation-key envelopes;
+- **writer**: signs ordinary manifests;
+- **administrator**: signs direct child policies and policy-transition
+  manifests.
 
-An access set binds:
+Every active writer and administrator MUST also be an active reader because a
+publisher needs the current generation key to construct the next predecessor
+link. A policy must retain at least one active reader and administrator.
 
-- repository root and protocol version;
-- payload kind and ciphertext object ID;
-- policy ID and policy generation;
-- a domain-separated commitment `SHA-256(tag || payload_DEK)`;
-- one HPKE envelope of the same payload DEK for every active reader;
-- signer identity and signature.
+Genesis has exactly one active owner with all three roles and is self-signed.
+Every child policy is signed by an administrator in its direct parent, never
+solely by authority introduced in the child. v3 supports threshold 1 and one
+signature; other thresholds fail closed. A future M-of-N format must count
+distinct parent administrators under the parent's threshold.
 
-Every access set referenced by a manifest, both for the manifest body and for
-every pack inventory entry, must bind exactly that manifest's selected policy
-ID and generation. Its recipient set must equal the active readers of that
-policy: no other device may have an envelope and no active reader may be
-omitted. A client must reject a manifest that violates this rule regardless of
-whether every individual signature is otherwise valid.
+## 7. Manifest
 
-A normal writer may sign the access set for a newly created pack or manifest
-body under an unchanged policy. Replacing the access set of an existing
-payload, including adding or removing a recipient envelope, is an
-administrative operation. In a policy transition, its signer is evaluated
-against the parent policy's administrator set even when that signer is absent
-from the child policy to which the new access set is bound.
+### 7.1 Signed plaintext header
 
-The envelope must bind the repository root, payload object ID, policy ID,
-recipient device ID, and payload kind as HPKE associated information. An
-envelope copied to another repository, payload, device, or policy must fail.
-After HPKE open, each recipient must verify the unwrapped DEK against the
-signed commitment before attempting payload decryption. This makes a wrong
-envelope attributable to the access-set signer, although a third party still
-cannot verify that another recipient's envelope contains the correct DEK.
+The header binds at least:
 
-### 5.3 Policy
+- format version and repository root;
+- generation and exact previous manifest ID;
+- selected policy ID and policy generation;
+- cumulative pack count;
+- `C_t`;
+- the complete, sorted generation-envelope list;
+- signer device ID and transition type.
 
-A policy records repository-unique device public keys and independent roles:
+The Ed25519 signature covers the exact stored header bytes and the SHA-256
+digest of the exact encrypted body bytes. Verifiers never sign or verify a
+re-serialized interpretation.
 
-- **reader**: may receive payload DEK envelopes and decrypt the repository;
-- **writer**: may sign ordinary manifest updates and new-payload access sets;
-- **administrator**: may authorize the next policy and replacement access sets.
+The envelope for one recipient uses HPKE AAD that binds the repository root,
+format, generation, policy ID, recipient device ID, and `C_t`. HPKE Base mode
+does not authenticate the sender by itself; sender authenticity comes from the
+manifest signature covering the complete envelope list.
 
-The genesis policy contains one owner, and that owner is a reader, writer, and
-administrator. Every later policy is authorized by administrators in the
-parent policy, never solely by authority introduced in the child.
+Every verifier MUST compare the envelope device-ID set with the selected
+policy's active-reader set. The relationship is bijective: no omissions,
+extras, or duplicates. A recipient unwraps its envelope and checks `C_t` before
+decrypting the body.
 
-In the initial target version, every administrator must also be an active
-reader. A policy violating this invariant is invalid. Administrative
-membership operations must unwrap all current payload DEKs, so allowing a
-non-reader administrator would create an unusable or easily bricked policy.
+### 7.2 Encrypted delta body
 
-The first target implementation remains single-administrator authorization
-(threshold 1). The format should retain a threshold and signature array but
-must fail closed on unsupported values. A future M-of-N version must count
-distinct parent administrators and use the parent policy's threshold to
-authorize its child.
+The body contains:
 
-A writer who is not an administrator cannot add or revoke devices, change
-roles, change the administrator set, replace access metadata for an existing
-payload, or select a different policy.
+- complete current inner refs;
+- only pack descriptors introduced by this generation;
+- exactly one predecessor-key link, except at genesis.
 
-### 5.4 Manifest
+A pack descriptor contains ciphertext ID, plaintext size, creation generation,
+and a dense generation-local ordinal beginning at zero. Its subkey and AAD bind
+that generation and ordinal. Descriptor IDs must be unique within the delta.
 
-The manifest is a plaintext signed header that references a separate encrypted
-body in `states/`. The header
-binds at least:
+The manifest chain is the append-only pack inventory. Manifests do not repeat
+historical descriptors, avoiding quadratic cumulative-inventory metadata.
 
-- repository root and protocol version;
-- manifest generation: 0 for genesis, otherwise the parent generation plus one;
-- previous manifest ID, using the defined null constant only for genesis;
-- current policy ID and generation;
-- transition signer identity and signature;
-- encrypted body object ID;
-- access-set ID for the manifest body's independent DEK.
+### 7.3 Transition types
 
-The encrypted body contains the inner refs and cumulative pack inventory. Each
-inventory entry selects both a pack ciphertext ID and the access-set ID that
-currently grants access to its DEK.
+Every successor is exactly one of:
 
-The header must not reveal inner ref names, inner Git object IDs, authors, or
-commit messages.
+1. **Ordinary**: selected policy is unchanged; signer is an active writer in
+   that policy; refs may change; zero or more new pack deltas may be added.
+2. **Policy transition**: selected policy is the direct authorized child of the
+   parent's policy; signer is an administrator in the parent policy; refs and
+   cumulative pack count are unchanged; the delta contains no packs.
+3. **Checkpoint**: reserved for future compaction and garbage collection.
+   Current implementations MUST reject it as unsupported.
 
-Every successor is exactly one of two transition types:
+For every successor:
 
-1. **Ordinary update.** The selected policy is unchanged. The manifest is
-   signed by an active writer in that policy. Its inventory contains every
-   parent entry unchanged, including both pack ciphertext ID and access-set ID,
-   and may only append new packs whose access sets are signed by that writer.
-2. **Administrative transition.** The manifest selects the direct authorized
-   child of the parent's policy and is signed by an administrator in the
-   parent policy, regardless of the signer's writer role. Inner refs and the
-   ordered list of pack ciphertext IDs are unchanged. Every existing pack gets
-   a replacement access set bound to the child policy, and the new manifest
-   body gets its own child-policy access set. Those replacement sets are
-   authorized by the same parent administrator rule.
+- generation equals parent generation plus one;
+- `previous` equals the parent's content-addressed manifest ID;
+- cumulative pack count equals parent count plus delta length;
+- policy never moves backward or sideways;
+- the predecessor link recovers the key committed by the parent header.
 
-A client that can decrypt both adjacent bodies must compare them and enforce
-these transition rules. Along the manifest chain, the selected policy is
-either unchanged or advances to a direct authorized child; it can never move
-backward or sideways. Policy generation is therefore non-decreasing.
+Genesis is generation 0, uses the defined null previous value, selects the
+genesis policy, contains empty refs and no packs, and has no predecessor link.
 
-## 6. Repository and device lifecycle
+## 8. Repository lifecycle
 
-### 6.1 Initialization
+### 8.1 Normal content publication
 
-The repository root is derived with domain separation from the genesis owner's
-Ed25519 and HPKE public keys. The genesis policy is self-signed by exactly that
-owner. The first manifest is the genesis base case rather than a successor: its
-generation is 0, its previous-manifest field is a defined domain-separated null
-constant, it selects the genesis policy and an empty repository state, and it
-is signed by the genesis owner. The successor transition rules in section 5.4
-apply from the second manifest onward.
+1. Fetch and validate the current manifest/policy chain to the local pin or
+   genesis.
+2. Enforce Git fast-forward rules locally unless force was explicit.
+3. Create only the incremental Git pack needed for the update.
+4. Sample `K_t`, derive the pack and body subkeys, and encrypt the new data.
+5. Encrypt the previous generation key under the predecessor-link subkey.
+6. HPKE-wrap `K_t` once to every active reader.
+7. Upload the immutable pack and manifest.
+8. Compare-and-swap `HEAD` from the observed parent ID to the new manifest ID.
 
-### 6.2 Normal push
+### 8.2 Add a device
 
-1. Read and fully validate the current `HEAD`, manifest chain, policy chain,
-   signatures, local continuity pin, and referenced ciphertext.
-2. Apply normal Git checks locally, including fast-forward enforcement unless
-   force was explicitly requested.
-3. Generate an incremental Git pack and a fresh pack DEK.
-4. Encrypt the pack once and wrap its DEK independently to every active reader.
-5. Build the next encrypted manifest body under another fresh DEK and wrap that
-   DEK independently to every active reader.
-6. Upload all new immutable objects.
-7. Compare-and-swap `HEAD` from the value read in step 1 to the new manifest ID.
+The new device sends only its repository-specific public record to an
+administrator. The administrator creates a child policy and a membership-only
+generation whose envelopes include the new active reader. No historical pack
+or manifest is rewritten. The new device unwraps the newest generation key and
+walks the predecessor chain for full history.
 
-Publishing an access set or ciphertext without winning the final CAS can leave
-unreachable immutable objects. That is safe and can be handled by later
-garbage collection.
+### 8.3 Revoke a device
 
-### 6.3 Add a reader
+Revocation immediately publishes a membership-only generation selecting a
+child policy without the device. The revoked device retains plaintext and keys
+through the parent generation but receives no envelope for the child key and
+cannot derive it from the parent key. Historical objects are unchanged.
 
-The default onboarding mode grants full history:
+The departing administrator necessarily knows the child key it publishes. A
+revocation racing another valid push has an inherent race window: a losing CAS
+candidate can contain content encrypted to the pre-revocation reader set. It is
+unreachable from `HEAD` but not confidentiality-inert if storage colludes with
+that reader. Garbage collection should remove losing candidates when safe.
 
-1. The new device generates its own repository-specific signing and HPKE keys
-   and sends only its public device record to an administrator.
-2. An already authorized administrator validates and decrypts the current
-   repository state.
-3. For every existing pack, the administrator unwraps its DEK locally and
-   verifies it against the signed DEK commitment.
-4. The administrator creates the next policy and an administrative-transition
-   manifest. It encrypts that manifest's body under a new DEK and creates
-   child-policy access sets for the body and every cumulative pack.
-5. One `HEAD` CAS makes the membership and full-history access visible
-   together.
+### 8.4 Rotate a device key
 
-Pack ciphertext is not re-encrypted. Onboarding work grows with the number of
-encrypted packs and readers, but only small key envelopes and indexes change.
-Future-only or snapshot-based invitations may be added later, but are not part
-of the initial target behavior.
+Rotation is one administrative transition that adds the replacement device and
+revokes the old record. Other users keep their device private keys. No pack is
+rewritten.
 
-### 6.4 Revoke a reader
+## 9. Delta traversal and Git connectivity
 
-Revocation publishes a new policy without the device and replacement access
-sets for every entry in the cumulative pack inventory plus the new manifest
-body. Each new access set exactly matches the new active-reader set and
-therefore omits the revoked device. Future payloads never contain an envelope
-for it. Existing pack ciphertext remains unchanged.
+A fresh clone traverses manifest and key links from `HEAD` to genesis,
+validates each hop, collects pack deltas, decrypts packs with their creation
+generation keys, and imports them oldest-first.
 
-Old immutable manifests and access sets may still contain envelopes for that
-device, and the device may already have cached DEKs or plaintext. Replacing the
-current access sets expresses current authorization and avoids accidental new
-use; it does not revoke past knowledge.
+A returning client traverses from `HEAD` to its pinned manifest, validates each
+new hop, and imports only unseen pack IDs. Imported pack IDs are local cache
+state, not an authorization source.
 
-### 6.5 Rotate or replace one device key
+After importing the required deltas, the client MUST verify that every current
+ref resolves to a complete local Git object graph before moving remote-tracking
+refs, pinning the new head, or publishing a successor. A signed ref advance
+whose required pack delta is absent is invalid even when every cryptographic
+check succeeds.
 
-Key rotation is modeled as adding a new device identity and revoking the old
-one in one administrative transition. Other devices keep their private keys.
-Existing pack ciphertext remains unchanged; access metadata is regenerated for
-the new active-reader set.
+Force pushes append a normal pack delta and new ref state. Older packs remain
+in historical manifests and may become unreachable in the inner Git graph.
 
-## 7. Git semantics and branch behavior
+## 10. Concurrency
 
-After decryption, the client works with an ordinary local Git repository.
-Branches, commits, merges, rebases, diffs, and local hooks behave normally.
+The server does not inspect encrypted inner commit parents. Two writers read
+the same opaque `HEAD`, create immutable candidates, and attempt the same CAS.
+Exactly one wins.
 
-Creating or switching a local branch does not change who can decrypt the
-remote. Every active reader can read every inner branch and the full encrypted
-history selected by the manifest. Branch-level write policy may be added
-later, but it is separate from read-key distribution.
+- Filesystem storage uses locking and atomic rename.
+- Carrier Git uses a normal fast-forward push of
+  `refs/heads/git-remote-e2ee`; receive-pack ref update is the CAS.
 
-The carrier backend uses one fixed outer branch,
-`refs/heads/git-remote-e2ee`. It maps protocol objects to ordinary carrier Git
-blobs. Other outer branches are unrelated and ignored by the remote helper.
-The inner branch names and commit graph exist only inside encrypted manifest
-and pack payloads.
+The losing client fetches/decrypts the winner and uses the inner Git DAG to
+decide whether to retry, merge, or rebase. Administrative CAS failures are
+never automatically rebased; authorization and membership must be reevaluated.
+Unreachable losing objects require later GC.
 
-The initial target version supports push destinations under `refs/heads/*`.
-Tags and branch deletion remain unsupported and must be rejected before a new
-manifest is published.
+## 11. Continuity and invitations
 
-## 8. Concurrency and conflict handling
+Returning clients pin at least repository root, manifest ID and generation,
+and policy ID and generation. They reject rollback, a non-descendant manifest,
+policy rollback/sideways movement, root substitution, and generation gaps.
 
-Race detection does not inspect encrypted inner commit parents on the server.
-Two devices read the same opaque `HEAD`, prepare immutable objects, and attempt
-the same compare-and-swap. Exactly one update wins; the loser receives a stale
-state conflict.
-
-- The filesystem backend implements CAS with locking and atomic rename.
-- The carrier-Git backend maps `HEAD` publication to a fast-forward update of
-  the fixed outer branch. Git's receive-pack ref transaction is the CAS.
-
-After losing CAS, the client fetches and decrypts the winning state and then
-uses the inner Git DAG to decide whether it can retry, merge, or must ask the
-user to rebase. The initial implementation may surface the conflict rather
-than retry automatically.
-
-An administrative operation that loses CAS is never automatically rebased.
-The client must validate the winning state, re-evaluate the operator's current
-authorization, and explicitly reconstruct the policy and every affected access
-set before retrying. This is required when, for example, an add races a revoke.
-
-## 9. Integrity, rollback, and invitations
-
-Clients validate content hashes, AEAD tags, DEK commitments, exact-byte
-signatures, policy authorization, access-set membership and policy equality,
-manifest ancestry, policy monotonicity, transition type, and every referenced
-object before moving local refs or publishing a successor.
-
-Returning clients pin at least:
-
-- repository root;
-- newest accepted manifest ID and generation;
-- newest accepted policy ID and generation.
-
-They reject rollback, a non-descendant manifest, policy rollback, or a
-repository-root change.
-
-A fresh device must be provisioned with an invitation checkpoint through an
-authenticated channel. The repository root received through that channel is
-the bootstrap trust anchor; the invitation signature adds administrator
-authorization and accountability. Its signed body contains at least:
+A fresh device should receive an administrator-authorized invitation checkpoint
+through an authenticated channel containing:
 
 ```text
 repository_root
@@ -376,83 +319,58 @@ minimum_policy_id
 minimum_policy_generation
 recipient_device_id
 signing_administrator_device_id
+signature
 ```
 
-The serialized invitation also carries the administrator signature, which
-covers the exact signed-body bytes under a versioned invitation domain tag.
+The repository root delivered through that channel is the bootstrap trust
+anchor. The signature provides authorization and accountability. Storage alone
+cannot prevent freeze, present different valid forks to isolated clients, or
+prove global freshness; gossip or transparency anchoring is a separate layer.
 
-After fetching the plaintext policy chain anchored in `repository_root`, the
-new device verifies the exact-byte signature and checks that its signer was
-authorized for the checkpoint manifest: an administrator in the selected
-policy for a genesis or ordinary manifest, or an administrator in the parent
-policy for an administrative-transition manifest. This permits a departing
-sole administrator to authorize an invitation for its replacement while the
-checkpoint still names the decryptable child manifest.
+## 12. Cost model
 
-The new device rejects any remote state older than, or not descended from, the
-checkpoint or selecting a policy older than the named minimum policy. The
-policy selected at `minimum_manifest_id` must exactly equal `minimum_policy_id`
-and generation.
+Let `N` be active readers, `G` one small HPKE envelope, and `S` newly encrypted
+pack bytes.
 
-Because the new reader has no envelopes for historical manifest bodies before
-its admission, it cannot independently compare those bodies or enforce their
-encrypted inventory-continuity rules. It trusts the authenticated invitation
-checkpoint for that prefix and fully validates transitions from the checkpoint
-forward. This mirrors the unavoidable bootstrap boundary: the invitation
-solves fresh-client rollback only up to its checkpoint. It does not detect a
-later freeze or different valid forks shown to isolated clients.
+| Operation | Upload delta | Remote storage delta |
+| --- | ---: | ---: |
+| Content push | `S + N*G + O(1)` | `S + N*G + O(1)` |
+| Add/revoke/rotate | `N*G + O(1)` | `N*G + O(1)` |
 
-## 10. Hosting and CI behavior
+Large-content storage is `sum(pack ciphertext sizes)`, independent of `N`.
+Envelope metadata is still linear in readers per generation and accumulates as
+approximately `O(generations * readers * G)`. Fresh clone work is linear in
+manifest generations until checkpoint compaction exists.
 
-- Local `git clone`, `fetch`, `pull`, and `push` remain the intended interface.
-- GitHub or GitLab can store and synchronize the carrier repository.
-- A hosting-site pull request can move the outer carrier branch, but its diff
-  is ciphertext and is not a meaningful review of the inner repository.
-- CI can operate on plaintext only after running the remote helper with an
-  authorized device key. A trusted or self-hosted runner best preserves the
-  storage host confidentiality boundary.
-- Server-side branch protection, code search, secret scanning, blame, and web
-  browsing do not understand the encrypted inner repository.
+## 13. Security limits
 
-The fixed carrier branch is protocol-owned and should not be merged through a
-hosting UI. A helper may preserve unrelated paths or no-op outer commits, but
-must reject any foreign mutation of the protocol namespace that does not
-validate as the expected manifest transition. Carrier Git history is a CAS
-transport, not an additional source of protocol authorization.
+- An authorized reader can export plaintext or the current snapshot key.
+- Disclosure of `K_t` exposes all repository history through `t`, not only one
+  pack. It exposes no later generation.
+- Compromise of an active device private key is stronger: the attacker can
+  unwrap later generation keys while the device remains active.
+- Old immutable headers retain envelopes. Later device-key compromise can
+  retroactively expose every generation addressed to that device. v3 has no
+  forward secrecy for stored history.
+- Full-history onboarding is mandatory; future-only access requires a new
+  format or an explicit compartment.
+- Storage observes sizes, timing, generation count, reader count, public keys,
+  roles, and membership changes.
+- Storage can delete, freeze, or deny service.
+- Writers can author destructive Git history; force remains explicit.
+- Global rollback/equivocation detection requires an external anchor.
 
-## 11. Security consequences of direct per-payload wrapping
+## 14. Migration and future work
 
-This design removes the repository-wide transferable epoch secret. Leaking one
-pack DEK exposes that pack, not every past and future pack. Compromise of a
-device private key can expose every payload whose access set contains that
-device, so protecting and rotating device keys still matters.
+v3 is intentionally wire-incompatible with v2. Migration must occur on a
+trusted client able to decrypt v2 and republish under a new v3 repository
+boundary. Automatic migration is not implemented.
 
-Direct recipient wrapping costs roughly O(readers × payloads) envelope
-metadata and makes full-history onboarding O(payloads). This is the deliberate
-initial trade-off for a simple, auditable trust model.
+Planned extensions:
 
-Broadcast encryption could reduce recipient-header size for a large reader
-set, but would add protocol and implementation complexity and would not stop an
-authorized reader from sharing the resulting content key. Zero-knowledge
-proofs can prove possession or authorization; they do not deliver the payload
-key to multiple readers or prevent its disclosure. Neither is required for the
-initial target format.
-
-## 12. Migration and future work
-
-The target protocol is intentionally not wire-compatible with v2. Migration
-must run on a trusted client that can decrypt the v2 repository and republish
-its packs and state under a new repository/version boundary. Until that path is
-implemented and tested, v2 repositories remain on the implemented format.
-
-Planned extensions after the target 1-of-N format:
-
-1. M-of-N administrator authorization and recovery workflows.
-2. Indexed or batched access catalogs for large histories and reader sets.
-3. Automatic stale-push fetch/retry with explicit merge behavior.
-4. S3 backend and a provider-specific conditional-write compatibility suite.
-5. Safe compaction and garbage collection with explicit deletion authority.
-6. Optional gossip or transparency-log anchoring for equivocation detection.
-7. Optional explicit read compartments, if their Git UX and leakage model can
-   be made understandable; ordinary branches will not silently become security
-   boundaries.
+1. checkpoint/compaction and garbage collection with explicit authority;
+2. M-of-N administrator authorization and recovery;
+3. automatic stale-push retry with explicit merge behavior;
+4. persistent partial-clone carrier cache;
+5. S3 backend with conditional-write compatibility tests;
+6. optional gossip or transparency-log anchoring.

@@ -170,7 +170,7 @@ fn main() -> Result<()> {
                 "verified generation {} ({} refs, {} packs)",
                 manifest.generation,
                 manifest.refs.len(),
-                manifest.packs.len()
+                manifest.total_pack_count
             );
         }
         Command::DeviceAdd {

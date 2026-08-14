@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -6,18 +6,30 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::crypto::{KeyFile, open_with_key, random_key, seal_with_key, verify_domain};
+use crate::crypto::{
+    KeyFile, SecretKey, SubkeyKind, commit_key, derive_subkey, open_with_key, seal_with_key,
+    verify_domain, verify_key_commitment, wrap_generation_key,
+};
 use crate::policy::PolicyState;
 
-pub const FORMAT_VERSION: u32 = 2;
-const MANIFEST_SIGNATURE_DOMAIN: &[u8] = b"git-remote-e2ee manifest v2\0";
+pub const FORMAT_VERSION: u32 = 3;
+const MANIFEST_SIGNATURE_DOMAIN: &[u8] = b"git-remote-e2ee manifest v3\0";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PackDescriptor {
     pub id: String,
     pub plaintext_size: u64,
-    pub wrapped_key: String,
+    pub generation: u64,
+    pub ordinal: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenerationKeyEnvelope {
+    pub device_id: String,
+    pub encapsulated_key: String,
+    pub ciphertext: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,10 +40,11 @@ pub struct Manifest {
     pub previous: Option<String>,
     pub policy_id: String,
     pub policy_generation: u64,
-    pub epoch: u64,
     pub authorization: ManifestAuthorization,
+    pub total_pack_count: u64,
     pub refs: BTreeMap<String, String>,
-    pub packs: Vec<PackDescriptor>,
+    pub new_packs: Vec<PackDescriptor>,
+    pub predecessor_key_wrap: Option<String>,
 }
 
 impl Manifest {
@@ -43,17 +56,36 @@ impl Manifest {
             previous: None,
             policy_id: policy.id.clone(),
             policy_generation: policy.body.generation,
-            epoch: policy.body.epoch,
             authorization: ManifestAuthorization::PolicyTransition,
+            total_pack_count: 0,
             refs: BTreeMap::new(),
-            packs: Vec::new(),
+            new_packs: Vec::new(),
+            predecessor_key_wrap: None,
         }
     }
 
-    pub fn validate_successor(&self, previous_id: &str, previous: &Manifest) -> Result<()> {
-        if self.format_version != FORMAT_VERSION {
-            bail!("unsupported manifest format {}", self.format_version)
+    pub fn validate_genesis(&self, policy: &PolicyState) -> Result<()> {
+        validate_manifest_policy(self, policy)?;
+        if self.generation != 0
+            || self.previous.is_some()
+            || self.authorization != ManifestAuthorization::PolicyTransition
+            || self.total_pack_count != 0
+            || !self.refs.is_empty()
+            || !self.new_packs.is_empty()
+            || self.predecessor_key_wrap.is_some()
+        {
+            bail!("invalid genesis manifest")
         }
+        Ok(())
+    }
+
+    pub fn validate_successor(
+        &self,
+        previous_id: &str,
+        previous: &Manifest,
+        selected_policy: &PolicyState,
+    ) -> Result<()> {
+        validate_manifest_policy(self, selected_policy)?;
         if self.repository_root != previous.repository_root {
             bail!("manifest repository root changed")
         }
@@ -63,36 +95,38 @@ impl Manifest {
         if self.previous.as_deref() != Some(previous_id) {
             bail!("manifest previous pointer does not match")
         }
-        if self.policy_generation < previous.policy_generation {
-            bail!("manifest policy generation moved backwards")
+        if self.predecessor_key_wrap.is_none() {
+            bail!("successor manifest is missing its predecessor key link")
         }
+        validate_pack_delta(self)?;
+        let expected_total = previous
+            .total_pack_count
+            .checked_add(self.new_packs.len() as u64)
+            .context("manifest total pack count overflow")?;
+        if self.total_pack_count != expected_total {
+            bail!("manifest total pack count does not match its delta")
+        }
+
         match self.authorization {
             ManifestAuthorization::Writer => {
                 if self.policy_id != previous.policy_id
                     || self.policy_generation != previous.policy_generation
-                    || self.epoch != previous.epoch
                 {
                     bail!("writer manifest changed policy state")
                 }
             }
             ManifestAuthorization::PolicyTransition => {
-                if self.policy_generation != previous.policy_generation + 1 {
-                    bail!("policy transition did not advance policy generation by one")
+                if self.policy_generation != previous.policy_generation + 1
+                    || selected_policy.body.previous.as_deref() != Some(previous.policy_id.as_str())
+                {
+                    bail!("policy transition did not select the direct policy child")
+                }
+                if self.refs != previous.refs || !self.new_packs.is_empty() {
+                    bail!("policy transition changed Git content")
                 }
             }
-        }
-        if self.packs.len() < previous.packs.len() {
-            bail!("manifest removed packs from the inventory")
-        }
-        for (current, old) in self.packs.iter().zip(&previous.packs) {
-            if current.id != old.id || current.plaintext_size != old.plaintext_size {
-                bail!("manifest rewrote the pack inventory")
-            }
-            if self.epoch == previous.epoch && current.wrapped_key != old.wrapped_key {
-                bail!("manifest rewrote a pack key without rotating the epoch")
-            }
-            if self.epoch != previous.epoch && current.wrapped_key == old.wrapped_key {
-                bail!("manifest did not rewrap every pack key after epoch rotation")
+            ManifestAuthorization::Checkpoint => {
+                bail!("checkpoint transitions are reserved but not implemented")
             }
         }
         Ok(())
@@ -104,6 +138,7 @@ impl Manifest {
 pub enum ManifestAuthorization {
     Writer,
     PolicyTransition,
+    Checkpoint,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,8 +150,9 @@ pub struct ManifestHeader {
     pub previous: Option<String>,
     pub policy_id: String,
     pub policy_generation: u64,
-    pub epoch: u64,
-    pub manifest_key_wrap: String,
+    pub total_pack_count: u64,
+    pub key_commitment: String,
+    pub generation_key_envelopes: Vec<GenerationKeyEnvelope>,
     pub signer_device_id: String,
     pub authorization: ManifestAuthorization,
 }
@@ -125,7 +161,8 @@ pub struct ManifestHeader {
 #[serde(deny_unknown_fields)]
 struct ManifestBody {
     refs: BTreeMap<String, String>,
-    packs: Vec<PackDescriptor>,
+    new_packs: Vec<PackDescriptor>,
+    predecessor_key_wrap: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -146,21 +183,36 @@ struct ParsedEnvelope {
 pub fn seal_manifest(
     key: &KeyFile,
     policy: &PolicyState,
-    epoch_key: &[u8; 32],
+    generation_key: &[u8; 32],
     authorization: ManifestAuthorization,
     manifest: Manifest,
 ) -> Result<Vec<u8>> {
     validate_manifest_policy(&manifest, policy)?;
-    let manifest_key = random_key();
-    let key_wrap = seal_with_key(
-        epoch_key,
-        &manifest_key,
-        &manifest_key_aad(
-            &manifest.repository_root,
-            manifest.generation,
-            manifest.epoch,
-        ),
-    )?;
+    let commitment = commit_key(generation_key);
+    let mut envelopes = policy
+        .body
+        .devices
+        .iter()
+        .filter(|device| device.active() && device.roles.reader)
+        .map(|device| {
+            let aad = generation_key_aad(
+                &manifest.repository_root,
+                manifest.generation,
+                &manifest.policy_id,
+                &device.public.device_id,
+                &commitment,
+            );
+            let (encapsulated, ciphertext) =
+                wrap_generation_key(&device.public.wrapping_public_key, generation_key, &aad)?;
+            Ok(GenerationKeyEnvelope {
+                device_id: device.public.device_id.clone(),
+                encapsulated_key: BASE64.encode(encapsulated),
+                ciphertext: BASE64.encode(ciphertext),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    envelopes.sort_by(|a, b| a.device_id.cmp(&b.device_id));
+
     let header = ManifestHeader {
         format_version: manifest.format_version,
         repository_root: manifest.repository_root.clone(),
@@ -168,18 +220,28 @@ pub fn seal_manifest(
         previous: manifest.previous.clone(),
         policy_id: manifest.policy_id.clone(),
         policy_generation: manifest.policy_generation,
-        epoch: manifest.epoch,
-        manifest_key_wrap: BASE64.encode(key_wrap),
+        total_pack_count: manifest.total_pack_count,
+        key_commitment: commitment,
+        generation_key_envelopes: envelopes,
         signer_device_id: key.device_id()?,
         authorization,
     };
+    validate_recipient_set(&header, policy)?;
     let exact_header = serde_json::to_vec(&header)?;
     let body = serde_json::to_vec(&ManifestBody {
         refs: manifest.refs,
-        packs: manifest.packs,
+        new_packs: manifest.new_packs,
+        predecessor_key_wrap: manifest.predecessor_key_wrap,
     })?;
+    let body_key = derive_subkey(
+        generation_key,
+        &header.repository_root,
+        header.generation,
+        SubkeyKind::ManifestBody,
+        0,
+    )?;
     let body_ciphertext = seal_with_key(
-        &manifest_key,
+        &body_key,
         &body,
         &manifest_body_aad(&header.repository_root, header.generation),
     )?;
@@ -205,10 +267,10 @@ pub fn read_manifest_header(
     if header.repository_root != policy.body.repository_root
         || header.policy_id != policy.id
         || header.policy_generation != policy.body.generation
-        || header.epoch != policy.body.epoch
     {
         bail!("manifest header does not match its policy")
     }
+    validate_recipient_set(&header, policy)?;
     let signer = match header.authorization {
         ManifestAuthorization::Writer => policy
             .device(&header.signer_device_id)
@@ -220,6 +282,9 @@ pub fn read_manifest_header(
                 .device(&header.signer_device_id)
                 .filter(|device| device.active() && device.roles.administrator)
                 .context("policy transition manifest was not signed by a parent administrator")?
+        }
+        ManifestAuthorization::Checkpoint => {
+            bail!("checkpoint transitions are reserved but not implemented")
         }
     };
     verify_domain(
@@ -235,73 +300,140 @@ pub fn peek_manifest_header(encrypted: &[u8]) -> Result<ManifestHeader> {
     Ok(parse_envelope(encrypted)?.header)
 }
 
+pub fn unwrap_generation_key(header: &ManifestHeader, key: &KeyFile) -> Result<SecretKey> {
+    if key.repository_root != header.repository_root {
+        bail!("key file belongs to a different repository")
+    }
+    let device_id = key.device_id()?;
+    let envelope = header
+        .generation_key_envelopes
+        .iter()
+        .find(|envelope| envelope.device_id == device_id)
+        .context("device is not an active reader in this generation")?;
+    let aad = generation_key_aad(
+        &header.repository_root,
+        header.generation,
+        &header.policy_id,
+        &device_id,
+        &header.key_commitment,
+    );
+    let generation_key = key.unwrap_generation_key(
+        &BASE64.decode(&envelope.encapsulated_key)?,
+        &BASE64.decode(&envelope.ciphertext)?,
+        &aad,
+    )?;
+    verify_key_commitment(&generation_key, &header.key_commitment)?;
+    Ok(generation_key)
+}
+
 pub fn open_manifest(
     encrypted: &[u8],
     policy: &PolicyState,
     parent_policy: Option<&PolicyState>,
-    epoch_key: &[u8; 32],
+    generation_key: &[u8; 32],
 ) -> Result<Manifest> {
     let header = read_manifest_header(encrypted, policy, parent_policy)?;
-    let envelope: ManifestEnvelope = serde_json::from_slice(encrypted)?;
-    let manifest_key: [u8; 32] = open_with_key(
-        epoch_key,
-        &BASE64.decode(&header.manifest_key_wrap)?,
-        &manifest_key_aad(&header.repository_root, header.generation, header.epoch),
-    )?
-    .try_into()
-    .map_err(|_| anyhow::anyhow!("invalid manifest key length"))?;
-    let body_ciphertext = BASE64.decode(envelope.body_ciphertext)?;
+    verify_key_commitment(generation_key, &header.key_commitment)?;
+    let parsed = parse_envelope(encrypted)?;
+    let body_key = derive_subkey(
+        generation_key,
+        &header.repository_root,
+        header.generation,
+        SubkeyKind::ManifestBody,
+        0,
+    )?;
     let body_bytes = open_with_key(
-        &manifest_key,
-        &body_ciphertext,
+        &body_key,
+        &parsed.body_ciphertext,
         &manifest_body_aad(&header.repository_root, header.generation),
     )?;
     let body: ManifestBody = serde_json::from_slice(&body_bytes).context("parse manifest body")?;
-    Ok(Manifest {
+    let manifest = Manifest {
         format_version: header.format_version,
         repository_root: header.repository_root,
         generation: header.generation,
         previous: header.previous,
         policy_id: header.policy_id,
         policy_generation: header.policy_generation,
-        epoch: header.epoch,
         authorization: header.authorization,
+        total_pack_count: header.total_pack_count,
         refs: body.refs,
-        packs: body.packs,
-    })
+        new_packs: body.new_packs,
+        predecessor_key_wrap: body.predecessor_key_wrap,
+    };
+    validate_pack_delta(&manifest)?;
+    if (manifest.generation == 0) != manifest.predecessor_key_wrap.is_none() {
+        bail!("manifest predecessor key link does not match its generation")
+    }
+    Ok(manifest)
 }
 
-pub fn wrap_pack_key(
-    epoch_key: &[u8; 32],
+pub fn wrap_predecessor_key(
+    generation_key: &[u8; 32],
+    previous_key: &[u8; 32],
     repository_root: &str,
-    epoch: u64,
-    pack_id: &str,
-    pack_key: &[u8; 32],
+    generation: u64,
+    previous_manifest_id: &str,
 ) -> Result<String> {
+    let link_key = derive_subkey(
+        generation_key,
+        repository_root,
+        generation,
+        SubkeyKind::PredecessorLink,
+        0,
+    )?;
     Ok(BASE64.encode(seal_with_key(
-        epoch_key,
-        pack_key,
-        &pack_key_aad(repository_root, epoch, pack_id),
+        &link_key,
+        previous_key,
+        &predecessor_link_aad(repository_root, generation, previous_manifest_id),
     )?))
 }
 
-pub fn unwrap_pack_key(
-    epoch_key: &[u8; 32],
-    repository_root: &str,
-    epoch: u64,
-    descriptor: &PackDescriptor,
-) -> Result<[u8; 32]> {
-    open_with_key(
-        epoch_key,
-        &BASE64.decode(&descriptor.wrapped_key)?,
-        &pack_key_aad(repository_root, epoch, &descriptor.id),
-    )?
-    .try_into()
-    .map_err(|_| anyhow::anyhow!("invalid pack key length"))
+pub fn unwrap_predecessor_key(
+    generation_key: &[u8; 32],
+    manifest: &Manifest,
+    parent_header: &ManifestHeader,
+) -> Result<SecretKey> {
+    let previous_id = manifest
+        .previous
+        .as_deref()
+        .context("genesis manifest has no predecessor key")?;
+    let encrypted = manifest
+        .predecessor_key_wrap
+        .as_deref()
+        .context("successor manifest is missing predecessor key link")?;
+    if parent_header.generation + 1 != manifest.generation
+        || parent_header.repository_root != manifest.repository_root
+    {
+        bail!("predecessor header does not match manifest generation")
+    }
+    let link_key = derive_subkey(
+        generation_key,
+        &manifest.repository_root,
+        manifest.generation,
+        SubkeyKind::PredecessorLink,
+        0,
+    )?;
+    let plaintext = zeroize::Zeroizing::new(open_with_key(
+        &link_key,
+        &BASE64.decode(encrypted)?,
+        &predecessor_link_aad(&manifest.repository_root, manifest.generation, previous_id),
+    )?);
+    let key: [u8; 32] = plaintext
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid predecessor generation key length"))?;
+    let key = zeroize::Zeroizing::new(key);
+    verify_key_commitment(&key, &parent_header.key_commitment)?;
+    Ok(key)
 }
 
-pub fn pack_aad(repository_root: &str) -> Vec<u8> {
-    format!("git-remote-e2ee pack v2\0{repository_root}").into_bytes()
+pub fn pack_aad(repository_root: &str, generation: u64, ordinal: u64) -> Vec<u8> {
+    let mut aad = b"git-remote-e2ee pack v3\0".to_vec();
+    push_field(&mut aad, repository_root.as_bytes());
+    aad.extend_from_slice(&generation.to_le_bytes());
+    aad.extend_from_slice(&ordinal.to_le_bytes());
+    aad
 }
 
 fn parse_envelope(encrypted: &[u8]) -> Result<ParsedEnvelope> {
@@ -325,9 +457,40 @@ fn validate_manifest_policy(manifest: &Manifest, policy: &PolicyState) -> Result
         || manifest.repository_root != policy.body.repository_root
         || manifest.policy_id != policy.id
         || manifest.policy_generation != policy.body.generation
-        || manifest.epoch != policy.body.epoch
     {
         bail!("manifest does not match policy state")
+    }
+    Ok(())
+}
+
+fn validate_recipient_set(header: &ManifestHeader, policy: &PolicyState) -> Result<()> {
+    let active: HashSet<_> = policy
+        .body
+        .devices
+        .iter()
+        .filter(|device| device.active() && device.roles.reader)
+        .map(|device| device.public.device_id.as_str())
+        .collect();
+    let wrapped: HashSet<_> = header
+        .generation_key_envelopes
+        .iter()
+        .map(|envelope| envelope.device_id.as_str())
+        .collect();
+    if wrapped.len() != header.generation_key_envelopes.len() || wrapped != active {
+        bail!("generation key envelopes must match active readers exactly")
+    }
+    Ok(())
+}
+
+fn validate_pack_delta(manifest: &Manifest) -> Result<()> {
+    let mut ids = HashSet::new();
+    for (index, pack) in manifest.new_packs.iter().enumerate() {
+        if pack.generation != manifest.generation || pack.ordinal != index as u64 {
+            bail!("pack delta has a non-dense generation-local ordinal")
+        }
+        if !ids.insert(pack.id.as_str()) {
+            bail!("pack delta contains a duplicate ciphertext id")
+        }
     }
     Ok(())
 }
@@ -339,14 +502,210 @@ fn manifest_signed_bytes(exact_header: &[u8], body_ciphertext: &[u8]) -> Vec<u8>
     bytes
 }
 
-fn manifest_key_aad(root: &str, generation: u64, epoch: u64) -> Vec<u8> {
-    format!("git-remote-e2ee manifest key v2\0{root}\0{generation}\0{epoch}").into_bytes()
+fn generation_key_aad(
+    root: &str,
+    generation: u64,
+    policy_id: &str,
+    recipient_id: &str,
+    commitment: &str,
+) -> Vec<u8> {
+    let mut aad = b"git-remote-e2ee generation envelope v3\0".to_vec();
+    push_field(&mut aad, root.as_bytes());
+    aad.extend_from_slice(&generation.to_le_bytes());
+    push_field(&mut aad, policy_id.as_bytes());
+    push_field(&mut aad, recipient_id.as_bytes());
+    push_field(&mut aad, commitment.as_bytes());
+    aad
 }
 
 fn manifest_body_aad(root: &str, generation: u64) -> Vec<u8> {
-    format!("git-remote-e2ee manifest body v2\0{root}\0{generation}").into_bytes()
+    let mut aad = b"git-remote-e2ee manifest body v3\0".to_vec();
+    push_field(&mut aad, root.as_bytes());
+    aad.extend_from_slice(&generation.to_le_bytes());
+    aad
 }
 
-fn pack_key_aad(root: &str, epoch: u64, pack_id: &str) -> Vec<u8> {
-    format!("git-remote-e2ee pack key v2\0{root}\0{epoch}\0{pack_id}").into_bytes()
+fn predecessor_link_aad(root: &str, generation: u64, previous_id: &str) -> Vec<u8> {
+    let mut aad = b"git-remote-e2ee predecessor link v3\0".to_vec();
+    push_field(&mut aad, root.as_bytes());
+    aad.extend_from_slice(&generation.to_le_bytes());
+    push_field(&mut aad, previous_id.as_bytes());
+    aad
+}
+
+fn push_field(output: &mut Vec<u8>, value: &[u8]) {
+    output.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    output.extend_from_slice(value);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::{PublicDevice, random_key};
+    use crate::policy::{DeviceRecord, DeviceRoles};
+
+    fn add_reader(owner: &KeyFile, parent: &PolicyState, reader: &KeyFile) -> PolicyState {
+        let mut devices = parent.body.devices.clone();
+        devices.push(DeviceRecord {
+            public: reader.public_device().unwrap(),
+            roles: DeviceRoles::collaborator(),
+            revoked_at: None,
+        });
+        let (policy, _) = PolicyState::successor(parent, devices, owner).unwrap();
+        policy.validate_successor(parent).unwrap();
+        policy
+    }
+
+    #[test]
+    fn predecessor_link_must_match_parent_commitment() {
+        let owner = KeyFile::generate();
+        let (policy, _) = PolicyState::genesis(&owner).unwrap();
+        let parent_key = random_key();
+        let parent = Manifest::genesis(owner.repository_root.clone(), &policy);
+        let parent_bytes = seal_manifest(
+            &owner,
+            &policy,
+            &parent_key,
+            ManifestAuthorization::PolicyTransition,
+            parent,
+        )
+        .unwrap();
+        let parent_id = crate::crypto::object_id(&parent_bytes);
+        let parent_header = read_manifest_header(&parent_bytes, &policy, None).unwrap();
+
+        let child_key = random_key();
+        let wrong_parent_key = random_key();
+        let child = Manifest {
+            format_version: FORMAT_VERSION,
+            repository_root: owner.repository_root.clone(),
+            generation: 1,
+            previous: Some(parent_id.clone()),
+            policy_id: policy.id.clone(),
+            policy_generation: policy.body.generation,
+            authorization: ManifestAuthorization::Writer,
+            total_pack_count: 0,
+            refs: BTreeMap::new(),
+            new_packs: Vec::new(),
+            predecessor_key_wrap: Some(
+                wrap_predecessor_key(
+                    &child_key,
+                    &wrong_parent_key,
+                    &owner.repository_root,
+                    1,
+                    &parent_id,
+                )
+                .unwrap(),
+            ),
+        };
+        let child_bytes = seal_manifest(
+            &owner,
+            &policy,
+            &child_key,
+            ManifestAuthorization::Writer,
+            child,
+        )
+        .unwrap();
+        let opened = open_manifest(&child_bytes, &policy, None, &child_key).unwrap();
+        assert!(unwrap_predecessor_key(&child_key, &opened, &parent_header).is_err());
+    }
+
+    #[test]
+    fn every_validator_rejects_missing_or_duplicate_recipient_envelopes() {
+        let owner = KeyFile::generate();
+        let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
+        let (parent, _) = PolicyState::genesis(&owner).unwrap();
+        let policy = add_reader(&owner, &parent, &reader);
+        let generation_key = random_key();
+        let manifest = Manifest {
+            format_version: FORMAT_VERSION,
+            repository_root: owner.repository_root.clone(),
+            generation: 1,
+            previous: Some("00".repeat(32)),
+            policy_id: policy.id.clone(),
+            policy_generation: policy.body.generation,
+            authorization: ManifestAuthorization::PolicyTransition,
+            total_pack_count: 0,
+            refs: BTreeMap::new(),
+            new_packs: Vec::new(),
+            predecessor_key_wrap: Some(BASE64.encode([0_u8; 64])),
+        };
+        let bytes = seal_manifest(
+            &owner,
+            &policy,
+            &generation_key,
+            ManifestAuthorization::PolicyTransition,
+            manifest,
+        )
+        .unwrap();
+        let mut outer: ManifestEnvelope = serde_json::from_slice(&bytes).unwrap();
+        let mut header: ManifestHeader =
+            serde_json::from_slice(&BASE64.decode(&outer.header).unwrap()).unwrap();
+        header.generation_key_envelopes.pop();
+        outer.header = BASE64.encode(serde_json::to_vec(&header).unwrap());
+        let missing = serde_json::to_vec(&outer).unwrap();
+        assert!(read_manifest_header(&missing, &policy, Some(&parent)).is_err());
+
+        let mut outer: ManifestEnvelope = serde_json::from_slice(&bytes).unwrap();
+        let mut header: ManifestHeader =
+            serde_json::from_slice(&BASE64.decode(&outer.header).unwrap()).unwrap();
+        header
+            .generation_key_envelopes
+            .push(header.generation_key_envelopes[0].clone());
+        outer.header = BASE64.encode(serde_json::to_vec(&header).unwrap());
+        let duplicate = serde_json::to_vec(&outer).unwrap();
+        assert!(read_manifest_header(&duplicate, &policy, Some(&parent)).is_err());
+    }
+
+    #[test]
+    fn wrong_recipient_key_is_rejected_by_signed_commitment() {
+        let owner = KeyFile::generate();
+        let (policy, _) = PolicyState::genesis(&owner).unwrap();
+        let intended = random_key();
+        let wrong = random_key();
+        let manifest = Manifest::genesis(owner.repository_root.clone(), &policy);
+        let bytes = seal_manifest(
+            &owner,
+            &policy,
+            &intended,
+            ManifestAuthorization::PolicyTransition,
+            manifest,
+        )
+        .unwrap();
+        let mut outer: ManifestEnvelope = serde_json::from_slice(&bytes).unwrap();
+        let mut header: ManifestHeader =
+            serde_json::from_slice(&BASE64.decode(&outer.header).unwrap()).unwrap();
+        let PublicDevice {
+            wrapping_public_key,
+            device_id,
+            ..
+        } = owner.public_device().unwrap();
+        let aad = generation_key_aad(
+            &header.repository_root,
+            header.generation,
+            &header.policy_id,
+            &device_id,
+            &header.key_commitment,
+        );
+        let (encapsulated, ciphertext) =
+            wrap_generation_key(&wrapping_public_key, &wrong, &aad).unwrap();
+        header.generation_key_envelopes = vec![GenerationKeyEnvelope {
+            device_id,
+            encapsulated_key: BASE64.encode(encapsulated),
+            ciphertext: BASE64.encode(ciphertext),
+        }];
+        let exact_header = serde_json::to_vec(&header).unwrap();
+        let body_ciphertext = BASE64.decode(&outer.body_ciphertext).unwrap();
+        outer.header = BASE64.encode(&exact_header);
+        outer.signature = BASE64.encode(
+            owner
+                .sign_domain(
+                    MANIFEST_SIGNATURE_DOMAIN,
+                    &manifest_signed_bytes(&exact_header, &body_ciphertext),
+                )
+                .unwrap(),
+        );
+        let malicious = serde_json::to_vec(&outer).unwrap();
+        let verified = read_manifest_header(&malicious, &policy, None).unwrap();
+        assert!(unwrap_generation_key(&verified, &owner).is_err());
+    }
 }

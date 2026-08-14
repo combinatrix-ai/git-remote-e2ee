@@ -92,7 +92,7 @@ fn two_devices_can_decrypt_and_push_independently() {
 }
 
 #[test]
-fn revocation_rotates_epoch_rewraps_history_and_blocks_future_access() {
+fn revocation_rotates_generation_key_without_rewriting_history() {
     let temp = tempfile::tempdir().unwrap();
     let remote = temp.path().join("remote");
     let source = temp.path().join("source");
@@ -109,6 +109,7 @@ fn revocation_rotates_epoch_rewraps_history_and_blocks_future_access() {
     repo_a.push_ref(&source, "refs/heads/main", false).unwrap();
     commit(&source, "second pack\n", "second pack");
     repo_a.push_ref(&source, "refs/heads/main", false).unwrap();
+    assert_eq!(count_files(&remote.join("objects")), 2);
     repo_a
         .add_device(
             key_b.public_device().unwrap(),
@@ -116,16 +117,18 @@ fn revocation_rotates_epoch_rewraps_history_and_blocks_future_access() {
             &admin_pin,
         )
         .unwrap();
+    assert_eq!(count_files(&remote.join("objects")), 2);
     let before_revoke = temp.path().join("before-revoke");
     copy_directory(&remote, &before_revoke);
 
     repo_a
         .revoke_device(&key_b.device_id().unwrap(), &admin_pin)
         .unwrap();
+    assert_eq!(count_files(&remote.join("objects")), 2);
     let repo_b = EncryptedRepository::new(FilesystemStorage::new(&remote), key_b.clone());
     assert!(repo_b.current_manifest().is_err());
     let old_repo_b = EncryptedRepository::new(FilesystemStorage::new(&before_revoke), key_b);
-    assert_eq!(old_repo_b.current_manifest().unwrap().1.packs.len(), 2);
+    assert_eq!(old_repo_b.current_manifest().unwrap().1.total_pack_count, 2);
 
     repo_a
         .add_device(
@@ -134,15 +137,67 @@ fn revocation_rotates_epoch_rewraps_history_and_blocks_future_access() {
             &admin_pin,
         )
         .unwrap();
+    assert_eq!(count_files(&remote.join("objects")), 2);
     let destination = temp.path().join("destination");
     initialize_git(&destination);
     let repo_c = EncryptedRepository::new(FilesystemStorage::new(&remote), key_c);
     let manifest = repo_c.fetch_into(&destination, "e2ee").unwrap();
     repo_c.verify().unwrap();
-    assert_eq!(manifest.packs.len(), 2);
+    assert_eq!(manifest.total_pack_count, 2);
     assert_eq!(
         git(&destination, &["show", "refs/remotes/e2ee/main:note.md"]),
         "second pack"
+    );
+}
+
+#[test]
+fn membership_observation_pins_head_without_skipping_later_pack_import() {
+    let temp = tempfile::tempdir().unwrap();
+    let remote = temp.path().join("remote");
+    let source = temp.path().join("source");
+    let client = temp.path().join("client");
+    let admin_pin = temp.path().join("admin-state.json");
+    initialize_git(&source);
+    initialize_git(&client);
+
+    let key_a = KeyFile::generate();
+    let key_b = KeyFile::generate_for_repository(key_a.repository_root.clone()).unwrap();
+    let repository = EncryptedRepository::new(FilesystemStorage::new(&remote), key_a);
+    repository.initialize().unwrap();
+    repository.pin_admin_state(&admin_pin).unwrap();
+    commit(&source, "one\n", "one");
+    repository
+        .push_ref(&source, "refs/heads/main", false)
+        .unwrap();
+    repository.fetch_into(&client, "e2ee").unwrap();
+    let before_membership = fs::read_to_string(remote.join("HEAD")).unwrap();
+
+    repository
+        .add_device(
+            key_b.public_device().unwrap(),
+            DeviceRoles::collaborator(),
+            &admin_pin,
+        )
+        .unwrap();
+    repository.observe_manifest(&client, "e2ee").unwrap();
+    let after_membership = fs::read_to_string(remote.join("HEAD")).unwrap();
+
+    fs::write(remote.join("HEAD"), &before_membership).unwrap();
+    let error = repository
+        .observe_manifest(&client, "e2ee")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("rolled back"), "unexpected error: {error}");
+
+    fs::write(remote.join("HEAD"), after_membership).unwrap();
+    commit(&source, "two\n", "two");
+    repository
+        .push_ref(&source, "refs/heads/main", false)
+        .unwrap();
+    repository.fetch_into(&client, "e2ee").unwrap();
+    assert_eq!(
+        git(&client, &["show", "refs/remotes/e2ee/main:note.md"]),
+        "two"
     );
 }
 
@@ -223,4 +278,18 @@ fn copy_directory(source: &Path, destination: &Path) {
             fs::copy(entry.path(), target).unwrap();
         }
     }
+}
+
+fn count_files(path: &Path) -> usize {
+    fs::read_dir(path)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                count_files(&entry.path())
+            } else {
+                1
+            }
+        })
+        .sum()
 }

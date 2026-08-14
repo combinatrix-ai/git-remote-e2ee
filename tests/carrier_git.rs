@@ -187,7 +187,7 @@ fn carrier_git_allows_exactly_one_concurrent_writer() {
     let manifest = fresh.verify().unwrap();
     assert_eq!(manifest.generation, 1);
     assert_eq!(manifest.refs.len(), 1);
-    assert_eq!(manifest.packs.len(), 1);
+    assert_eq!(manifest.total_pack_count, 1);
     assert_eq!(
         git(
             temporary.path(),
