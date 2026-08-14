@@ -21,7 +21,7 @@ path = "src/bin/git-remote-e2ee.rs"
 [dependencies]
 anyhow = "1.0"
 base64 = "0.22"
-chacha20poly1305 = "0.10"
+chacha20poly1305 = { version = "0.10", features = ["stream"] }
 clap = { version = "4.5", features = ["derive"] }
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 fs2 = "0.4"

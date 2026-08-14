@@ -1,10 +1,11 @@
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use chacha20poly1305::aead::stream::{DecryptorBE32, EncryptorBE32, Nonce, StreamBE32};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -21,10 +22,15 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-const SYMMETRIC_MAGIC: &[u8; 8] = b"E2EES03\0";
-const HPKE_INFO: &[u8] = b"git-remote-e2ee generation key v3";
-const KEY_COMMITMENT_DOMAIN: &[u8] = b"git-remote-e2ee generation key commitment v3\0";
-const SUBKEY_SALT: &[u8] = b"git-remote-e2ee subkey derivation v3\0";
+const SYMMETRIC_MAGIC: &[u8; 8] = b"E2EES04\0";
+const PACK_STREAM_MAGIC: &[u8; 8] = b"E2EEPK4\0";
+const HPKE_INFO: &[u8] = b"git-remote-e2ee generation key v4";
+const KEY_COMMITMENT_DOMAIN: &[u8] = b"git-remote-e2ee generation key commitment v4\0";
+const SUBKEY_SALT: &[u8] = b"git-remote-e2ee subkey derivation v4\0";
+pub const PACK_STREAM_CHUNK_SIZE: usize = 1024 * 1024;
+const PACK_STREAM_NONCE_SIZE: usize = 19;
+const PACK_STREAM_TAG_SIZE: usize = 16;
+const PACK_STREAM_HEADER_SIZE: usize = PACK_STREAM_MAGIC.len() + 4 + PACK_STREAM_NONCE_SIZE;
 
 type HpkeKem = X25519HkdfSha256;
 type HpkeKdf = HkdfSha256;
@@ -336,6 +342,226 @@ pub fn open_with_key(key: &[u8; 32], envelope: &[u8], associated_data: &[u8]) ->
         .map_err(|_| anyhow::anyhow!("encrypted object authentication failed"))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamSealResult {
+    pub object_id: String,
+    pub plaintext_size: u64,
+    pub ciphertext_size: u64,
+}
+
+struct DigestWriter<W> {
+    inner: W,
+    hasher: Sha256,
+    count: u64,
+}
+
+impl<W: Write> DigestWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+            count: 0,
+        }
+    }
+
+    fn finish(self) -> (String, u64) {
+        (hex::encode(self.hasher.finalize()), self.count)
+    }
+}
+
+impl<W: Write> Write for DigestWriter<W> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(data)?;
+        self.hasher.update(&data[..written]);
+        self.count += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn pack_stream_aad(base_aad: &[u8], header: &[u8]) -> Vec<u8> {
+    let mut aad = b"git-remote-e2ee pack stream v4\0".to_vec();
+    aad.extend_from_slice(&(base_aad.len() as u32).to_le_bytes());
+    aad.extend_from_slice(base_aad);
+    aad.extend_from_slice(&(header.len() as u32).to_le_bytes());
+    aad.extend_from_slice(header);
+    aad
+}
+
+fn read_chunk(reader: &mut impl Read) -> Result<Vec<u8>> {
+    let mut chunk = vec![0_u8; PACK_STREAM_CHUNK_SIZE];
+    let mut filled = 0;
+    while filled < chunk.len() {
+        match reader.read(&mut chunk[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    chunk.truncate(filled);
+    Ok(chunk)
+}
+
+pub fn seal_pack_stream(
+    key: &[u8; 32],
+    mut plaintext: impl Read,
+    ciphertext: impl Write,
+    base_aad: &[u8],
+) -> Result<StreamSealResult> {
+    let mut nonce = [0_u8; PACK_STREAM_NONCE_SIZE];
+    OsRng.fill_bytes(&mut nonce);
+    let mut header = Vec::with_capacity(PACK_STREAM_HEADER_SIZE);
+    header.extend_from_slice(PACK_STREAM_MAGIC);
+    header.extend_from_slice(&(PACK_STREAM_CHUNK_SIZE as u32).to_le_bytes());
+    header.extend_from_slice(&nonce);
+    let aad = pack_stream_aad(base_aad, &header);
+    let stream_nonce =
+        Nonce::<XChaCha20Poly1305, StreamBE32<XChaCha20Poly1305>>::from_slice(&nonce);
+    let mut encryptor = EncryptorBE32::<XChaCha20Poly1305>::new(key.into(), stream_nonce);
+    let mut output = DigestWriter::new(ciphertext);
+    output.write_all(&header)?;
+
+    let mut current = read_chunk(&mut plaintext)?;
+    if current.is_empty() {
+        bail!("cannot encrypt an empty pack stream")
+    }
+    let mut plaintext_size = 0_u64;
+    let mut segments = 0_u64;
+    loop {
+        let next = read_chunk(&mut plaintext)?;
+        plaintext_size = plaintext_size
+            .checked_add(current.len() as u64)
+            .context("pack plaintext size overflow")?;
+        segments += 1;
+        if segments >= u32::MAX as u64 {
+            bail!("pack stream exceeds segment counter limit")
+        }
+        if next.is_empty() {
+            encryptor
+                .encrypt_last_in_place(&aad, &mut current)
+                .map_err(|_| anyhow::anyhow!("pack stream encryption failed"))?;
+            output.write_all(&current)?;
+            break;
+        }
+        encryptor
+            .encrypt_next_in_place(&aad, &mut current)
+            .map_err(|_| anyhow::anyhow!("pack stream encryption failed"))?;
+        output.write_all(&current)?;
+        current = next;
+    }
+    output.flush()?;
+    let (object_id, ciphertext_size) = output.finish();
+    Ok(StreamSealResult {
+        object_id,
+        plaintext_size,
+        ciphertext_size,
+    })
+}
+
+pub fn open_pack_stream(
+    key: &[u8; 32],
+    mut ciphertext: impl Read,
+    mut plaintext: impl Write,
+    base_aad: &[u8],
+    plaintext_size: u64,
+    expected_id: &str,
+) -> Result<u64> {
+    if plaintext_size == 0 {
+        bail!("pack plaintext size must be nonzero")
+    }
+    let mut header = [0_u8; PACK_STREAM_HEADER_SIZE];
+    ciphertext
+        .read_exact(&mut header)
+        .context("truncated pack stream header")?;
+    if &header[..PACK_STREAM_MAGIC.len()] != PACK_STREAM_MAGIC {
+        bail!("invalid pack stream magic")
+    }
+    let chunk_size_start = PACK_STREAM_MAGIC.len();
+    let chunk_size = u32::from_le_bytes(
+        header[chunk_size_start..chunk_size_start + 4]
+            .try_into()
+            .expect("fixed chunk size field"),
+    ) as usize;
+    if chunk_size != PACK_STREAM_CHUNK_SIZE {
+        bail!("unsupported pack stream chunk size")
+    }
+    let segments = plaintext_size.div_ceil(PACK_STREAM_CHUNK_SIZE as u64);
+    if segments == 0 || segments >= u32::MAX as u64 {
+        bail!("pack stream exceeds segment counter limit")
+    }
+    let tag_bytes = segments
+        .checked_mul(PACK_STREAM_TAG_SIZE as u64)
+        .context("pack stream tag size overflow")?;
+    let expected_ciphertext_size = (PACK_STREAM_HEADER_SIZE as u64)
+        .checked_add(plaintext_size)
+        .and_then(|size| size.checked_add(tag_bytes))
+        .context("pack ciphertext size overflow")?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(header);
+    let aad = pack_stream_aad(base_aad, &header);
+    let nonce_start = chunk_size_start + 4;
+    let stream_nonce = Nonce::<XChaCha20Poly1305, StreamBE32<XChaCha20Poly1305>>::from_slice(
+        &header[nonce_start..],
+    );
+    let mut decryptor = Some(DecryptorBE32::<XChaCha20Poly1305>::new(
+        key.into(),
+        stream_nonce,
+    ));
+    let mut remaining = plaintext_size;
+    let mut ciphertext_count = PACK_STREAM_HEADER_SIZE as u64;
+    for segment in 0..segments {
+        let plain_len = remaining.min(PACK_STREAM_CHUNK_SIZE as u64) as usize;
+        let cipher_len = plain_len + PACK_STREAM_TAG_SIZE;
+        let mut chunk = vec![0_u8; cipher_len];
+        ciphertext
+            .read_exact(&mut chunk)
+            .with_context(|| format!("truncated pack stream segment {segment}"))?;
+        hasher.update(&chunk);
+        ciphertext_count += chunk.len() as u64;
+        if segment + 1 == segments {
+            decryptor
+                .take()
+                .expect("final pack segment is processed once")
+                .decrypt_last_in_place(&aad, &mut chunk)
+                .map_err(|_| anyhow::anyhow!("pack stream authentication failed"))?;
+        } else {
+            decryptor
+                .as_mut()
+                .expect("pack stream decryptor is active")
+                .decrypt_next_in_place(&aad, &mut chunk)
+                .map_err(|_| anyhow::anyhow!("pack stream authentication failed"))?;
+        }
+        if chunk.len() != plain_len {
+            bail!("pack stream segment length mismatch")
+        }
+        plaintext.write_all(&chunk)?;
+        remaining -= plain_len as u64;
+    }
+    let mut trailing = [0_u8; 1];
+    loop {
+        match ciphertext.read(&mut trailing) {
+            Ok(0) => break,
+            Ok(_) => bail!("pack stream has trailing data"),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if remaining != 0 || ciphertext_count != expected_ciphertext_size {
+        bail!("pack stream size mismatch")
+    }
+    let actual_id = hex::encode(hasher.finalize());
+    if actual_id != expected_id {
+        bail!("pack ciphertext hash mismatch for {expected_id}")
+    }
+    plaintext.flush()?;
+    Ok(ciphertext_count)
+}
+
 pub fn object_id(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -387,6 +613,35 @@ fn validate_root(root: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn pack_bytes(size: usize) -> Vec<u8> {
+        (0..size).map(|index| (index % 251) as u8).collect()
+    }
+
+    fn seal_test_pack(plaintext: &[u8]) -> (SecretKey, Vec<u8>, StreamSealResult) {
+        let key = random_key();
+        let mut ciphertext = Vec::new();
+        let sealed = seal_pack_stream(&key, plaintext, &mut ciphertext, b"test-pack").unwrap();
+        (key, ciphertext, sealed)
+    }
+
+    fn open_test_pack(
+        key: &[u8; 32],
+        ciphertext: &[u8],
+        plaintext_size: u64,
+        id: &str,
+    ) -> Result<Vec<u8>> {
+        let mut plaintext = Vec::new();
+        open_pack_stream(
+            key,
+            ciphertext,
+            &mut plaintext,
+            b"test-pack",
+            plaintext_size,
+            id,
+        )?;
+        Ok(plaintext)
+    }
+
     #[test]
     fn symmetric_ciphertext_is_randomized_and_context_bound() {
         let key = random_key();
@@ -431,5 +686,143 @@ mod tests {
         verify_key_commitment(&key, &commitment).unwrap();
         let wrong = random_key();
         assert!(verify_key_commitment(&wrong, &commitment).is_err());
+    }
+
+    #[test]
+    fn pack_stream_round_trips_chunk_boundaries() {
+        for size in [
+            1,
+            PACK_STREAM_CHUNK_SIZE - 1,
+            PACK_STREAM_CHUNK_SIZE,
+            PACK_STREAM_CHUNK_SIZE + 1,
+            PACK_STREAM_CHUNK_SIZE * 2,
+        ] {
+            let plaintext = pack_bytes(size);
+            let (key, ciphertext, sealed) = seal_test_pack(&plaintext);
+            assert_eq!(sealed.plaintext_size, size as u64);
+            assert_eq!(sealed.ciphertext_size, ciphertext.len() as u64);
+            assert_eq!(sealed.object_id, object_id(&ciphertext));
+            assert_eq!(
+                open_test_pack(&key, &ciphertext, size as u64, &sealed.object_id).unwrap(),
+                plaintext
+            );
+        }
+    }
+
+    #[test]
+    fn pack_stream_is_randomized_and_context_bound() {
+        let plaintext = pack_bytes(PACK_STREAM_CHUNK_SIZE + 1);
+        let key = random_key();
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        let first_result =
+            seal_pack_stream(&key, plaintext.as_slice(), &mut first, b"context").unwrap();
+        seal_pack_stream(&key, plaintext.as_slice(), &mut second, b"context").unwrap();
+        assert_ne!(first, second);
+
+        let mut output = Vec::new();
+        assert!(
+            open_pack_stream(
+                &key,
+                first.as_slice(),
+                &mut output,
+                b"other-context",
+                plaintext.len() as u64,
+                &first_result.object_id,
+            )
+            .is_err()
+        );
+        assert!(
+            open_test_pack(
+                &random_key(),
+                &first,
+                plaintext.len() as u64,
+                &first_result.object_id,
+            )
+            .is_err()
+        );
+
+        let wrong_id = object_id(b"not this ciphertext");
+        let mut authenticated_plaintext = Vec::new();
+        let error = open_pack_stream(
+            &key,
+            first.as_slice(),
+            &mut authenticated_plaintext,
+            b"context",
+            plaintext.len() as u64,
+            &wrong_id,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("pack ciphertext hash mismatch"));
+        assert_eq!(authenticated_plaintext, plaintext);
+    }
+
+    #[test]
+    fn pack_stream_rejects_tamper_reorder_duplicate_truncation_and_trailing_data() {
+        let plaintext = pack_bytes(PACK_STREAM_CHUNK_SIZE * 2 + 7);
+        let (key, ciphertext, sealed) = seal_test_pack(&plaintext);
+        let first_segment = PACK_STREAM_CHUNK_SIZE + PACK_STREAM_TAG_SIZE;
+
+        let mut tampered = ciphertext.clone();
+        tampered[PACK_STREAM_HEADER_SIZE + 17] ^= 1;
+        assert!(open_test_pack(&key, &tampered, sealed.plaintext_size, &sealed.object_id).is_err());
+
+        let mut reordered = ciphertext.clone();
+        let segments = &mut reordered[PACK_STREAM_HEADER_SIZE..];
+        let (first, rest) = segments.split_at_mut(first_segment);
+        let second = &mut rest[..first_segment];
+        first.swap_with_slice(second);
+        assert!(
+            open_test_pack(&key, &reordered, sealed.plaintext_size, &sealed.object_id).is_err()
+        );
+
+        let mut duplicated = ciphertext[..PACK_STREAM_HEADER_SIZE + first_segment].to_vec();
+        duplicated.extend_from_slice(&ciphertext[PACK_STREAM_HEADER_SIZE..]);
+        assert!(
+            open_test_pack(&key, &duplicated, sealed.plaintext_size, &sealed.object_id).is_err()
+        );
+
+        let mut truncated = ciphertext.clone();
+        truncated.pop();
+        assert!(
+            open_test_pack(&key, &truncated, sealed.plaintext_size, &sealed.object_id).is_err()
+        );
+
+        let mut trailing = ciphertext.clone();
+        trailing.push(0);
+        assert!(open_test_pack(&key, &trailing, sealed.plaintext_size, &sealed.object_id).is_err());
+    }
+
+    #[test]
+    fn pack_stream_rejects_forged_header_size_and_legacy_magic() {
+        let plaintext = pack_bytes(1234);
+        let (key, ciphertext, sealed) = seal_test_pack(&plaintext);
+
+        for wrong_size in [sealed.plaintext_size - 1, sealed.plaintext_size + 1] {
+            assert!(open_test_pack(&key, &ciphertext, wrong_size, &sealed.object_id).is_err());
+        }
+
+        let mut forged_chunk_size = ciphertext.clone();
+        forged_chunk_size[PACK_STREAM_MAGIC.len()..PACK_STREAM_MAGIC.len() + 4]
+            .copy_from_slice(&4096_u32.to_le_bytes());
+        assert!(
+            open_test_pack(
+                &key,
+                &forged_chunk_size,
+                sealed.plaintext_size,
+                &sealed.object_id,
+            )
+            .is_err()
+        );
+
+        let mut legacy = ciphertext;
+        legacy[..PACK_STREAM_MAGIC.len()].copy_from_slice(b"E2EEPK3\0");
+        assert!(open_test_pack(&key, &legacy, sealed.plaintext_size, &sealed.object_id).is_err());
+    }
+
+    #[test]
+    fn pack_stream_rejects_empty_plaintext() {
+        let mut ciphertext = Vec::new();
+        assert!(seal_pack_stream(&random_key(), &[][..], &mut ciphertext, b"test-pack").is_err());
     }
 }

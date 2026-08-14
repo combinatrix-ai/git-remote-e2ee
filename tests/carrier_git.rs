@@ -319,7 +319,7 @@ fn carrier_git_detects_tampered_ciphertext_chunk() {
     let fresh = EncryptedRepository::new(GitStorage::open(carrier.to_str().unwrap()).unwrap(), key);
     let error = fresh.verify().unwrap_err();
     assert!(
-        error.to_string().contains("pack ciphertext hash mismatch"),
+        error.to_string().contains("invalid pack stream magic"),
         "unexpected verification error: {error:#}"
     );
 }

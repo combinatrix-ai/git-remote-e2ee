@@ -308,6 +308,58 @@ fn detects_tampered_pack_ciphertext() {
 }
 
 #[test]
+fn late_stream_authentication_failure_does_not_advance_refs_or_pins() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let destination = temporary.path().join("destination");
+    let remote_path = temporary.path().join("remote");
+    initialize_git(&source);
+    initialize_git(&destination);
+
+    let mut state = 0x9e37_79b9_u32;
+    let contents: Vec<u8> = (0..(2 * 1024 * 1024 + 123))
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect();
+    fs::write(source.join("large.bin"), contents).unwrap();
+    git(&source, &["add", "large.bin"]);
+    git(&source, &["commit", "-q", "-m", "large"]);
+
+    let key = KeyFile::generate();
+    let encrypted = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key);
+    encrypted.initialize().unwrap();
+    encrypted
+        .push_ref(&source, "refs/heads/main", false)
+        .unwrap();
+    let manifest = encrypted.current_manifest().unwrap().1;
+    let id = &manifest.new_packs[0].id;
+    let path = remote_path.join("objects").join(&id[..2]).join(id);
+    let mut bytes = fs::read(&path).unwrap();
+    assert!(bytes.len() > 1024 * 1024 * 2);
+    let last = bytes.len() - 1;
+    bytes[last] ^= 1;
+    fs::write(path, bytes).unwrap();
+
+    assert!(encrypted.fetch_into(&destination, "encrypted").is_err());
+    assert!(
+        !destination
+            .join(".git/git-remote-e2ee/encrypted/state.json")
+            .exists()
+    );
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&destination)
+        .args(["rev-parse", "--verify", "refs/remotes/encrypted/main"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+}
+
+#[test]
 fn rejects_storage_head_rollback_after_fetch_pins_history() {
     let temporary = tempfile::tempdir().unwrap();
     let source = temporary.path().join("source");

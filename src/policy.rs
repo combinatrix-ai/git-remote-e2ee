@@ -10,8 +10,8 @@ use crate::crypto::{
     verify_domain,
 };
 
-pub const POLICY_FORMAT_VERSION: u32 = 2;
-const POLICY_SIGNATURE_DOMAIN: &[u8] = b"git-remote-e2ee policy v3\0";
+pub const POLICY_FORMAT_VERSION: u32 = 3;
+const POLICY_SIGNATURE_DOMAIN: &[u8] = b"git-remote-e2ee policy v4\0";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

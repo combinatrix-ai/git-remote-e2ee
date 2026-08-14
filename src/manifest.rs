@@ -12,8 +12,8 @@ use crate::crypto::{
 };
 use crate::policy::PolicyState;
 
-pub const FORMAT_VERSION: u32 = 3;
-const MANIFEST_SIGNATURE_DOMAIN: &[u8] = b"git-remote-e2ee manifest v3\0";
+pub const FORMAT_VERSION: u32 = 4;
+const MANIFEST_SIGNATURE_DOMAIN: &[u8] = b"git-remote-e2ee manifest v4\0";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -429,7 +429,7 @@ pub fn unwrap_predecessor_key(
 }
 
 pub fn pack_aad(repository_root: &str, generation: u64, ordinal: u64) -> Vec<u8> {
-    let mut aad = b"git-remote-e2ee pack v3\0".to_vec();
+    let mut aad = b"git-remote-e2ee pack v4\0".to_vec();
     push_field(&mut aad, repository_root.as_bytes());
     aad.extend_from_slice(&generation.to_le_bytes());
     aad.extend_from_slice(&ordinal.to_le_bytes());
@@ -488,6 +488,9 @@ fn validate_pack_delta(manifest: &Manifest) -> Result<()> {
         if pack.generation != manifest.generation || pack.ordinal != index as u64 {
             bail!("pack delta has a non-dense generation-local ordinal")
         }
+        if pack.plaintext_size == 0 {
+            bail!("pack plaintext size must be nonzero")
+        }
         if !ids.insert(pack.id.as_str()) {
             bail!("pack delta contains a duplicate ciphertext id")
         }
@@ -509,7 +512,7 @@ fn generation_key_aad(
     recipient_id: &str,
     commitment: &str,
 ) -> Vec<u8> {
-    let mut aad = b"git-remote-e2ee generation envelope v3\0".to_vec();
+    let mut aad = b"git-remote-e2ee generation envelope v4\0".to_vec();
     push_field(&mut aad, root.as_bytes());
     aad.extend_from_slice(&generation.to_le_bytes());
     push_field(&mut aad, policy_id.as_bytes());
@@ -519,14 +522,14 @@ fn generation_key_aad(
 }
 
 fn manifest_body_aad(root: &str, generation: u64) -> Vec<u8> {
-    let mut aad = b"git-remote-e2ee manifest body v3\0".to_vec();
+    let mut aad = b"git-remote-e2ee manifest body v4\0".to_vec();
     push_field(&mut aad, root.as_bytes());
     aad.extend_from_slice(&generation.to_le_bytes());
     aad
 }
 
 fn predecessor_link_aad(root: &str, generation: u64, previous_id: &str) -> Vec<u8> {
-    let mut aad = b"git-remote-e2ee predecessor link v3\0".to_vec();
+    let mut aad = b"git-remote-e2ee predecessor link v4\0".to_vec();
     push_field(&mut aad, root.as_bytes());
     aad.extend_from_slice(&generation.to_le_bytes());
     push_field(&mut aad, previous_id.as_bytes());

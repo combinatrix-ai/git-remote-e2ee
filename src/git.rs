@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::fs::File;
+use std::io::{Read, Write};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 
@@ -47,18 +48,59 @@ pub fn object_exists(repo: &Path, object: &str) -> Result<bool> {
     }
 }
 
-pub fn create_incremental_pack(
+pub struct PackSource {
+    child: Child,
+    stdout: Option<ChildStdout>,
+    stderr: File,
+    finished: bool,
+}
+
+impl Read for PackSource {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.stdout
+            .as_mut()
+            .expect("pack source stdout is available")
+            .read(buffer)
+    }
+}
+
+impl PackSource {
+    pub fn finish(mut self) -> Result<()> {
+        self.stdout.take();
+        let status = self.child.wait()?;
+        self.finished = true;
+        if !status.success() {
+            bail!(
+                "git pack-objects failed: {}",
+                read_process_error(&mut self.stderr)
+            )
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PackSource {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+pub fn start_incremental_pack(
     repo: &Path,
     new_refs: &BTreeMap<String, String>,
     old_refs: &BTreeMap<String, String>,
-) -> Result<Vec<u8>> {
+) -> Result<PackSource> {
+    let stderr = tempfile::tempfile().context("create pack-objects stderr file")?;
     let mut child = Command::new("git")
         .arg("-C")
         .arg(repo)
         .args(["pack-objects", "--stdout", "--revs"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::from(stderr.try_clone()?))
         .spawn()?;
     {
         let input = child
@@ -72,41 +114,93 @@ pub fn create_incremental_pack(
             writeln!(input, "^{object}")?;
         }
     }
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        bail!(
-            "git pack-objects failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-    }
-    if output.stdout.is_empty() {
-        bail!("git produced an empty pack")
-    }
-    Ok(output.stdout)
+    child.stdin.take();
+    let stdout = child
+        .stdout
+        .take()
+        .context("open git pack-objects stdout")?;
+    Ok(PackSource {
+        child,
+        stdout: Some(stdout),
+        stderr,
+        finished: false,
+    })
 }
 
-pub fn import_pack(repo: &Path, pack: &[u8]) -> Result<()> {
+pub struct PackImporter {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    stderr: File,
+    finished: bool,
+}
+
+impl Write for PackImporter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.stdin
+            .as_mut()
+            .expect("pack importer stdin is available")
+            .write(buffer)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stdin
+            .as_mut()
+            .expect("pack importer stdin is available")
+            .flush()
+    }
+}
+
+impl PackImporter {
+    pub fn finish(mut self) -> Result<()> {
+        self.stdin.take();
+        let status = self.child.wait()?;
+        self.finished = true;
+        if !status.success() {
+            bail!(
+                "git index-pack failed: {}",
+                read_process_error(&mut self.stderr)
+            )
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PackImporter {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.stdin.take();
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+pub fn start_pack_import(repo: &Path) -> Result<PackImporter> {
+    let stderr = tempfile::tempfile().context("create index-pack stderr file")?;
     let mut child = Command::new("git")
         .arg("-C")
         .arg(repo)
         .args(["index-pack", "--stdin"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::from(stderr.try_clone()?))
         .spawn()?;
-    child
-        .stdin
-        .as_mut()
-        .context("open git index-pack stdin")?
-        .write_all(pack)?;
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        bail!(
-            "git index-pack failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-    }
-    Ok(())
+    let stdin = child.stdin.take().context("open git index-pack stdin")?;
+    Ok(PackImporter {
+        child,
+        stdin: Some(stdin),
+        stderr,
+        finished: false,
+    })
+}
+
+fn read_process_error(file: &mut File) -> String {
+    use std::io::Seek;
+
+    let _ = file.rewind();
+    let mut message = String::new();
+    let _ = file.read_to_string(&mut message);
+    message.trim().to_owned()
 }
 
 pub fn ensure_refs_connected(repo: &Path, refs: &BTreeMap<String, String>) -> Result<()> {

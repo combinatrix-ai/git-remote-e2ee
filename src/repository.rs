@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -9,8 +9,8 @@ use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::{
-    KeyFile, PublicDevice, SecretKey, SubkeyKind, derive_subkey, object_id, open_with_key,
-    random_key, seal_with_key,
+    KeyFile, PublicDevice, SecretKey, SubkeyKind, derive_subkey, object_id, open_pack_stream,
+    random_key, seal_pack_stream,
 };
 use crate::git;
 use crate::manifest::{
@@ -234,7 +234,6 @@ impl<S: Storage> EncryptedRepository<S> {
             }
         }
         let pack_refs = BTreeMap::from([(destination_ref.to_owned(), next_object)]);
-        let pack = git::create_incremental_pack(repo, &pack_refs, &exclusions)?;
 
         let next_key = random_key();
         let generation = current.manifest.generation + 1;
@@ -246,17 +245,19 @@ impl<S: Storage> EncryptedRepository<S> {
             SubkeyKind::Pack,
             ordinal,
         )?;
-        let encrypted_pack = seal_with_key(
+        let mut pack_source = git::start_incremental_pack(repo, &pack_refs, &exclusions)?;
+        let mut pack_stage = self.storage.begin_object(ObjectKind::Pack)?;
+        let sealed = seal_pack_stream(
             &pack_key,
-            &pack,
+            &mut pack_source,
+            &mut pack_stage,
             &pack_aad(&current.manifest.repository_root, generation, ordinal),
         )?;
-        let pack_id = object_id(&encrypted_pack);
-        self.storage
-            .put_object_if_absent(ObjectKind::Pack, &pack_id, &encrypted_pack)?;
+        pack_source.finish()?;
+        pack_stage.finish(&sealed.object_id)?;
         let descriptor = PackDescriptor {
-            id: pack_id,
-            plaintext_size: pack.len() as u64,
+            id: sealed.object_id,
+            plaintext_size: sealed.plaintext_size,
             generation,
             ordinal,
         };
@@ -403,10 +404,7 @@ impl<S: Storage> EncryptedRepository<S> {
                         descriptor.id
                     )
                 }
-                let encrypted = self.storage.get_object(ObjectKind::Pack, &descriptor.id)?;
-                if object_id(&encrypted) != descriptor.id {
-                    bail!("pack ciphertext hash mismatch for {}", descriptor.id)
-                }
+                let encrypted = self.storage.open_object(ObjectKind::Pack, &descriptor.id)?;
                 let pack_key = derive_subkey(
                     &entry.generation_key,
                     &entry.manifest.repository_root,
@@ -414,19 +412,20 @@ impl<S: Storage> EncryptedRepository<S> {
                     SubkeyKind::Pack,
                     descriptor.ordinal,
                 )?;
-                let pack = open_with_key(
+                let mut importer = git::start_pack_import(repo)?;
+                open_pack_stream(
                     &pack_key,
-                    &encrypted,
+                    encrypted,
+                    &mut importer,
                     &pack_aad(
                         &entry.manifest.repository_root,
                         descriptor.generation,
                         descriptor.ordinal,
                     ),
+                    descriptor.plaintext_size,
+                    &descriptor.id,
                 )?;
-                if pack.len() as u64 != descriptor.plaintext_size {
-                    bail!("pack plaintext size mismatch for {}", descriptor.id)
-                }
-                git::import_pack(repo, &pack)?;
+                importer.finish()?;
                 imported.insert(descriptor.id.clone());
             }
         }
@@ -496,10 +495,7 @@ impl<S: Storage> EncryptedRepository<S> {
         let mut count = 0_u64;
         for entry in chain.iter().rev() {
             for pack in &entry.manifest.new_packs {
-                let encrypted = self.storage.get_object(ObjectKind::Pack, &pack.id)?;
-                if object_id(&encrypted) != pack.id {
-                    bail!("pack ciphertext hash mismatch for {}", pack.id)
-                }
+                let encrypted = self.storage.open_object(ObjectKind::Pack, &pack.id)?;
                 let pack_key = derive_subkey(
                     &entry.generation_key,
                     &entry.manifest.repository_root,
@@ -507,14 +503,17 @@ impl<S: Storage> EncryptedRepository<S> {
                     SubkeyKind::Pack,
                     pack.ordinal,
                 )?;
-                open_with_key(
+                open_pack_stream(
                     &pack_key,
-                    &encrypted,
+                    encrypted,
+                    io::sink(),
                     &pack_aad(
                         &entry.manifest.repository_root,
                         pack.generation,
                         pack.ordinal,
                     ),
+                    pack.plaintext_size,
+                    &pack.id,
                 )?;
                 count += 1;
             }
@@ -751,6 +750,12 @@ fn read_client_state(path: &Path) -> Result<ClientState> {
         Ok(contents) => {
             let mut state: ClientState =
                 serde_json::from_slice(&contents).context("parse git-remote-e2ee client state")?;
+            if state.format_version > 4 {
+                bail!(
+                    "unsupported git-remote-e2ee client state format {}",
+                    state.format_version
+                )
+            }
             // v2 client states used the observed generation as the import
             // checkpoint because observation and import were one operation.
             if state.format_version < 3 && state.imported_generation.is_none() {
@@ -772,7 +777,7 @@ fn write_client_state(
     let mut values: Vec<_> = values.iter().cloned().collect();
     values.sort();
     let state = ClientState {
-        format_version: 3,
+        format_version: 4,
         packs: values,
         head_id: Some(head_id.to_owned()),
         generation: Some(manifest.generation),
@@ -790,7 +795,7 @@ fn write_observed_client_state(
     manifest: &Manifest,
 ) -> Result<()> {
     let state = ClientState {
-        format_version: 3,
+        format_version: 4,
         packs: previous.packs,
         head_id: Some(head_id.to_owned()),
         generation: Some(manifest.generation),

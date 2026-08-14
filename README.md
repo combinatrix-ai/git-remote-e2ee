@@ -17,9 +17,10 @@ names, commit IDs, paths, authors, or messages.
 > format is unstable and there are no compatibility guarantees between
 > versions. Keep an independent copy of every repository and key.
 
-The implemented v3 protocol gives every published generation a fresh random
+The implemented v4 protocol gives every published generation a fresh random
 root key. Each active reader receives one small public-key envelope for that
-generation; pack ciphertext is stored only once, independent of reader count.
+generation; pack ciphertext is stored only once, independent of reader count,
+and is authenticated in bounded-memory 1 MiB segments.
 See the [design overview](DESIGN.md) and [normative specification](SPEC.md).
 
 ## Why this exists
@@ -85,6 +86,8 @@ this project as research-grade software.
 - Per-device HPKE (X25519/HKDF-SHA-256/ChaCha20-Poly1305) generation-key envelopes
 - A fresh random generation root for every successful HEAD publication
 - Domain-separated HKDF subkeys and XChaCha20-Poly1305 payload encryption
+- Streaming authenticated pack encryption and decryption with bounded Rust-side
+  memory rather than whole-pack buffers
 - Ed25519-signed, append-only policy and manifest chains
 - 1-of-N recipient access: each authorized device unlocks with only its own key
 - Separate reader, writer, and administrator authorization
@@ -291,20 +294,28 @@ plaintext or keys.
 
 ## Storage protocol
 
-The backend-neutral interface has four operations:
+The backend-neutral interface has four logical operations. Immutable object
+writes are staged so the final ciphertext ID can be learned while streaming:
 
 ```text
-put_object_if_absent(kind, id, bytes)
-get_object(kind, id)
+begin_object(kind) -> writable stage; stage.finish(id)
+open_object(kind, id) -> reader
 read_head()
 compare_and_swap_head(expected, next)
 ```
 
 The filesystem backend implements head CAS with an advisory lock and atomic
-rename. The carrier-Git backend implements it as a normal fast-forward push to
-the outer branch. A future S3 backend can use conditional writes, but each
-provider must be capability-tested; “S3 compatible” does not by itself promise
-correct compare-and-swap behavior.
+rename. Stages are created inside the backend's own filesystem or checkout, so
+publication does not depend on cross-filesystem rename. The carrier-Git backend
+implements head CAS as a normal fast-forward push to the outer branch. A future
+S3 backend can use multipart upload plus conditional writes, but each provider
+must be capability-tested; “S3 compatible” does not by itself promise correct
+compare-and-swap behavior.
+
+A killed filesystem writer can leave an unreachable file under `.staging/`.
+No published object or `HEAD` points to it, and stale `.stage-*` entries may be
+deleted when no writer is running. Automatic age-based cleanup belongs to
+future garbage collection.
 
 See [DESIGN.md](DESIGN.md) for the protocol and threat-model details.
 
@@ -321,6 +332,8 @@ The test suite includes:
 - incremental push and reconstruction into a fresh repository;
 - native clone, fetch, pull, push, dry-run, refspec, and force-push behavior;
 - rollback, same-generation fork, and ciphertext-tampering rejection;
+- streaming-AEAD chunk boundaries, wrong keys/AAD, reordering, duplication,
+  truncation, trailing bytes, forged sizes, and legacy-format rejection;
 - independent device add/read/write, non-admin rejection, genesis-substitution
   rejection, administrative rollback pinning, device revocation without pack
   rewrites, and multi-generation offline catch-up;

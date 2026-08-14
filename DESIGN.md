@@ -1,6 +1,6 @@
 # Design
 
-This document summarizes the implemented v3 architecture. [`SPEC.md`](SPEC.md)
+This document summarizes the implemented v4 architecture. [`SPEC.md`](SPEC.md)
 defines the protocol invariants and security claims in detail.
 
 ## Goal
@@ -53,7 +53,8 @@ pack delta log.
 - Ed25519 exact-byte signatures
 - X25519/HKDF-SHA-256/ChaCha20-Poly1305 HPKE generation-key envelopes
 - HKDF-SHA-256 domain-separated object subkeys
-- XChaCha20-Poly1305 authenticated encryption
+- XChaCha20-Poly1305 authenticated encryption, using the STREAM construction
+  for Git packs
 - SHA-256 content IDs and generation-key commitments
 
 The signature covers exact header bytes and the encrypted body digest. The
@@ -82,7 +83,7 @@ Genesis contains exactly that active owner with reader, writer, and
 administrator roles and is self-signed. Child policies are authorized by an
 administrator in the parent policy.
 
-The format retains an administrator threshold and signature array, but v3
+The format retains an administrator threshold and signature array, but v4
 accepts threshold 1 and one signature only. Unsupported thresholds fail closed.
 
 ## Device operations
@@ -102,8 +103,11 @@ administrative CAS is never automatically rebased.
 ## Git semantics
 
 - New data is generated with `git pack-objects --stdout --revs`.
+- Pack output is encrypted as 1 MiB authenticated segments directly into a
+  backend-owned stage; it is never collected into a whole-pack Rust buffer.
 - Existing remote tips present locally are pack exclusions.
-- Packs are imported with `git index-pack` oldest-first.
+- Packs are decrypted segment by segment directly into `git index-pack`
+  oldest-first.
 - After import, every advertised ref must resolve to a complete local Git
   object graph before pins or remote-tracking refs move.
 - Client-side `git merge-base --is-ancestor` enforces fast-forward updates.
@@ -117,17 +121,22 @@ pin records IDs and generations, never decryption keys.
 
 ## Storage contract
 
-The backend-neutral trait remains:
+The backend-neutral trait uses staged immutable writes:
 
 ```text
-put_object_if_absent(kind, id, bytes)
-get_object(kind, id)
+begin_object(kind) -> writable stage; stage.finish(id)
+open_object(kind, id) -> reader
 read_head()
 compare_and_swap_head(expected, next)
 ```
 
-Filesystem storage serializes CAS with an advisory lock and publishes `HEAD`
-with atomic rename. Immutable objects are durable before the pointer moves.
+The ciphertext digest is computed during the write. `finish(id)` validates the
+digest and atomically publishes the staged object under that ID. Filesystem
+storage serializes CAS with an advisory lock and publishes `HEAD` with atomic
+rename. Immutable objects are durable before the pointer moves. Abandoned
+`.stage-*` files are unreachable; automatic cleanup is deferred to future GC.
+Manifest and policy objects still use bounded buffered parsing with a 16 MiB
+hard limit; large pack objects always use the streaming path.
 
 An S3 backend can use create-if-absent immutable writes and a conditional HEAD
 write, but requires a provider capability test; the label "S3 compatible" does
@@ -136,7 +145,7 @@ not guarantee correct compare-and-swap behavior.
 ## Carrier Git mapping
 
 The carrier backend maps protocol objects to normal blobs under `e2ee/`, split
-into 32 MiB chunks, on the dedicated branch
+into a dense canonical sequence of 32 MiB chunks, on the dedicated branch
 `refs/heads/git-remote-e2ee`. Each protocol publication creates an outer commit.
 A normal fast-forward push is the CAS: two candidates from the same parent
 cannot both win.
@@ -188,5 +197,5 @@ large content storage   sum(pack ciphertext sizes), independent of N
 ```
 
 Envelope metadata remains linear in readers per generation. Fresh clone time is
-linear in generations until checkpoint compaction exists. The v3 wire format
+linear in generations until checkpoint compaction exists. The v4 wire format
 reserves a checkpoint transition, but current clients reject it as unimplemented.

@@ -1,8 +1,8 @@
 # Protocol specification
 
 > [!WARNING]
-> This document specifies the experimental v3 format implemented by the current
-> prototype. The format is incompatible with v2. There is no automatic
+> This document specifies the experimental v4 format implemented by the current
+> prototype. The format is incompatible with v2 and v3. There is no automatic
 > migration; keep an independent plaintext copy and every device key.
 
 ## 1. Requirements
@@ -49,12 +49,13 @@ prevent an authorized reader from exporting plaintext.
 
 ## 3. Cryptographic construction
 
-The initial v3 format uses:
+The v4 format uses:
 
 - Ed25519 signatures;
 - X25519/HKDF-SHA-256/ChaCha20-Poly1305 HPKE Base mode;
 - HKDF-SHA-256 for object subkeys;
-- XChaCha20-Poly1305 for manifest, pack, and predecessor-link encryption;
+- XChaCha20-Poly1305 for manifest and predecessor-link encryption;
+- XChaCha20-Poly1305 STREAM with a big-endian 32-bit counter for packs;
 - SHA-256 for content IDs and generation-key commitments.
 
 Every successful publisher samples `K_t` independently from the operating
@@ -67,20 +68,23 @@ The publisher derives distinct subkeys using an injective, fixed-width context:
 ```text
 HKDF-SHA-256(
   input_key = K_t,
-  salt = protocol-specific v3 domain,
+  salt = protocol-specific v4 domain,
   info = repository_root || generation_u64_le || kind_u8 || ordinal_u64_le
 )
 ```
 
 The defined kinds are `manifest-body`, `pack`, and `predecessor-link`. A key is
-used for one logical message only. Each XChaCha20-Poly1305 envelope also carries
-a fresh random 24-byte nonce. Associated data binds the v3 domain, repository
-root, generation, object kind, and ordinal or parent manifest ID as applicable.
+used for one logical message only. Manifest and predecessor-link envelopes each
+carry a fresh random 24-byte nonce. Pack streams carry a fresh random 19-byte
+nonce prefix; the STREAM counter and final-segment marker complete the nonce.
+Associated data binds the v4 domain, repository root, generation, object kind,
+ordinal or parent manifest ID as applicable, and the complete pack-stream
+header.
 
 The signed header contains the full, untruncated commitment:
 
 ```text
-C_t = SHA-256("git-remote-e2ee generation key commitment v3" || K_t)
+C_t = SHA-256("git-remote-e2ee generation key commitment v4" || K_t)
 ```
 
 Commitments are compared in constant time before the corresponding key is used
@@ -111,7 +115,7 @@ Consequences:
   compromise of a device private key that remains an active recipient.
 - A new reader given `K_t` can traverse to genesis and therefore always gets
   full history.
-- Future-only onboarding is not supported by v3 because the predecessor link is
+- Future-only onboarding is not supported by v4 because the predecessor link is
   available to every reader of the current generation.
 
 ## 5. Stored objects
@@ -157,7 +161,7 @@ link. A policy must retain at least one active reader and administrator.
 
 Genesis has exactly one active owner with all three roles and is self-signed.
 Every child policy is signed by an administrator in its direct parent, never
-solely by authority introduced in the child. v3 supports threshold 1 and one
+solely by authority introduced in the child. v4 supports threshold 1 and one
 signature; other thresholds fail closed. A future M-of-N format must count
 distinct parent administrators under the parent's threshold.
 
@@ -199,12 +203,43 @@ The body contains:
 
 A pack descriptor contains ciphertext ID, plaintext size, creation generation,
 and a dense generation-local ordinal beginning at zero. Its subkey and AAD bind
-that generation and ordinal. Descriptor IDs must be unique within the delta.
+that generation and ordinal. Descriptor IDs must be unique within the delta and
+plaintext size must be nonzero.
 
 The manifest chain is the append-only pack inventory. Manifests do not repeat
 historical descriptors, avoiding quadratic cumulative-inventory metadata.
 
-### 7.3 Transition types
+### 7.3 Pack stream framing
+
+Each pack is encoded as:
+
+```text
+"E2EEPK4\0" || chunk_size_u32_le || nonce_prefix_19 || segments...
+```
+
+`chunk_size` MUST equal 1,048,576 bytes. Every non-final plaintext segment is
+exactly that size; the final segment is 1 through 1,048,576 bytes. Each stored
+segment adds a 16-byte Poly1305 tag. The signed descriptor plaintext size
+determines the exact segment count and ciphertext geometry. There must be at
+least one and fewer than `2^32-1` segments.
+
+The decoder MUST authenticate every segment, invoke the STREAM final operation
+exactly once, consume the exact computed ciphertext length, reject trailing
+bytes, and verify SHA-256 of the complete stored stream against the descriptor
+ID. A malformed header, size mismatch, counter overflow, short read, reordered
+or duplicated segment, authentication failure, trailing byte, or hash mismatch
+is fatal. Plaintext may stream into `git index-pack` before the final object hash
+is known, but no ref or continuity pin may move until all cryptographic,
+content-address, process, and Git-connectivity checks succeed.
+
+Immutable writes MUST be staged within the storage backend and become visible
+under their ciphertext ID only after the complete streamed hash matches that
+ID. A process killed before finalization can leave an unreachable `.stage-*`
+artifact; an implementation may delete stale stages only when it can establish
+that no live writer owns them. Stage cleanup never changes a published object
+or `HEAD`.
+
+### 7.4 Transition types
 
 Every successor is exactly one of:
 
@@ -350,7 +385,7 @@ manifest generations until checkpoint compaction exists.
 - Compromise of an active device private key is stronger: the attacker can
   unwrap later generation keys while the device remains active.
 - Old immutable headers retain envelopes. Later device-key compromise can
-  retroactively expose every generation addressed to that device. v3 has no
+  retroactively expose every generation addressed to that device. v4 has no
   forward secrecy for stored history.
 - Full-history onboarding is mandatory; future-only access requires a new
   format or an explicit compartment.
@@ -362,9 +397,12 @@ manifest generations until checkpoint compaction exists.
 
 ## 14. Migration and future work
 
-v3 is intentionally wire-incompatible with v2. Migration must occur on a
-trusted client able to decrypt v2 and republish under a new v3 repository
-boundary. Automatic migration is not implemented.
+v4 is intentionally wire-incompatible with v2 and v3. Migration must occur on
+a trusted client able to decrypt the older repository and republish under a new
+v4 repository boundary. Automatic migration is not implemented. The local key
+file remains format 3 because its stable repository/device identity material did
+not change; manifest, policy, signature, KDF, HPKE, and AEAD domains changed and
+therefore fail closed across wire versions.
 
 Planned extensions:
 

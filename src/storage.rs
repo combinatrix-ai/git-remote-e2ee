@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use rand::RngCore;
 use rand::rngs::OsRng;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -17,14 +18,39 @@ pub struct CasConflict {
     pub actual: Option<String>,
 }
 
+const MAX_BUFFERED_OBJECT_SIZE: u64 = 16 * 1024 * 1024;
+
+pub trait ObjectStage: Write + Send {
+    fn finish(self: Box<Self>, id: &str) -> Result<()>;
+}
+
 pub trait Storage {
-    fn put_object_if_absent(&self, kind: ObjectKind, id: &str, data: &[u8]) -> Result<()>;
-    fn get_object(&self, kind: ObjectKind, id: &str) -> Result<Vec<u8>>;
+    fn begin_object(&self, kind: ObjectKind) -> Result<Box<dyn ObjectStage>>;
+    fn open_object(&self, kind: ObjectKind, id: &str) -> Result<Box<dyn Read + Send>>;
+
+    fn put_object_if_absent(&self, kind: ObjectKind, id: &str, data: &[u8]) -> Result<()> {
+        let mut stage = self.begin_object(kind)?;
+        stage.write_all(data)?;
+        stage.finish(id)
+    }
+
+    fn get_object(&self, kind: ObjectKind, id: &str) -> Result<Vec<u8>> {
+        let mut reader = self
+            .open_object(kind, id)?
+            .take(MAX_BUFFERED_OBJECT_SIZE + 1);
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_BUFFERED_OBJECT_SIZE {
+            bail!("buffered object exceeds size limit")
+        }
+        Ok(bytes)
+    }
+
     fn read_head(&self) -> Result<Option<String>>;
     fn compare_and_swap_head(&self, expected: Option<&str>, next: &str) -> Result<()>;
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum ObjectKind {
     Pack,
     Manifest,
@@ -80,51 +106,91 @@ impl FilesystemStorage {
     }
 }
 
-impl Storage for FilesystemStorage {
-    fn put_object_if_absent(&self, kind: ObjectKind, id: &str, data: &[u8]) -> Result<()> {
-        self.initialize()?;
-        let target = self.object_path(kind, id)?;
+struct FilesystemObjectStage {
+    file: File,
+    temporary: PathBuf,
+    root: PathBuf,
+    kind: ObjectKind,
+    hasher: Sha256,
+}
+
+impl Write for FilesystemObjectStage {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let written = self.file.write(data)?;
+        self.hasher.update(&data[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl ObjectStage for FilesystemObjectStage {
+    fn finish(mut self: Box<Self>, id: &str) -> Result<()> {
+        validate_id(id)?;
+        if hex::encode(self.hasher.clone().finalize()) != id {
+            bail!("staged object hash does not match id")
+        }
+        self.file.flush()?;
+        self.file.sync_all()?;
+        let target = self
+            .root
+            .join(self.kind.directory())
+            .join(&id[..2])
+            .join(id);
         let parent = target.parent().expect("object path has parent");
         fs::create_dir_all(parent)?;
         if target.exists() {
-            let existing = fs::read(&target)?;
-            if existing != data {
-                bail!("object id collision for {id}")
-            }
+            verify_file_id(&target, id)?;
+            fs::remove_file(&self.temporary)?;
             return Ok(());
         }
+        match fs::hard_link(&self.temporary, &target) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                verify_file_id(&target, id)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        fs::remove_file(&self.temporary)?;
+        FilesystemStorage::sync_directory(parent)?;
+        Ok(())
+    }
+}
 
+impl Drop for FilesystemObjectStage {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.temporary);
+    }
+}
+
+impl Storage for FilesystemStorage {
+    fn begin_object(&self, kind: ObjectKind) -> Result<Box<dyn ObjectStage>> {
+        self.initialize()?;
         let mut random = [0_u8; 8];
         OsRng.fill_bytes(&mut random);
-        let temporary = parent.join(format!(".tmp-{}", hex::encode(random)));
-        let mut file = OpenOptions::new()
+        let staging = self.root.join(".staging");
+        fs::create_dir_all(&staging)?;
+        let temporary = staging.join(format!(".stage-{}", hex::encode(random)));
+        let file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temporary)?;
-        file.write_all(data)?;
-        file.sync_all()?;
-
-        match fs::hard_link(&temporary, &target) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if fs::read(&target)? != data {
-                    let _ = fs::remove_file(&temporary);
-                    bail!("object id collision for {id}")
-                }
-            }
-            Err(error) => {
-                let _ = fs::remove_file(&temporary);
-                return Err(error.into());
-            }
-        }
-        fs::remove_file(&temporary)?;
-        Self::sync_directory(parent)?;
-        Ok(())
+        Ok(Box::new(FilesystemObjectStage {
+            file,
+            temporary,
+            root: self.root.clone(),
+            kind,
+            hasher: Sha256::new(),
+        }))
     }
 
-    fn get_object(&self, kind: ObjectKind, id: &str) -> Result<Vec<u8>> {
+    fn open_object(&self, kind: ObjectKind, id: &str) -> Result<Box<dyn Read + Send>> {
         let path = self.object_path(kind, id)?;
-        fs::read(&path).with_context(|| format!("read {}", path.display()))
+        Ok(Box::new(
+            File::open(&path).with_context(|| format!("read {}", path.display()))?,
+        ))
     }
 
     fn read_head(&self) -> Result<Option<String>> {
@@ -177,6 +243,26 @@ fn validate_id(id: &str) -> Result<()> {
     Ok(())
 }
 
+fn reader_id(mut reader: impl Read) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn verify_file_id(path: &Path, id: &str) -> Result<()> {
+    if reader_id(File::open(path)?)? != id {
+        bail!("object id collision for {id}")
+    }
+    Ok(())
+}
+
 const CARRIER_BRANCH: &str = "git-remote-e2ee";
 const CARRIER_CHUNK_SIZE: usize = 32 * 1024 * 1024;
 
@@ -187,6 +273,163 @@ pub struct GitStorage {
 
 struct GitStorageState {
     base_commit: Option<String>,
+}
+
+struct ChunkReader {
+    paths: Vec<PathBuf>,
+    next: usize,
+    current: Option<File>,
+}
+
+impl Read for ChunkReader {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if let Some(file) = &mut self.current {
+                let read = file.read(output)?;
+                if read != 0 {
+                    return Ok(read);
+                }
+                self.current = None;
+            }
+            if self.next == self.paths.len() {
+                return Ok(0);
+            }
+            self.current = Some(File::open(&self.paths[self.next])?);
+            self.next += 1;
+        }
+    }
+}
+
+struct CarrierObjectStage {
+    staging: PathBuf,
+    root: PathBuf,
+    kind: ObjectKind,
+    current: Option<File>,
+    chunk_index: usize,
+    chunk_len: usize,
+    hasher: Sha256,
+}
+
+impl CarrierObjectStage {
+    fn open_chunk(&mut self) -> std::io::Result<()> {
+        if self.current.is_none() {
+            self.current = Some(
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(self.staging.join(format!("{:08}", self.chunk_index)))?,
+            );
+            self.chunk_len = 0;
+        }
+        Ok(())
+    }
+
+    fn finish_chunk(&mut self) -> std::io::Result<()> {
+        if let Some(mut file) = self.current.take() {
+            file.flush()?;
+            file.sync_all()?;
+            self.chunk_index += 1;
+            self.chunk_len = 0;
+        }
+        Ok(())
+    }
+}
+
+impl Write for CarrierObjectStage {
+    fn write(&mut self, mut data: &[u8]) -> std::io::Result<usize> {
+        let original = data.len();
+        while !data.is_empty() {
+            self.open_chunk()?;
+            let available = CARRIER_CHUNK_SIZE - self.chunk_len;
+            let take = available.min(data.len());
+            self.current
+                .as_mut()
+                .expect("carrier chunk opened")
+                .write_all(&data[..take])?;
+            self.hasher.update(&data[..take]);
+            self.chunk_len += take;
+            data = &data[take..];
+            if self.chunk_len == CARRIER_CHUNK_SIZE {
+                self.finish_chunk()?;
+            }
+        }
+        Ok(original)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if let Some(file) = &mut self.current {
+            file.flush()?;
+        }
+        Ok(())
+    }
+}
+
+impl ObjectStage for CarrierObjectStage {
+    fn finish(mut self: Box<Self>, id: &str) -> Result<()> {
+        validate_id(id)?;
+        if hex::encode(self.hasher.clone().finalize()) != id {
+            bail!("staged object hash does not match id")
+        }
+        self.finish_chunk()?;
+        if self.chunk_index == 0 {
+            bail!("cannot store an empty carrier object")
+        }
+        let target = self
+            .root
+            .join("e2ee")
+            .join(self.kind.directory())
+            .join(&id[..2])
+            .join(id);
+        if target.exists() {
+            let paths = validated_chunk_paths(&target)?;
+            if reader_id(ChunkReader {
+                paths,
+                next: 0,
+                current: None,
+            })? != id
+            {
+                bail!("object id collision for {id}")
+            }
+            fs::remove_dir_all(&self.staging)?;
+            return Ok(());
+        }
+        fs::create_dir_all(target.parent().expect("carrier object path has parent"))?;
+        fs::rename(&self.staging, target)?;
+        Ok(())
+    }
+}
+
+impl Drop for CarrierObjectStage {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.staging);
+    }
+}
+
+fn validated_chunk_paths(directory: &Path) -> Result<Vec<PathBuf>> {
+    let mut entries = fs::read_dir(directory)
+        .with_context(|| format!("read carrier object {}", directory.display()))?
+        .collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    if entries.is_empty() {
+        bail!("carrier object has no chunks")
+    }
+    let total = entries.len();
+    let mut paths = Vec::with_capacity(total);
+    for (index, entry) in entries.into_iter().enumerate() {
+        if !entry.file_type()?.is_file()
+            || entry.file_name().to_str() != Some(&format!("{index:08}"))
+        {
+            bail!("carrier object chunks are not a dense canonical sequence")
+        }
+        let length = entry.metadata()?.len();
+        if (index + 1 < total && length != CARRIER_CHUNK_SIZE as u64)
+            || (index + 1 == total && (length == 0 || length > CARRIER_CHUNK_SIZE as u64))
+        {
+            bail!("carrier object chunk has invalid size")
+        }
+        paths.push(entry.path());
+    }
+    Ok(paths)
 }
 
 impl GitStorage {
@@ -252,20 +495,6 @@ impl GitStorage {
             .join(id))
     }
 
-    fn read_object_directory(&self, directory: &Path) -> Result<Vec<u8>> {
-        let mut chunks = fs::read_dir(directory)
-            .with_context(|| format!("read carrier object {}", directory.display()))?
-            .collect::<std::io::Result<Vec<_>>>()?;
-        chunks.sort_by_key(|entry| entry.file_name());
-        let mut result = Vec::new();
-        for entry in chunks {
-            if entry.file_type()?.is_file() {
-                result.extend_from_slice(&fs::read(entry.path())?);
-            }
-        }
-        Ok(result)
-    }
-
     fn local_head(&self) -> Result<Option<String>> {
         let path = self.root().join("e2ee/HEAD");
         match fs::read_to_string(path) {
@@ -327,23 +556,29 @@ impl TempDirPath for tempfile::TempDir {
 }
 
 impl Storage for GitStorage {
-    fn put_object_if_absent(&self, kind: ObjectKind, id: &str, data: &[u8]) -> Result<()> {
-        let directory = self.object_directory(kind, id)?;
-        if directory.exists() {
-            if self.read_object_directory(&directory)? != data {
-                bail!("object id collision for {id}")
-            }
-            return Ok(());
-        }
-        fs::create_dir_all(&directory)?;
-        for (index, chunk) in data.chunks(CARRIER_CHUNK_SIZE).enumerate() {
-            fs::write(directory.join(format!("{index:08}")), chunk)?;
-        }
-        Ok(())
+    fn begin_object(&self, kind: ObjectKind) -> Result<Box<dyn ObjectStage>> {
+        let mut random = [0_u8; 8];
+        OsRng.fill_bytes(&mut random);
+        let staging = self.root().join(format!(".stage-{}", hex::encode(random)));
+        fs::create_dir(&staging)?;
+        Ok(Box::new(CarrierObjectStage {
+            staging,
+            root: self.root().to_path_buf(),
+            kind,
+            current: None,
+            chunk_index: 0,
+            chunk_len: 0,
+            hasher: Sha256::new(),
+        }))
     }
 
-    fn get_object(&self, kind: ObjectKind, id: &str) -> Result<Vec<u8>> {
-        self.read_object_directory(&self.object_directory(kind, id)?)
+    fn open_object(&self, kind: ObjectKind, id: &str) -> Result<Box<dyn Read + Send>> {
+        let paths = validated_chunk_paths(&self.object_directory(kind, id)?)?;
+        Ok(Box::new(ChunkReader {
+            paths,
+            next: 0,
+            current: None,
+        }))
     }
 
     fn read_head(&self) -> Result<Option<String>> {
@@ -495,5 +730,63 @@ mod tests {
             .collect();
         assert_eq!(winners.len(), 1);
         assert_eq!(storage.read_head().unwrap(), Some(winners[0].clone()));
+    }
+
+    #[test]
+    fn filesystem_object_stage_streams_and_validates_the_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(directory.path());
+        let data = vec![0x5a; 2 * 1024 * 1024 + 3];
+        let id = object_id(&data);
+        let mut stage = storage.begin_object(ObjectKind::Pack).unwrap();
+        for chunk in data.chunks(7777) {
+            stage.write_all(chunk).unwrap();
+        }
+        stage.finish(&id).unwrap();
+        let mut opened = storage.open_object(ObjectKind::Pack, &id).unwrap();
+        let mut actual = Vec::new();
+        opened.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, data);
+
+        let mut rejected = storage.begin_object(ObjectKind::Pack).unwrap();
+        rejected.write_all(b"wrong id").unwrap();
+        assert!(rejected.finish(&object_id(b"something else")).is_err());
+    }
+
+    #[test]
+    fn buffered_object_reads_have_a_hard_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(directory.path());
+        let data = vec![1_u8; MAX_BUFFERED_OBJECT_SIZE as usize + 1];
+        let id = object_id(&data);
+        storage
+            .put_object_if_absent(ObjectKind::Pack, &id, &data)
+            .unwrap();
+        assert!(storage.get_object(ObjectKind::Pack, &id).is_err());
+    }
+
+    #[test]
+    fn carrier_chunk_sequence_is_canonical() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("00000000"), b"first").unwrap();
+        fs::write(directory.path().join("00000002"), b"gap").unwrap();
+        assert!(validated_chunk_paths(directory.path()).is_err());
+
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("00000000"), b"only").unwrap();
+        let paths = validated_chunk_paths(directory.path()).unwrap();
+        assert_eq!(
+            reader_id(ChunkReader {
+                paths,
+                next: 0,
+                current: None
+            })
+            .unwrap(),
+            object_id(b"only")
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("00000000")).unwrap();
+        assert!(validated_chunk_paths(directory.path()).is_err());
     }
 }
