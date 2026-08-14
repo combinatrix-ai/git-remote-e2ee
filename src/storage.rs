@@ -24,6 +24,47 @@ pub trait ObjectStage: Write + Send {
     fn finish(self: Box<Self>, id: &str) -> Result<()>;
 }
 
+trait ObjectStageSink: Write + Send + Sized {
+    fn publish(self, id: &str) -> Result<()>;
+}
+
+struct ValidatingObjectStage<S> {
+    sink: S,
+    hasher: Sha256,
+}
+
+impl<S: ObjectStageSink + 'static> ValidatingObjectStage<S> {
+    fn wrap(sink: S) -> Box<dyn ObjectStage> {
+        Box::new(Self {
+            sink,
+            hasher: Sha256::new(),
+        })
+    }
+}
+
+impl<S: ObjectStageSink> Write for ValidatingObjectStage<S> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let written = self.sink.write(data)?;
+        self.hasher.update(&data[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.sink.flush()
+    }
+}
+
+impl<S: ObjectStageSink> ObjectStage for ValidatingObjectStage<S> {
+    fn finish(self: Box<Self>, id: &str) -> Result<()> {
+        validate_id(id)?;
+        let Self { sink, hasher } = *self;
+        if hex::encode(hasher.finalize()) != id {
+            bail!("staged object hash does not match id")
+        }
+        sink.publish(id)
+    }
+}
+
 pub trait Storage {
     fn begin_object(&self, kind: ObjectKind) -> Result<Box<dyn ObjectStage>>;
     fn open_object(&self, kind: ObjectKind, id: &str) -> Result<Box<dyn Read + Send>>;
@@ -111,14 +152,11 @@ struct FilesystemObjectStage {
     temporary: PathBuf,
     root: PathBuf,
     kind: ObjectKind,
-    hasher: Sha256,
 }
 
 impl Write for FilesystemObjectStage {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        let written = self.file.write(data)?;
-        self.hasher.update(&data[..written]);
-        Ok(written)
+        self.file.write(data)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -126,12 +164,8 @@ impl Write for FilesystemObjectStage {
     }
 }
 
-impl ObjectStage for FilesystemObjectStage {
-    fn finish(mut self: Box<Self>, id: &str) -> Result<()> {
-        validate_id(id)?;
-        if hex::encode(self.hasher.clone().finalize()) != id {
-            bail!("staged object hash does not match id")
-        }
+impl ObjectStageSink for FilesystemObjectStage {
+    fn publish(mut self, id: &str) -> Result<()> {
         self.file.flush()?;
         self.file.sync_all()?;
         let target = self
@@ -177,12 +211,11 @@ impl Storage for FilesystemStorage {
             .write(true)
             .create_new(true)
             .open(&temporary)?;
-        Ok(Box::new(FilesystemObjectStage {
+        Ok(ValidatingObjectStage::wrap(FilesystemObjectStage {
             file,
             temporary,
             root: self.root.clone(),
             kind,
-            hasher: Sha256::new(),
         }))
     }
 
@@ -307,7 +340,6 @@ struct CarrierObjectStage {
     current: Option<File>,
     chunk_index: usize,
     chunk_len: usize,
-    hasher: Sha256,
 }
 
 impl CarrierObjectStage {
@@ -346,7 +378,6 @@ impl Write for CarrierObjectStage {
                 .as_mut()
                 .expect("carrier chunk opened")
                 .write_all(&data[..take])?;
-            self.hasher.update(&data[..take]);
             self.chunk_len += take;
             data = &data[take..];
             if self.chunk_len == CARRIER_CHUNK_SIZE {
@@ -364,12 +395,8 @@ impl Write for CarrierObjectStage {
     }
 }
 
-impl ObjectStage for CarrierObjectStage {
-    fn finish(mut self: Box<Self>, id: &str) -> Result<()> {
-        validate_id(id)?;
-        if hex::encode(self.hasher.clone().finalize()) != id {
-            bail!("staged object hash does not match id")
-        }
+impl ObjectStageSink for CarrierObjectStage {
+    fn publish(mut self, id: &str) -> Result<()> {
         self.finish_chunk()?;
         if self.chunk_index == 0 {
             bail!("cannot store an empty carrier object")
@@ -440,18 +467,16 @@ impl GitStorage {
         let checkout = tempfile::Builder::new()
             .prefix("git-remote-e2ee-carrier-")
             .tempdir()?;
+        let checkout_path = checkout
+            .path()
+            .to_str()
+            .context("carrier checkout path is not UTF-8")?;
         git_command(
             checkout
                 .path()
                 .parent()
                 .context("carrier tempdir has no parent")?,
-            &[
-                "clone",
-                "--quiet",
-                "--no-checkout",
-                remote,
-                checkout.path_str()?,
-            ],
+            &["clone", "--quiet", "--no-checkout", remote, checkout_path],
         )?;
         git_command(checkout.path(), &["config", "user.name", "git-remote-e2ee"])?;
         git_command(
@@ -543,32 +568,19 @@ impl GitStorage {
     }
 }
 
-trait TempDirPath {
-    fn path_str(&self) -> Result<&str>;
-}
-
-impl TempDirPath for tempfile::TempDir {
-    fn path_str(&self) -> Result<&str> {
-        self.path()
-            .to_str()
-            .context("carrier checkout path is not UTF-8")
-    }
-}
-
 impl Storage for GitStorage {
     fn begin_object(&self, kind: ObjectKind) -> Result<Box<dyn ObjectStage>> {
         let mut random = [0_u8; 8];
         OsRng.fill_bytes(&mut random);
         let staging = self.root().join(format!(".stage-{}", hex::encode(random)));
         fs::create_dir(&staging)?;
-        Ok(Box::new(CarrierObjectStage {
+        Ok(ValidatingObjectStage::wrap(CarrierObjectStage {
             staging,
             root: self.root().to_path_buf(),
             kind,
             current: None,
             chunk_index: 0,
             chunk_len: 0,
-            hasher: Sha256::new(),
         }))
     }
 
@@ -683,11 +695,53 @@ fn carrier_git_command() -> Command {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
 
     use super::*;
     use crate::crypto::object_id;
+
+    struct PartialWriteSink {
+        published: Arc<AtomicBool>,
+    }
+
+    impl Write for PartialWriteSink {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            Ok(data.len().min(3))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ObjectStageSink for PartialWriteSink {
+        fn publish(self, _id: &str) -> Result<()> {
+            self.published.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn object_stage_validates_all_written_bytes_before_publishing() {
+        let data = b"partial writes must all contribute to the staged object hash";
+        let published = Arc::new(AtomicBool::new(false));
+        let mut stage = ValidatingObjectStage::wrap(PartialWriteSink {
+            published: Arc::clone(&published),
+        });
+        stage.write_all(data).unwrap();
+        stage.finish(&object_id(data)).unwrap();
+        assert!(published.load(Ordering::Relaxed));
+
+        let published = Arc::new(AtomicBool::new(false));
+        let mut stage = ValidatingObjectStage::wrap(PartialWriteSink {
+            published: Arc::clone(&published),
+        });
+        stage.write_all(data).unwrap();
+        assert!(stage.finish(&object_id(b"different bytes")).is_err());
+        assert!(!published.load(Ordering::Relaxed));
+    }
 
     #[test]
     fn head_compare_and_swap_rejects_stale_writer() {

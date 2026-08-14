@@ -127,13 +127,9 @@ impl KeyFile {
         let signing_public = self.signing_key()?.verifying_key().to_bytes();
         let wrapping_private = self.wrapping_private_key()?;
         let wrapping_public = HpkeKem::sk_to_pk(&wrapping_private).to_bytes();
-        let mut identity = Vec::with_capacity(96);
-        identity.extend_from_slice(b"git-remote-e2ee device id v3\0");
-        identity.extend_from_slice(&signing_public);
-        identity.extend_from_slice(&wrapping_public);
         Ok(PublicDevice {
             repository_root: self.repository_root.clone(),
-            device_id: hex::encode(Sha256::digest(&identity)),
+            device_id: device_id_for_public_keys(&signing_public, wrapping_public.as_slice()),
             signing_public_key: BASE64.encode(signing_public),
             wrapping_public_key: BASE64.encode(wrapping_public),
         })
@@ -577,11 +573,7 @@ pub fn validate_public_device(device: &PublicDevice) -> Result<()> {
     validate_root(&device.repository_root)?;
     let signing = decode_public_key(&device.signing_public_key)?;
     let wrapping = decode_public_key(&device.wrapping_public_key)?;
-    let mut identity = Vec::with_capacity(96);
-    identity.extend_from_slice(b"git-remote-e2ee device id v3\0");
-    identity.extend_from_slice(&signing);
-    identity.extend_from_slice(&wrapping);
-    if device.device_id != hex::encode(Sha256::digest(&identity)) {
+    if device.device_id != device_id_for_public_keys(&signing, &wrapping) {
         bail!("device id does not match its public keys")
     }
     Ok(())
@@ -597,6 +589,14 @@ pub fn repository_root_for_device(device: &PublicDevice) -> Result<String> {
 fn repository_root_for_public_keys(signing: &[u8], wrapping: &[u8]) -> String {
     let mut identity = Vec::with_capacity(32 + signing.len() + wrapping.len());
     identity.extend_from_slice(b"git-remote-e2ee repository root v2\0");
+    identity.extend_from_slice(signing);
+    identity.extend_from_slice(wrapping);
+    hex::encode(Sha256::digest(identity))
+}
+
+fn device_id_for_public_keys(signing: &[u8], wrapping: &[u8]) -> String {
+    let mut identity = Vec::with_capacity(32 + signing.len() + wrapping.len());
+    identity.extend_from_slice(b"git-remote-e2ee device id v3\0");
     identity.extend_from_slice(signing);
     identity.extend_from_slice(wrapping);
     hex::encode(Sha256::digest(identity))

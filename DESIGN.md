@@ -134,7 +134,7 @@ The ciphertext digest is computed during the write. `finish(id)` validates the
 digest and atomically publishes the staged object under that ID. Filesystem
 storage serializes CAS with an advisory lock and publishes `HEAD` with atomic
 rename. Immutable objects are durable before the pointer moves. Abandoned
-`.stage-*` files are unreachable; automatic cleanup is deferred to future GC.
+`.stage-*` artifacts are unreachable; automatic cleanup is deferred to future GC.
 Manifest and policy objects still use bounded buffered parsing with a 16 MiB
 hard limit; large pack objects always use the streaming path.
 
