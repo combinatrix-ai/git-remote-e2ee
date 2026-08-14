@@ -1,5 +1,10 @@
 # Design
 
+> [!NOTE]
+> This document describes the currently implemented v2 epoch-key protocol.
+> [`SPEC.md`](SPEC.md) describes the proposed next protocol, which removes the
+> shared epoch key and wraps each payload key directly to every active reader.
+
 ## Goal
 
 Provide Git synchronization where an untrusted storage service cannot read

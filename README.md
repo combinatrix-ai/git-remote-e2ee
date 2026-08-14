@@ -17,6 +17,11 @@ names, commit IDs, paths, authors, or messages.
 > format is unstable and there are no compatibility guarantees between
 > versions. Keep an independent copy of every repository and key.
 
+The [current implemented v2 design](DESIGN.md) uses a shared epoch key between
+per-device envelopes and per-payload keys. The [target protocol](SPEC.md) is a
+separate proposal that removes that shared secret and wraps every payload key
+directly to each active reader. It is not implemented yet.
+
 ## Why this exists
 
 Git hosting normally requires the server to understand the repository. That is
