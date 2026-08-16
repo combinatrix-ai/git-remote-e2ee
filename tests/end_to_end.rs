@@ -135,7 +135,7 @@ fn returning_client_fetches_multiple_offline_generations_from_deltas() {
 }
 
 #[test]
-fn signed_ref_advance_without_its_pack_is_rejected_by_connectivity() {
+fn returning_client_rejects_signed_ref_advance_without_its_pack() {
     let temporary = tempfile::tempdir().unwrap();
     let source = temporary.path().join("source");
     let destination = temporary.path().join("destination");
@@ -149,6 +149,7 @@ fn signed_ref_advance_without_its_pack_is_rejected_by_connectivity() {
     repository
         .push_ref(&source, "refs/heads/main", false)
         .unwrap();
+    repository.fetch_into(&destination, "e2ee").unwrap();
 
     let head = fs::read_to_string(remote.join("HEAD"))
         .unwrap()
@@ -208,6 +209,37 @@ fn signed_ref_advance_without_its_pack_is_rejected_by_connectivity() {
         error.contains("does not resolve") || error.contains("missing Git objects"),
         "unexpected connectivity error: {error}"
     );
+}
+
+#[test]
+fn missing_verified_frontier_tip_fails_closed() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let destination = temporary.path().join("destination");
+    let remote = temporary.path().join("remote");
+    initialize_git(&source);
+    initialize_git(&destination);
+
+    let key = KeyFile::generate();
+    let repository = EncryptedRepository::new(FilesystemStorage::new(&remote), key);
+    repository.initialize().unwrap();
+    commit(&source, "valid\n", "valid");
+    repository
+        .push_ref(&source, "refs/heads/main", false)
+        .unwrap();
+    repository.fetch_into(&destination, "e2ee").unwrap();
+
+    let state_path = destination.join(".git/git-remote-e2ee/e2ee/state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    state["verified_refs"]["refs/heads/main"] = serde_json::Value::String("1".repeat(40));
+    fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+
+    let error = repository
+        .fetch_into(&destination, "e2ee")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("verified ref refs/heads/main is missing locally"));
 }
 
 fn read_stored_object(root: &Path, kind: &str, id: &str) -> Vec<u8> {

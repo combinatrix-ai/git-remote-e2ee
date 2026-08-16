@@ -81,6 +81,9 @@ The single-run local measurements are similarly workload-specific. On the
 12.26/13.78 seconds for initial push and 30.78/31.75 seconds for fresh fetch.
 For a tiny update, an incompressible 10 MiB addition, and 1,000 small files,
 their push times were 0.54/0.08, 0.66/0.40, and 0.69/0.34 seconds respectively.
+After incremental connectivity verification was added, returning E2EE fetches
+for the same update classes took 0.09, 0.23, and 0.10 seconds on Godot, versus
+0.50, 0.64, and 0.47 seconds for gcrypt's local backend.
 The gcrypt run used its efficient local-filesystem backend, not its arbitrary
 Git transport. A separate selected-file benchmark found that `git-crypt` and
 `transcrypt` spent 20.03 and 143.94 seconds staging and pushing 1,000 encrypted
@@ -101,6 +104,8 @@ this project as research-grade software.
 - Domain-separated HKDF subkeys and XChaCha20-Poly1305 payload encryption
 - Streaming authenticated pack encryption and decryption with bounded Rust-side
   memory rather than whole-pack buffers
+- Incremental Git connectivity verification from a locally pinned, previously
+  verified ref frontier
 - Ed25519-signed, append-only policy and manifest chains
 - 1-of-N recipient access: each authorized device unlocks with only its own key
 - Separate reader, writer, and administrator authorization

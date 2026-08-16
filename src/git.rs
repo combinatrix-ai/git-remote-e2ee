@@ -203,7 +203,11 @@ fn read_process_error(file: &mut File) -> String {
     message.trim().to_owned()
 }
 
-pub fn ensure_refs_connected(repo: &Path, refs: &BTreeMap<String, String>) -> Result<()> {
+pub fn ensure_refs_connected_since(
+    repo: &Path,
+    refs: &BTreeMap<String, String>,
+    verified_refs: &BTreeMap<String, String>,
+) -> Result<()> {
     if refs.is_empty() {
         return Ok(());
     }
@@ -219,6 +223,23 @@ pub fn ensure_refs_connected(repo: &Path, refs: &BTreeMap<String, String>) -> Re
         }
     }
 
+    // A successful prior connectivity check makes every object reachable from
+    // these tips a trusted frontier. Git objects are immutable and
+    // content-addressed, so a later fetch only needs to walk objects newly
+    // reachable beyond that frontier. Still require the frontier tips to be
+    // present locally so corruption or an unexpected local prune fails closed.
+    for (reference, object) in verified_refs {
+        let expression = format!("{object}^{{commit}}");
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["cat-file", "-e", &expression])
+            .output()?;
+        if !output.status.success() {
+            bail!("verified ref {reference} is missing locally")
+        }
+    }
+
     let mut command = Command::new("git");
     command
         .arg("-C")
@@ -226,6 +247,12 @@ pub fn ensure_refs_connected(repo: &Path, refs: &BTreeMap<String, String>) -> Re
         .args(["rev-list", "--objects", "--missing=print"]);
     for object in refs.values() {
         command.arg(object);
+    }
+    if !verified_refs.is_empty() {
+        command.arg("--not");
+        for object in verified_refs.values() {
+            command.arg(object);
+        }
     }
     let output = command.output()?;
     if !output.status.success() {

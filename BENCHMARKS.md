@@ -212,10 +212,10 @@ than repository size.
 | Rust | 0.37 / 0.08 s | 0.62 / 0.40 s | 0.59 / 0.36 s |
 | Kubernetes | 0.25 / 0.08 s | 0.58 / 0.39 s | 0.50 / 0.34 s |
 
-The clear bottleneck is returning-client fetch. E2EE currently performs a full
-connectivity walk after importing even a tiny encrypted delta. Git can validate
-against its existing object graph incrementally, so the difference grows with
-history size:
+Before verified-frontier connectivity was implemented, the clear bottleneck
+was returning-client fetch. E2EE performed a full connectivity walk after
+importing even a tiny encrypted delta, so the difference grew with history
+size:
 
 | Repository | Tiny returning fetch Git / E2EE | E2EE peak RSS |
 |---|---:|---:|
@@ -223,10 +223,34 @@ history size:
 | Rust | 0.35 / 19.65 s | 1,436 MiB |
 | Kubernetes | 0.26 / 6.62 s | 1,053 MiB |
 
-Adding 10 MiB or 1,000 files barely changes the E2EE returning-fetch time for a
-given repository: it remains about 3.2 s for Godot, 19.6 s for Rust, and 6.6 s
-for Kubernetes. That indicates history traversal, not AEAD throughput or delta
-size, is the dominant incremental-read cost and the next performance target.
+Adding 10 MiB or 1,000 files barely changed those old E2EE returning-fetch
+times. This identified history traversal, rather than AEAD throughput or delta
+size, as the dominant incremental-read cost.
+
+The implementation now persists the exact ref tips that passed connectivity
+verification. A returning fetch requires those frontier tips to remain local
+and asks `rev-list` to inspect only objects newly reachable beyond them. A
+missing or legacy frontier still triggers a full walk, and the signed-ref
+without-pack attack test now exercises and passes through the incremental path.
+
+Godot was rerun once with the optimization and the additional one-byte-change
+scenario. Initial/fresh operations remained unchanged within single-run noise:
+initial E2EE push was 14.32 seconds, fresh fetch was 31.86 seconds, and a new
+reader's full fetch was 31.70 seconds. Returning fetch changed substantially:
+
+| Godot returning update | Plain Git | E2EE before | E2EE verified frontier |
+|---|---:|---:|---:|
+| Tiny commit | 0.12 s | 3.24 s | 0.09 s |
+| Add incompressible 10 MiB | 0.58 s | about 3.2 s | 0.23 s |
+| Change one byte in 10 MiB | 0.37 s | not measured | 0.23 s |
+| Add 1,000 small files | 0.08 s | about 3.2 s | 0.10 s |
+
+Peak E2EE RSS for those returning fetches was 39--40 MiB, down from 526 MiB
+for the old Godot tiny-fetch path. The reconstructed clients still resolved to
+the expected final ref and passed `git fsck --full`; the encrypted remote also
+passed full authenticated-object verification. Rust and Kubernetes have not
+yet been rerun with this optimization, so their old values above remain useful
+as the before baseline rather than a claim about current performance.
 
 All six reconstructed clients (Git and E2EE for each repository) resolved to
 the expected synthetic final commit and passed `git fsck --full`; every E2EE
@@ -281,9 +305,12 @@ uploaded on each push.
 
 The result is narrower than a feature-only comparison might suggest:
 gcrypt's local backend is essentially tied with E2EE for initial transfer.
-E2EE is faster for these incremental pushes, while gcrypt's returning fetches
-are much faster: 0.47--0.64 seconds versus about 3.2 seconds for E2EE on Godot.
-E2EE's full connectivity walk remains its clearest performance weakness.
+E2EE is faster for these incremental pushes. Before verified-frontier
+connectivity, gcrypt's returning fetches were also much faster. After the
+optimization, the same update classes took 0.50/0.64/0.47 seconds in gcrypt
+versus 0.09/0.23/0.10 seconds in E2EE for tiny/10 MiB/1,000-file fetches.
+These are separate single runs and not stable percentage claims, but the old
+full-history connectivity bottleneck is no longer present on this workload.
 
 The gcrypt remote grew by about 1.7 KiB, 10.01 MiB, and 67.2 KiB for the three
 updates. E2EE grew by about 3.2 KiB, 10.01 MiB, and 79.3 KiB. Both local

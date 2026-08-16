@@ -319,6 +319,21 @@ refs, pinning the new head, or publishing a successor. A signed ref advance
 whose required pack delta is absent is invalid even when every cryptographic
 check succeeds.
 
+A client MAY satisfy that requirement incrementally. After a successful full
+or incremental connectivity check, it records the exact checked ref tips as a
+verified frontier. On a later fetch it first requires every frontier tip to
+still exist locally, then walks the current tips while excluding objects
+reachable from the verified frontier. Content-addressed Git objects reachable
+from that frontier were already checked and cannot be changed in place, so an
+inductive check of only the newly reachable range establishes completeness of
+the new state. The frontier advances only after pack authentication, import,
+and the incremental connectivity check all succeed.
+
+A missing frontier, including a client state written by an older version,
+requires a full connectivity walk. The incremental rule assumes the trusted
+client's existing object database has not been corrupted outside this
+protocol; explicit full verification remains available to check local storage.
+
 Force pushes append a normal pack delta and new ref state. Older packs remain
 in historical manifests and may become unreachable in the inner Git graph.
 

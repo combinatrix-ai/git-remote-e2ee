@@ -35,6 +35,8 @@ struct ClientState {
     policy_generation: Option<u64>,
     #[serde(default)]
     repository_root: Option<String>,
+    #[serde(default)]
+    verified_refs: BTreeMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -104,7 +106,13 @@ impl<S: Storage> EncryptedRepository<S> {
             &next_key,
             next.clone(),
         )?;
-        write_client_state(pin_path, &HashSet::new(), &result.0, &next)?;
+        write_client_state(
+            pin_path,
+            &HashSet::new(),
+            &result.0,
+            &next,
+            &BTreeMap::new(),
+        )?;
         Ok(result)
     }
 
@@ -141,7 +149,13 @@ impl<S: Storage> EncryptedRepository<S> {
             &next_key,
             next.clone(),
         )?;
-        write_client_state(pin_path, &HashSet::new(), &result.0, &next)?;
+        write_client_state(
+            pin_path,
+            &HashSet::new(),
+            &result.0,
+            &next,
+            &BTreeMap::new(),
+        )?;
         Ok(result)
     }
 
@@ -149,7 +163,13 @@ impl<S: Storage> EncryptedRepository<S> {
         let current = self.current_state()?;
         let previous = read_client_state(pin_path)?;
         self.validate_pinned_head(&current, &previous)?;
-        write_client_state(pin_path, &HashSet::new(), &current.id, &current.manifest)
+        write_client_state(
+            pin_path,
+            &HashSet::new(),
+            &current.id,
+            &current.manifest,
+            &BTreeMap::new(),
+        )
     }
 
     pub fn list_devices(&self) -> Result<Vec<DeviceRecord>> {
@@ -429,8 +449,14 @@ impl<S: Storage> EncryptedRepository<S> {
                 imported.insert(descriptor.id.clone());
             }
         }
-        git::ensure_refs_connected(repo, &current.manifest.refs)?;
-        write_client_state(&state_path, &imported, &current.id, &current.manifest)?;
+        git::ensure_refs_connected_since(repo, &current.manifest.refs, &state.verified_refs)?;
+        write_client_state(
+            &state_path,
+            &imported,
+            &current.id,
+            &current.manifest,
+            &current.manifest.refs,
+        )?;
         Ok(current.manifest)
     }
 
@@ -773,6 +799,7 @@ fn write_client_state(
     values: &HashSet<String>,
     head_id: &str,
     manifest: &Manifest,
+    verified_refs: &BTreeMap<String, String>,
 ) -> Result<()> {
     let mut values: Vec<_> = values.iter().cloned().collect();
     values.sort();
@@ -784,6 +811,7 @@ fn write_client_state(
         imported_generation: Some(manifest.generation),
         policy_generation: Some(manifest.policy_generation),
         repository_root: Some(manifest.repository_root.clone()),
+        verified_refs: verified_refs.clone(),
     };
     persist_client_state(path, &state)
 }
@@ -802,6 +830,7 @@ fn write_observed_client_state(
         imported_generation: previous.imported_generation,
         policy_generation: Some(manifest.policy_generation),
         repository_root: Some(manifest.repository_root.clone()),
+        verified_refs: previous.verified_refs,
     };
     persist_client_state(path, &state)
 }
@@ -830,4 +859,24 @@ fn validate_remote_name(name: &str) -> Result<()> {
         bail!("remote name may contain only ASCII letters, digits, '-' and '_'")
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClientState;
+
+    #[test]
+    fn client_state_without_verified_frontier_requires_a_full_check() {
+        let legacy = br#"{
+            "format_version": 4,
+            "packs": ["pack-id"],
+            "head_id": "head-id",
+            "generation": 7,
+            "imported_generation": 7,
+            "policy_generation": 2,
+            "repository_root": "repository-root"
+        }"#;
+        let state: ClientState = serde_json::from_slice(legacy).unwrap();
+        assert!(state.verified_refs.is_empty());
+    }
 }
