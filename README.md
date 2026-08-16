@@ -61,6 +61,7 @@ diffs, pull requests, search, and CI over the plaintext.
 | Update granularity | Per encrypted file; a changed encrypted file is stored again | Per encrypted file | Backend-dependent; Git and SFTP backends may retransmit full history | Incremental Git packs on filesystem and carrier-Git backends |
 | Integrity model | Git repository integrity plus deterministic encrypted blobs | Git repository integrity plus encrypted blobs | Encrypted and signed manifest; ciphertext-addressed packs | AEAD packs/manifests, signed policy and manifest chains, and per-client history pinning |
 | Key and collaborator model | Symmetric key or GPG users | Shared passphrase | GPG participants and symmetric mode | Per-repository device keys; any authorized device can decrypt independently; writers and administrators are separate roles |
+| Measured local workload | Selected-file filter: 10 MiB and 1,000 files | Selected-file filter: 10 MiB and 1,000 files | Whole 867 MiB Godot history, local backend | Whole 867 MiB Godot history, local backend; also 100-reader scaling |
 | Maturity | Established | Established | Established | Experimental prototype |
 
 The closest comparison is `git-remote-gcrypt`. It already supports participant
@@ -74,6 +75,18 @@ its arbitrary Git and SFTP transports upload the complete repository history on
 each push; its rsync backend behaves differently. The comparison is therefore
 backend-specific, not a claim that every `git-remote-gcrypt` update is a full
 upload.
+
+The single-run local measurements are similarly workload-specific. On the
+867 MiB Godot history, `git-remote-gcrypt` and `git-remote-e2ee` took
+12.26/13.78 seconds for initial push and 30.78/31.75 seconds for fresh fetch.
+For a tiny update, an incompressible 10 MiB addition, and 1,000 small files,
+their push times were 0.54/0.08, 0.66/0.40, and 0.69/0.34 seconds respectively.
+The gcrypt run used its efficient local-filesystem backend, not its arbitrary
+Git transport. A separate selected-file benchmark found that `git-crypt` and
+`transcrypt` spent 20.03 and 143.94 seconds staging and pushing 1,000 encrypted
+files; this is not an apples-to-apples whole-repository comparison. See
+[BENCHMARKS.md](BENCHMARKS.md#comparison-with-the-tools-in-the-feature-table)
+for method, memory, disk growth, versions, and limitations.
 
 If you need to protect a few secrets while retaining GitHub or GitLab features,
 use a file-filter tool. If the storage provider must not learn the repository
