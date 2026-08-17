@@ -23,78 +23,136 @@ generation; pack ciphertext is stored only once, independent of reader count,
 and is authenticated in bounded-memory 1 MiB segments.
 See the [design overview](DESIGN.md) and [normative specification](SPEC.md).
 
-## Why this exists
+## The problem this project solves
 
-Git hosting normally requires the server to understand the repository. That is
-useful for web diffs, pull requests, search, and CI, but it also exposes the
-entire object graph and most repository metadata to the host.
+Ordinary Git hosting must understand a repository to provide web diffs, pull
+request review, search, and hosted CI. Even a private repository therefore
+reveals its files, paths, branches, commit graph, authors, and messages to the
+host.
 
-`git-remote-e2ee` deliberately gives up server-side Git features. Git semantics
-stay on trusted clients, while the server is reduced to two jobs:
+`git-remote-e2ee` is for the different case where the storage provider should
+learn none of that, while trusted clients still need ordinary Git semantics. It
+keeps encryption, history validation, fast-forward checks, and conflict
+handling on clients. The server is reduced to two jobs:
 
 1. store immutable ciphertext objects;
 2. atomically replace one opaque head value if it has not changed.
 
-This differs from [`git-crypt`](https://github.com/AGWA/git-crypt), which is
-designed to encrypt selected files inside an otherwise normal repository. It is
-closer to
-[`git-remote-gcrypt`](https://github.com/spwhitton/git-remote-gcrypt), but uses
-modern authenticated encryption, a signed policy and manifest chain,
-per-device keys, incremental Git packs, and a backend-neutral compare-and-swap
-storage contract. In
-particular, the carrier-Git backend does not require uploading the entire inner
-repository on every update.
+The project also addresses collaboration without a repository-wide private key
+or passphrase. Every device has its own key, administrators can add or revoke a
+device without rewriting historical packs, readers and writers can have
+different permissions, and concurrent writers cannot silently overwrite each
+other.
+
+This tradeoff is intentional: a host that cannot read the repository also
+cannot provide meaningful plaintext diffs, search, or review by itself.
 
 ## Comparison with existing tools
 
-These projects solve two different problems. File-filter tools keep an ordinary
-Git repository useful to its host while hiding selected blob contents. Encrypted
-remote helpers hide the repository as a whole, which also removes server-side
-diffs, pull requests, search, and CI over the plaintext.
+File-filter tools and encrypted remote helpers solve different problems.
+[`git-crypt`](https://github.com/AGWA/git-crypt) and
+[`transcrypt`](https://github.com/elasticdog/transcrypt) hide selected files in
+an otherwise normal repository. [`git-remote-gcrypt`](https://github.com/spwhitton/git-remote-gcrypt)
+and `git-remote-e2ee` hide the complete inner repository.
 
-| | [`git-crypt`](https://github.com/AGWA/git-crypt) | [`transcrypt`](https://github.com/elasticdog/transcrypt) | [`git-remote-gcrypt`](https://github.com/spwhitton/git-remote-gcrypt) | `git-remote-e2ee` |
-|---|---|---|---|---|
-| Primary use | Encrypt selected files | Encrypt selected files | Encrypt a complete Git remote | Encrypt a complete Git remote |
-| Integration | Git clean/smudge filters | Git clean/smudge filters | Git remote helper | Git remote helper |
-| Hidden from host | Selected blob contents | Selected blob contents | Inner objects, refs, and encrypted manifest contents | Inner objects, refs, paths, authors, messages, and manifest contents |
-| Host retains normal Git features | Yes, for visible repository data | Yes, for visible repository data | No | No |
-| Update granularity | Per encrypted file; a changed encrypted file is stored again | Per encrypted file | Backend-dependent; Git and SFTP backends may retransmit full history | Incremental Git packs on filesystem and carrier-Git backends |
-| Integrity model | Git repository integrity plus deterministic encrypted blobs | Git repository integrity plus encrypted blobs | Encrypted and signed manifest; ciphertext-addressed packs | AEAD packs/manifests, signed policy and manifest chains, and per-client history pinning |
-| Key and collaborator model | Symmetric key or GPG users | Shared passphrase | GPG participants and symmetric mode | Per-repository device keys; any authorized device can decrypt independently; writers and administrators are separate roles |
-| Measured local workload | Selected-file filter: 10 MiB and 1,000 files | Selected-file filter: 10 MiB and 1,000 files | Whole 867 MiB Godot history, local backend | Whole 867 MiB Godot history, local backend; also 100-reader scaling |
-| Maturity | Established | Established | Established | Experimental prototype |
+Legend: **○** supported, **△** supported with caveats or extra setup, **×** not
+supported.
 
-The closest comparison is `git-remote-gcrypt`. It already supports participant
-management and several transports, making it the more mature choice today.
-`git-remote-e2ee` is exploring a different storage protocol: immutable
-incremental packs plus an explicit compare-and-swap head, modern AEAD, and a
-signed history chain that returning clients pin locally. According to
-`git-remote-gcrypt`'s
-[`PERFORMANCE` documentation](https://manpages.debian.org/trixie/git-remote-gcrypt/git-remote-gcrypt.1.en.html#PERFORMANCE),
-its arbitrary Git and SFTP transports upload the complete repository history on
-each push; its rsync backend behaves differently. The comparison is therefore
-backend-specific, not a claim that every `git-remote-gcrypt` update is a full
-upload.
+| What you can do | `git-crypt` | `transcrypt` | `git-remote-gcrypt` | `git-remote-e2ee` |
+|---|:---:|:---:|:---:|:---:|
+| Hide the complete repository from the host | × | × | ○ | ○ |
+| Encrypt only selected files | ○ | ○ | × | × |
+| Use GitHub or GitLab as storage | ○ | ○ | △¹ | ○ |
+| Keep using normal `clone`, `pull`, and `push` | ○ | ○ | ○ | ○ |
+| Keep a hosted pull-request workflow | ○² | ○² | △² | △² |
+| See encrypted-content diffs on the host | × | × | × | × |
+| Run CI after explicitly providing a key | △ | △ | △ | △ |
+| Avoid distributing one shared passphrase or private key | ○³ | × | ○ | ○ |
+| Add a collaborator using only their public key | ○³ | × | ○ | ○ |
+| Revoke one collaborator independently | △⁴ | × | ○ | ○ |
+| Add a collaborator without rewriting bulk history | ○ | ○ | ○ | ○ |
+| Separate reader, writer, and administrator roles | × | × | × | ○ |
+| Reject concurrent-writer races without silent overwrite | ○ | ○ | ×⁵ | ○ |
+| Transfer only incremental data for small updates | △⁶ | △⁶ | △¹ | ○ |
+| Detect a storage rollback or fork after a prior sync | × | × | × | ○⁷ |
+| Branches | ○ | ○ | ○ | ○ |
+| Tags and remote branch deletion | ○ | ○ | ○ | ×⁸ |
+| Established, production-mature project | ○ | ○ | ○ | △ |
 
-The single-run local measurements are similarly workload-specific. On the
-867 MiB Godot history, `git-remote-gcrypt` and `git-remote-e2ee` took
-12.26/13.78 seconds for initial push and 30.78/31.75 seconds for fresh fetch.
-For a tiny update, an incompressible 10 MiB addition, and 1,000 small files,
-their push times were 0.54/0.08, 0.66/0.40, and 0.69/0.34 seconds respectively.
-After incremental connectivity verification was added, returning E2EE fetches
-for the same update classes took 0.09, 0.23, and 0.10 seconds on Godot, versus
-0.50, 0.64, and 0.47 seconds for gcrypt's local backend.
-The gcrypt run used its efficient local-filesystem backend, not its arbitrary
-Git transport. A separate selected-file benchmark found that `git-crypt` and
-`transcrypt` spent 20.03 and 143.94 seconds staging and pushing 1,000 encrypted
-files; this is not an apples-to-apples whole-repository comparison. See
-[BENCHMARKS.md](BENCHMARKS.md#comparison-with-the-tools-in-the-feature-table)
-for method, memory, disk growth, versions, and limitations.
+1. gcrypt is incremental with its local and rsync backends. Its
+   [performance documentation](https://manpages.debian.org/trixie/git-remote-gcrypt/git-remote-gcrypt.1.en.html#PERFORMANCE)
+   warns that arbitrary Git and SFTP backends may upload the complete history
+   on every push.
+2. File-filter repositories retain normal hosted review for visible data, but
+   the host cannot show plaintext diffs for encrypted files. A whole-remote
+   workflow needs an authorized client or CI job to decrypt and produce an
+   inner diff; the carrier repository's own diff is not meaningful.
+3. This refers to git-crypt's GPG-user mode. It still uses an internal
+   repository key, encrypted separately to each GPG recipient.
+4. Revoking a git-crypt user requires rotating the repository key and
+   re-encrypting the protected files.
+5. gcrypt has a longstanding behavior where pushes are effectively force
+   pushes; its explicit-force option prevents accidental use but does not add
+   compare-and-swap writer coordination.
+6. A changed encrypted file becomes a new complete ciphertext blob, so Git
+   cannot efficiently delta-compress it against the previous plaintext.
+7. A returning E2EE client pins observed history and rejects rollback or a
+   different successor chain. A fresh client still needs an authenticated
+   invitation checkpoint or an external anchor.
+8. The current E2EE implementation accepts destinations under
+   `refs/heads/*`; tag pushes and branch deletion fail without publication.
 
-If you need to protect a few secrets while retaining GitHub or GitLab features,
-use a file-filter tool. If the storage provider must not learn the repository
-structure or metadata, use a whole-remote encryption design—and, for now, treat
-this project as research-grade software.
+### Performance snapshot
+
+Whole-remote tools were measured once against the same 867 MiB reachable Godot
+history using local-filesystem backends. These are exploratory measurements,
+not stable release claims or network-hosting benchmarks:
+
+| Operation | Plain Git | `git-remote-gcrypt` | `git-remote-e2ee` |
+|---|---:|---:|---:|
+| Initial push | 30.51 s | 12.26 s | 13.78 s |
+| Fresh fetch | 30.26 s | 30.78 s | 31.75 s |
+| Tiny push | 0.17 s | 0.54 s | 0.08 s |
+| Add incompressible 10 MiB | 0.60 s | 0.66 s | 0.40 s |
+| Add 1,000 small files | 0.56 s | 0.69 s | 0.34 s |
+| Fetch tiny update | 0.12 s | 0.50 s | 0.09 s |
+| Fetch 10 MiB update | 0.58 s | 0.64 s | 0.23 s |
+| Fetch 1,000-file update | 0.08 s | 0.47 s | 0.10 s |
+
+Selected-file tools use a different workload and should not be ranked directly
+against whole-remote encryption:
+
+| Operation | `git-crypt` | `transcrypt` |
+|---|---:|---:|
+| Encrypt and push 10 MiB | 1.14 s | 1.76 s |
+| Encrypt and push 1,000 small files | 20.03 s | 143.94 s |
+| Fresh clone and unlock | 29.64 s | 380.18 s |
+
+See [BENCHMARKS.md](BENCHMARKS.md#comparison-with-the-tools-in-the-feature-table)
+for method, memory, disk growth, tool revisions, and limitations.
+
+## When another tool is a better fit
+
+- Use **git-crypt** when only a few files are secret and retaining normal
+  GitHub or GitLab diffs, reviews, search, and integrations for the rest of the
+  repository matters more than hiding the repository as a whole.
+- Use **transcrypt** when selected-file encryption with a shared passphrase is
+  acceptable and its simple shell-based setup is preferable.
+- Use **git-remote-gcrypt** when you need an established whole-remote tool,
+  already use GPG, and can use its efficient local or rsync backend while
+  accepting its force-push and periodic-repack behavior.
+- Use an ordinary **private Git repository** when you trust the host with the
+  plaintext and need first-class hosted pull requests, code search, previews,
+  or CI without managing decryption keys.
+- Do **not** use git-remote-e2ee as the only backup yet. Choose a mature tool if
+  you require stable repository formats, recovery tooling, tags, branch
+  deletion, shallow clones, or a production support commitment today.
+
+Choose `git-remote-e2ee` when the complete repository and its metadata must be
+opaque to storage, collaborators should use independent device keys, membership
+changes must not rewrite bulk history, and incremental synchronization plus
+client-side rollback and writer-race protection are worth giving up server-side
+plaintext features.
 
 ## Current features
 
