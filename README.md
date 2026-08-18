@@ -101,19 +101,13 @@ supported.
    invitation checkpoint or an external anchor.
 8. The current E2EE implementation accepts destinations under
    `refs/heads/*`; tag pushes and branch deletion fail without publication.
-9. The local timing comparison reflects different backend responsibilities.
-   Plain Git indexes a server-side object database and may construct a new
-   transfer pack during fetch. E2EE and gcrypt store encrypted pack files and
-   replay them directly. That is efficient on dumb storage, but the host cannot
-   provide plaintext diffs, search, shallow or partial-clone negotiation, or
-   other server-side Git features.
 
 ### Performance: practical full sync, incremental updates
 
 The local benchmark supports three practical conclusions:
 
 - Full encryption and reconstruction are in the same performance class as
-  plain Git⁹ and git-remote-gcrypt for a large repository.
+  plain Git and git-remote-gcrypt for a large repository.
 - Incremental E2EE push and fetch are comparable to plain Git and were faster
   than git-remote-gcrypt in every measured incremental case.
 - Incremental backend payload and storage grow with the new Git pack plus small
@@ -122,7 +116,7 @@ The local benchmark supports three practical conclusions:
 The tools were measured once against the same 867 MiB reachable Godot history
 using local-filesystem backends:
 
-| Operation | Plain Git | `git-remote-gcrypt` | `git-remote-e2ee` |
+| Operation | Plain Git† | `git-remote-gcrypt` | `git-remote-e2ee` |
 |---|---:|---:|---:|
 | Initial push | 30.51 s | 12.26 s | 13.78 s |
 | Fresh fetch | 30.26 s | 30.78 s | 31.75 s |
@@ -132,6 +126,13 @@ using local-filesystem backends:
 | Fetch tiny update | 0.12 s | 0.50 s | 0.09 s |
 | Fetch 10 MiB update | 0.58 s | 0.64 s | 0.23 s |
 | Fetch 1,000-file update | 0.08 s | 0.47 s | 0.10 s |
+
+† Plain Git and an opaque encrypted remote do different backend work. Plain
+Git indexes a server-side object database and may construct a new transfer pack
+during fetch. E2EE and gcrypt store encrypted pack files and replay them
+directly. That is efficient on dumb storage, but the host cannot provide
+plaintext diffs, search, shallow or partial-clone negotiation, or other
+server-side Git features.
 
 The corresponding remote growth was incremental:
 
