@@ -102,11 +102,19 @@ supported.
 8. The current E2EE implementation accepts destinations under
    `refs/heads/*`; tag pushes and branch deletion fail without publication.
 
-### Performance snapshot
+### Performance: practical full sync, incremental updates
 
-Whole-remote tools were measured once against the same 867 MiB reachable Godot
-history using local-filesystem backends. These are exploratory measurements,
-not stable release claims or network-hosting benchmarks:
+The local benchmark supports three practical conclusions:
+
+- Full encryption and reconstruction are in the same performance class as
+  plain Git and git-remote-gcrypt for a large repository.
+- Incremental E2EE push and fetch are comparable to plain Git and were faster
+  than git-remote-gcrypt in every measured incremental case.
+- Incremental backend payload and storage grow with the new Git pack plus small
+  protocol metadata, not with the complete repository history.
+
+The tools were measured once against the same 867 MiB reachable Godot history
+using local-filesystem backends:
 
 | Operation | Plain Git | `git-remote-gcrypt` | `git-remote-e2ee` |
 |---|---:|---:|---:|
@@ -119,14 +127,25 @@ not stable release claims or network-hosting benchmarks:
 | Fetch 10 MiB update | 0.58 s | 0.64 s | 0.23 s |
 | Fetch 1,000-file update | 0.08 s | 0.47 s | 0.10 s |
 
-Selected-file tools use a different workload and should not be ranked directly
-against whole-remote encryption:
+The corresponding remote growth was incremental:
 
-| Operation | `git-crypt` | `transcrypt` |
-|---|---:|---:|
-| Encrypt and push 10 MiB | 1.14 s | 1.76 s |
-| Encrypt and push 1,000 small files | 20.03 s | 143.94 s |
-| Fresh clone and unlock | 29.64 s | 380.18 s |
+| Update | Plain Git | `git-remote-gcrypt` | `git-remote-e2ee` |
+|---|---:|---:|---:|
+| Tiny commit | 1.5 KiB | 1.7 KiB | 3.5 KiB |
+| Add incompressible 10 MiB | 10.0 MiB | 10.0 MiB | 10.0 MiB |
+| Add 1,000 small files | 110.2 KiB | 67.2 KiB | 79.6 KiB |
+| Existing 877 MiB encrypted history rewritten | — | 0 bytes (this run) | 0 bytes |
+
+Adding a second E2EE reader wrote 3,379 bytes of policy and envelope metadata
+and rewrote zero existing pack bytes. With 100 active readers, content-pack
+storage and client repository size remained unchanged; only small per-reader
+metadata and public-key wrapping work grew.
+
+These are exploratory single runs, not stable release claims or
+network-hosting benchmarks. The gcrypt result uses its efficient local backend
+and did not cross its periodic repack threshold; its arbitrary Git transport
+has a different performance profile. A fresh clone necessarily transfers and
+checks the complete history.
 
 See [BENCHMARKS.md](BENCHMARKS.md#comparison-with-the-tools-in-the-feature-table)
 for method, memory, disk growth, tool revisions, and limitations.
