@@ -101,13 +101,19 @@ supported.
    invitation checkpoint or an external anchor.
 8. The current E2EE implementation accepts destinations under
    `refs/heads/*`; tag pushes and branch deletion fail without publication.
+9. The local timing comparison reflects different backend responsibilities.
+   Plain Git indexes a server-side object database and may construct a new
+   transfer pack during fetch. E2EE and gcrypt store encrypted pack files and
+   replay them directly. That is efficient on dumb storage, but the host cannot
+   provide plaintext diffs, search, shallow or partial-clone negotiation, or
+   other server-side Git features.
 
 ### Performance: practical full sync, incremental updates
 
 The local benchmark supports three practical conclusions:
 
 - Full encryption and reconstruction are in the same performance class as
-  plain Git and git-remote-gcrypt for a large repository.
+  plain Git⁹ and git-remote-gcrypt for a large repository.
 - Incremental E2EE push and fetch are comparable to plain Git and were faster
   than git-remote-gcrypt in every measured incremental case.
 - Incremental backend payload and storage grow with the new Git pack plus small
