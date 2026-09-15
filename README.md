@@ -223,6 +223,10 @@ git-e2ee --help
 
 Both binaries must be on `PATH` for native Git integration.
 
+Push sources must have complete history. Shallow repositories are rejected
+before publication; run `git fetch --unshallow` against the original Git remote
+before sending that repository to an encrypted remote.
+
 ## Quick start: filesystem backend
 
 Create a repository key and encrypted storage directory:

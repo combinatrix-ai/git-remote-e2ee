@@ -93,6 +93,17 @@ pub fn start_incremental_pack(
     new_refs: &BTreeMap<String, String>,
     old_refs: &BTreeMap<String, String>,
 ) -> Result<PackSource> {
+    let shallow = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--is-shallow-repository"])
+        .output()?;
+    if !shallow.status.success() {
+        bail!("could not determine whether the source repository is shallow")
+    }
+    if String::from_utf8(shallow.stdout)?.trim() == "true" {
+        bail!("cannot publish from a shallow repository; fetch --unshallow first")
+    }
     let stderr = tempfile::tempfile().context("create pack-objects stderr file")?;
     let mut child = Command::new("git")
         .arg("-C")
