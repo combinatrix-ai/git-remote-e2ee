@@ -339,6 +339,17 @@ Ciphertext is divided into 32 MiB chunks so it can be carried as ordinary Git
 blobs. The host can still observe outer commit times, chunk counts and sizes,
 update frequency, and total growth.
 
+Carrier Git objects are cached per remote URL, so subsequent operations fetch
+only new outer Git objects. The default cache is
+`$XDG_CACHE_HOME/git-remote-e2ee` or `$HOME/.cache/git-remote-e2ee`; set
+`GIT_E2EE_CACHE_DIR` to choose another location. It contains ciphertext Git
+objects and transport metadata, including the remote URL, but no device key.
+The cache can be removed without losing keys or the clone's continuity pins.
+Every operation still refreshes remote refs, and a failed refresh is an error;
+cached data is never an offline substitute for the remote. Temporary checkouts
+remain independent, and writer conflict checks and publication use the real
+remote directly.
+
 ## Security model
 
 The storage provider is treated as malicious for confidentiality and integrity.

@@ -461,9 +461,65 @@ fn validated_chunk_paths(directory: &Path) -> Result<Vec<PathBuf>> {
 
 impl GitStorage {
     pub fn open(remote: &str) -> Result<Self> {
+        let cache_base = std::env::var_os("GIT_E2EE_CACHE_DIR")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("XDG_CACHE_HOME")
+                    .map(PathBuf::from)
+                    .filter(|path| path.is_absolute())
+                    .map(|path| path.join("git-remote-e2ee"))
+            })
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|home| PathBuf::from(home).join(".cache/git-remote-e2ee"))
+            })
+            .context("set HOME or GIT_E2EE_CACHE_DIR for the carrier object cache")?;
+        Self::open_cached(remote, &cache_base)
+    }
+
+    fn open_cached(remote: &str, cache_base: &Path) -> Result<Self> {
         if remote.is_empty() {
             bail!("empty carrier Git remote")
         }
+        let cache = cache_base.join(hex::encode(Sha256::digest(remote.as_bytes())));
+        fs::create_dir_all(&cache)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&cache, fs::Permissions::from_mode(0o700))?;
+        }
+        let cache_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(cache.join("lock"))?;
+        cache_lock.lock_exclusive()?;
+        let repository = cache.join("objects.git");
+        if !repository.exists() {
+            let staging = tempfile::Builder::new()
+                .prefix("init-")
+                .tempdir_in(&cache)?;
+            git_command(staging.path(), &["init", "--bare", "--quiet"])?;
+            git_command(staging.path(), &["remote", "add", "origin", remote])?;
+            // Keep detached maintenance from racing local object hardlinking.
+            git_command(staging.path(), &["config", "gc.auto", "0"])?;
+            git_command(staging.path(), &["config", "maintenance.auto", "false"])?;
+            fs::rename(staging.path(), &repository)?;
+        }
+        // Never fall back to cached refs offline. Force/prune exposes remote
+        // rollback and deletion to the normal authenticated-state checks.
+        git_command(
+            &repository,
+            &[
+                "fetch",
+                "--quiet",
+                "--prune",
+                "--no-tags",
+                "origin",
+                "+refs/heads/*:refs/heads/*",
+            ],
+        )?;
         let checkout = tempfile::Builder::new()
             .prefix("git-remote-e2ee-carrier-")
             .tempdir()?;
@@ -476,8 +532,20 @@ impl GitStorage {
                 .path()
                 .parent()
                 .context("carrier tempdir has no parent")?,
-            &["clone", "--quiet", "--no-checkout", remote, checkout_path],
+            &[
+                "clone",
+                "--quiet",
+                "--no-checkout",
+                repository
+                    .to_str()
+                    .context("carrier cache path is not UTF-8")?,
+                checkout_path,
+            ],
         )?;
+        // Use hardlinks/copies, not alternates into the cache: eviction must not
+        // break an in-flight operation. CAS still uses the real remote directly.
+        git_command(checkout.path(), &["remote", "set-url", "origin", remote])?;
+        drop(cache_lock);
         git_command(checkout.path(), &["config", "user.name", "git-remote-e2ee"])?;
         git_command(
             checkout.path(),
@@ -701,6 +769,77 @@ mod tests {
 
     use super::*;
     use crate::crypto::object_id;
+
+    #[test]
+    fn carrier_cache_refreshes_refs_and_survives_eviction_during_an_operation() {
+        let temp = tempfile::tempdir().unwrap();
+        let remote = temp.path().join("remote.git");
+        fs::create_dir(&remote).unwrap();
+        git_command(&remote, &["init", "--bare", "--quiet"]).unwrap();
+        let url = remote.to_str().unwrap();
+        let cache = temp.path().join("cache");
+        let first = GitStorage::open_cached(url, &cache).unwrap();
+        let payload = b"opaque payload retained across opens";
+        let id = object_id(payload);
+        first
+            .put_object_if_absent(ObjectKind::Pack, &id, payload)
+            .unwrap();
+        let head_one = "1".repeat(64);
+        first.compare_and_swap_head(None, &head_one).unwrap();
+        drop(first);
+
+        let second = GitStorage::open_cached(url, &cache).unwrap();
+        assert_eq!(second.read_head().unwrap(), Some(head_one.clone()));
+        let cache_repo = cache
+            .join(hex::encode(Sha256::digest(url.as_bytes())))
+            .join("objects.git");
+        fs::write(cache_repo.join("retained-marker"), b"same cache").unwrap();
+        assert!(!second.root().join(".git/objects/info/alternates").exists());
+        let head_two = "2".repeat(64);
+        second
+            .compare_and_swap_head(Some(&head_one), &head_two)
+            .unwrap();
+        let third = GitStorage::open_cached(url, &cache).unwrap();
+        assert!(cache_repo.join("retained-marker").exists());
+        assert_eq!(third.read_head().unwrap(), Some(head_two.clone()));
+        assert_eq!(third.get_object(ObjectKind::Pack, &id).unwrap(), payload);
+        fs::remove_dir_all(&cache).unwrap();
+        assert_eq!(third.get_object(ObjectKind::Pack, &id).unwrap(), payload);
+        // Publication still targets the original server after cache eviction.
+        third
+            .compare_and_swap_head(Some(&head_two), &"3".repeat(64))
+            .unwrap();
+    }
+
+    #[test]
+    fn carrier_cache_does_not_hide_remote_failure_or_branch_deletion() {
+        let temp = tempfile::tempdir().unwrap();
+        let remote = temp.path().join("remote.git");
+        fs::create_dir(&remote).unwrap();
+        git_command(&remote, &["init", "--bare", "--quiet"]).unwrap();
+        let url = remote.to_str().unwrap();
+        let cache = temp.path().join("cache");
+        let first = GitStorage::open_cached(url, &cache).unwrap();
+        first.compare_and_swap_head(None, &"1".repeat(64)).unwrap();
+        drop(first);
+        assert!(
+            GitStorage::open_cached(url, &cache)
+                .unwrap()
+                .read_head()
+                .unwrap()
+                .is_some()
+        );
+        git_command(&remote, &["update-ref", "-d", "refs/heads/git-remote-e2ee"]).unwrap();
+        assert_eq!(
+            GitStorage::open_cached(url, &cache)
+                .unwrap()
+                .read_head()
+                .unwrap(),
+            None
+        );
+        fs::rename(&remote, temp.path().join("offline.git")).unwrap();
+        assert!(GitStorage::open_cached(url, &cache).is_err());
+    }
 
     struct PartialWriteSink {
         published: Arc<AtomicBool>,
