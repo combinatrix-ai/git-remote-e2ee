@@ -328,7 +328,11 @@ The server does not inspect encrypted inner commit parents. Two writers read
 the same opaque `HEAD`, create immutable candidates, and attempt the same CAS.
 Exactly one wins.
 
-- Filesystem storage uses locking and atomic rename.
+- Filesystem storage uses locking. `HEAD` is published by rename inside the
+  storage root. Immutable objects are hard-linked from `.staging` into
+  `objects/<prefix>/` on the same filesystem and are not replaced. New
+  directories and the parent of a published name are flushed; a flush error
+  fails the operation. Limits are in `DURABILITY.md`.
 - Carrier Git uses a normal fast-forward push of
   `refs/heads/git-remote-e2ee`; receive-pack ref update is the CAS.
 

@@ -1,0 +1,253 @@
+# Filesystem durability
+
+This describes what a successful filesystem publication promises, what it does
+not promise, and how to run the Windows hard-power-cut harness. No hard power
+cut was executed in this repository checkout.
+
+## Publication sequence
+
+Client continuity state (`state.json`), filesystem `HEAD`, and immutable
+objects use the same flush rules:
+
+1. Create any missing directory that will hold the published name, then flush
+   each created directory and the deepest ancestor that already existed.
+   Ancestors above that directory are not flushed. If that ancestor cannot be
+   flushed, creation fails.
+2. Write a temporary file and `File::sync_all` it. Return the error if that
+   fails.
+3. Publish the name.
+   - `state.json` and `HEAD` use `rename` in the destination directory and
+     replace an existing file.
+   - Immutable objects use `hard_link` from `.staging/<temp>` to
+     `objects/<prefix>/<id>`. Those are different directories on the same
+     filesystem. An existing path is not replaced. Its bytes are hashed and
+     must equal the object id; otherwise the call fails and the file is left
+     untouched.
+4. Flush the parent directory of the published name. Opening that directory or
+   flushing it, if it fails, fails the publication. Success is not returned
+   when this step fails.
+
+`FilesystemStorage::initialize` creates `objects`, `manifests`, and `policies`
+with the same directory helper, so the storage root (the preexisting ancestor)
+is flushed when those directories are new. A later object shard flushes the new
+`<prefix>` directory and `objects`, not the storage root again. Client state
+creates `.git/git-remote-e2ee/<remote>` the same way and stops at `.git` when
+that directory already exists.
+
+The carrier-Git backend does not use this helper. Its compare-and-swap is the
+fast-forward push of `refs/heads/git-remote-e2ee`.
+
+`KeyFile::write_new` still creates the final file in place and flushes that
+file only. It does not flush the parent directory. That path is outside this
+storage fix.
+
+## Unix
+
+The directory flush is `open` plus `sync_all` (`fsync`) on the parent
+directory. `fsync` reports an error on failure. It does not prove that a drive
+with a volatile write cache stored the sector.
+
+## Windows
+
+`File::open` on a directory followed by `sync_all` is not used. A directory
+handle opened with access `0` or `GENERIC_READ` can succeed and then
+`FlushFileBuffers` fails with `ERROR_ACCESS_DENIED` (os error 5).
+
+The helper opens the directory with Rust `OpenOptionsExt`:
+
+| Parameter | Value |
+| --- | --- |
+| `access_mode` | `GENERIC_WRITE` (`0x40000000`) |
+| `share_mode` | `7` = `FILE_SHARE_READ \| FILE_SHARE_WRITE \| FILE_SHARE_DELETE` |
+| disposition | `OPEN_EXISTING` (`3`), by not setting create or truncate |
+| `custom_flags` | `FILE_FLAG_BACKUP_SEMANTICS` (`0x02000000`) |
+
+`sync_all` is `FlushFileBuffers` on that handle. Open and flush errors both
+fail the publication.
+
+A Windows 11 NTFS probe observed this combination succeeding with flush error
+`0` for a limited interactive `codex` token. Creating an S4U scheduled task was
+denied, so the first native tests use that interactive token. A later power-cut
+run may execute the harness as SYSTEM through the guest agent. The probe is an
+API result on a running system. It is not a hard power cut, and this tree does
+not claim one was run here.
+
+`MoveFileExW` / `MOVEFILE_WRITE_THROUGH` is not used. `HEAD` and client state
+still use rename. Objects still use a hard link across `.staging` and
+`objects/<prefix>/`. `ReplaceFileW` / `REPLACEFILE_WRITE_THROUGH` is not used;
+that flag is unsupported.
+
+## What a returned success means
+
+After the function returns `Ok`:
+
+- the temporary file's bytes were flushed before the name was published;
+- the new directory entry was published;
+- every directory created for that publication was flushed through the
+  preexisting ancestor;
+- the parent-directory flush of the published name returned success.
+
+After acknowledged success, a later hard power cut must show the new complete
+state: client generation 2, `HEAD` successor id, or the successor object.
+The baseline immutable object must still contain its original bytes.
+
+Before the function returns, including after the file flush and after the
+rename or link but before the directory flush, a hard power cut must show
+either the complete baseline or the complete successor. A truncated file, a
+JSON fragment, a `HEAD` that is not one of the two fixture ids, or a successor
+object with the wrong bytes is a failure. Missing baseline object bytes are a
+failure at every stage.
+
+A process killed with `TerminateProcess` or `child.kill` is not a power cut.
+The harness below waits so a hypervisor can cut power while the guest is still
+inside the selected stage.
+
+## Limits that remain
+
+- Flush success does not prove a disk cache honored the request.
+- Directories above the preexisting ancestor are not flushed. `.staging` is
+  not a published name; losing it loses only an unfinished write.
+- A directory flush that fails after `rename` or `hard_link` returns an error
+  and does not try to roll the name back. The name may already be visible.
+  The caller must not treat that error as success.
+- Storage can still freeze, delete, or equivocate. Client pins detect rollback
+  only for state that was durably recorded.
+- No power-loss testing was done by the implementation change itself.
+
+## Power-cut harness
+
+The harness is the ignored library test
+`persist::tests::durability_power_cut_harness`. It is compiled only into the
+test binary (`cfg(test)`). `git-e2ee` and `git-remote-e2ee` do not contain the
+hook, do not read these variables, and do not wait.
+
+`cargo test` skips ignored tests. Do not treat a kill of this process as a
+power-loss result.
+
+The fixture must be an empty directory created for this experiment. Do not
+point it at a Vault, a real key file, or a personal repository. The Windows
+VM directory for the parent runner is `C:\Users\codex\e2ee-durability-test`.
+
+### Environment
+
+| Variable | Values |
+| --- | --- |
+| `E2EE_DURABILITY_FIXTURE` | Absolute fixture directory |
+| `E2EE_DURABILITY_OP` | `client_state`, `head`, or `object` |
+| `E2EE_DURABILITY_MODE` | `setup`, `mutate`, or `check` |
+| `E2EE_DURABILITY_STAGE` | `after_file_flush`, `after_name_publish`, `after_acknowledge` (mutate and check) |
+| `E2EE_DURABILITY_TCP` | Required for `mutate`. `172.18.0.1:18765`. Missing and loopback addresses are rejected. Not used by `setup` or `check`. |
+
+`setup` deletes only that op's subdirectory, writes the baseline, and exits.
+`mutate` requires the baseline, connects to `E2EE_DURABILITY_TCP` before the
+successor write, performs that write through the real callsite, and waits at
+the stage. `check` exits 0 when the on-disk result matches the stage rules
+above, and panics otherwise.
+
+Ops are isolated inside the fixture:
+
+- `client_state` → `<fixture>\client\state.json` via `persist_client_state`
+- `head` → `<fixture>\head\HEAD` via `FilesystemStorage::compare_and_swap_head`
+- `object` → `<fixture>\object-store\objects\<prefix>\<id>` via `put_object_if_absent`
+
+Payloads are fixed ASCII fixtures, not keys:
+
+- client baseline / successor: `e2ee-durability-client-v1` / `v2` (SHA-256 ids, generations 1 and 2)
+- head baseline / successor: `e2ee-durability-head-v1` / `v2`
+- object bytes: `e2ee-durability-object-v1` / `v2`
+
+### Stages
+
+| Stage | Where the wait happens |
+| --- | --- |
+| `after_file_flush` | After `sync_all` on the temp file, before rename or hard link |
+| `after_name_publish` | After rename or hard link returns, before the directory flush |
+| `after_acknowledge` | After the real persistence function has returned `Ok` |
+
+### Checkpoint protocol
+
+The outer listener binds `172.18.0.1:18765` before `mutate` starts. It expects
+one ASCII line, at most 512 bytes, ending in a single LF.
+
+`mutate` opens a `TcpStream` to `E2EE_DURABILITY_TCP` before it writes the
+successor. There is no guest listener, no accept thread, and no default
+loopback address. A missing endpoint or a loopback address fails the test
+before that write.
+
+At the selected stage the same socket does `write_all` and `flush` of exactly:
+
+```text
+E2EE_DURABILITY_CHECKPOINT op=<op> stage=<stage>
+```
+
+with a trailing LF and no further bytes. The guest then sleeps. The listener
+cuts on receipt (`docker kill --signal KILL codex-windows`), then restores the
+guest with `docker compose up -d` from `/home/exedev/windows`.
+
+Stdout may contain `E2EE_DURABILITY_CONNECTED ...` after the TCP connection and
+before the successor write. That line is not the checkpoint. Do not use a
+PowerShell raw socket; the guest connects outbound. A guest agent that only
+captures stdout after exit will not see the process while it is waiting.
+
+There is no production environment backdoor. The variables are read only by
+this ignored test.
+
+### Windows commands
+
+Build on a machine with Rust and `cargo-zigbuild` (not on the VM):
+
+```text
+cargo zigbuild --target x86_64-pc-windows-gnu --tests
+cargo zigbuild --release --target x86_64-pc-windows-gnu --bins
+```
+
+Copy the library test executable (the one whose `--list` output contains
+`persist::tests::durability_power_cut_harness`) to the VM. Release helper
+binaries are not the harness. Guest fixture root:
+`C:\Users\codex\e2ee-durability-test`.
+
+Run one op and one stage at a time, nine cuts in total (3 ops × 3 stages).
+Start the outer listener first. Repeat setup after each cut before the next
+mutate. Example for client state, cut before publication:
+
+```powershell
+$exe = "C:\Users\codex\e2ee-durability-test\git_remote_e2ee-test.exe"
+$env:E2EE_DURABILITY_FIXTURE = "C:\Users\codex\e2ee-durability-test"
+$env:E2EE_DURABILITY_OP = "client_state"
+$env:E2EE_DURABILITY_MODE = "setup"
+$env:E2EE_DURABILITY_STAGE = ""
+Remove-Item Env:E2EE_DURABILITY_TCP -ErrorAction SilentlyContinue
+& $exe --ignored --exact persist::tests::durability_power_cut_harness --nocapture --test-threads=1
+
+$env:E2EE_DURABILITY_MODE = "mutate"
+$env:E2EE_DURABILITY_STAGE = "after_file_flush"
+$env:E2EE_DURABILITY_TCP = "172.18.0.1:18765"
+& $exe --ignored --exact persist::tests::durability_power_cut_harness --nocapture --test-threads=1
+```
+
+After the guest is back:
+
+```powershell
+$env:E2EE_DURABILITY_FIXTURE = "C:\Users\codex\e2ee-durability-test"
+$env:E2EE_DURABILITY_OP = "client_state"
+$env:E2EE_DURABILITY_MODE = "check"
+$env:E2EE_DURABILITY_STAGE = "after_file_flush"
+Remove-Item Env:E2EE_DURABILITY_TCP -ErrorAction SilentlyContinue
+& $exe --ignored --exact persist::tests::durability_power_cut_harness --nocapture --test-threads=1
+```
+
+A passing check prints:
+
+```text
+E2EE_DURABILITY_CHECK op=client_state stage=after_file_flush result=pass observed=old
+```
+
+`observed` is `old` or `new` for the two pre-ack stages, and must be `new`
+for `after_acknowledge`. Run the same three modes for `head` and `object`, and
+for stages `after_name_publish` and `after_acknowledge`.
+
+`object` checks additionally fail if `e2ee-durability-object-v1` bytes change.
+
+The existing host test `end_to_end::rejects_storage_head_rollback_after_fetch_pins_history`
+covers rollback rejection with a key generated in a temporary directory. It is
+not a power-cut test and must not be pointed at a real key.

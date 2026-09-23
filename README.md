@@ -304,9 +304,15 @@ read_head()
 compare_and_swap_head(expected, next)
 ```
 
-The filesystem backend implements head CAS with an advisory lock and atomic
-rename. Stages are created inside the backend's own filesystem or checkout, so
-publication does not depend on cross-filesystem rename. The carrier-Git backend
+The filesystem backend implements head CAS with an advisory lock and a rename
+in the storage root. Object publication hard-links a staged file from
+`.staging` into `objects/<prefix>/` on the same filesystem and does not replace
+an existing id. File contents are flushed before the name is published, new
+directories are flushed through the preexisting ancestor, and the parent
+directory is flushed again afterwards. A flush error fails the call. Stages
+stay inside the backend's own filesystem or checkout, so publication does not
+cross filesystems. Crash and power-loss limits are in
+[DURABILITY.md](DURABILITY.md). The carrier-Git backend
 implements head CAS as a normal fast-forward push to the outer branch. A future
 S3 backend can use multipart upload plus conditional writes, but each provider
 must be capability-tested; “S3 compatible” does not by itself promise correct
@@ -326,6 +332,9 @@ cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
+
+The ignored power-cut harness is not part of that default run. Protocol,
+Windows commands, and durability limits are in [DURABILITY.md](DURABILITY.md).
 
 The test suite includes:
 

@@ -78,9 +78,11 @@ impl FilesystemStorage {
     }
 
     pub fn initialize(&self) -> Result<()> {
-        fs::create_dir_all(self.root.join("objects"))?;
-        fs::create_dir_all(self.root.join("manifests"))?;
-        fs::create_dir_all(self.root.join("policies"))?;
+        for name in ["objects", "manifests", "policies"] {
+            let directory = self.root.join(name);
+            crate::persist::create_dir_all_durable(&directory)
+                .with_context(|| format!("create {}", directory.display()))?;
+        }
         Ok(())
     }
 
@@ -98,16 +100,6 @@ impl FilesystemStorage {
             .truncate(false)
             .open(self.root.join("HEAD.lock"))
             .context("open HEAD lock")
-    }
-
-    fn sync_directory(path: &Path) -> Result<()> {
-        // Like `fsync`ing a directory on Unix, but Windows directory `sync_all` is unreliable
-        // (commonly failing with `Access is denied (os error 5)`), so we skip it there.
-        #[cfg(not(windows))]
-        File::open(path)?.sync_all()?;
-        #[cfg(windows)]
-        let _ = path;
-        Ok(())
     }
 }
 
@@ -139,27 +131,37 @@ impl ObjectStage for FilesystemObjectStage {
         }
         self.file.flush()?;
         self.file.sync_all()?;
+        crate::persist::durability_checkpoint(crate::persist::STAGE_AFTER_FILE_FLUSH);
         let target = self
             .root
             .join(self.kind.directory())
             .join(&id[..2])
             .join(id);
         let parent = target.parent().expect("object path has parent");
-        fs::create_dir_all(parent)?;
+        crate::persist::create_dir_all_durable(parent)
+            .with_context(|| format!("create {}", parent.display()))?;
         if target.exists() {
             verify_file_id(&target, id)?;
             fs::remove_file(&self.temporary)?;
+            crate::persist::sync_directory(parent)
+                .with_context(|| format!("sync directory {}", parent.display()))?;
             return Ok(());
         }
         match fs::hard_link(&self.temporary, &target) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 verify_file_id(&target, id)?;
+                fs::remove_file(&self.temporary)?;
+                crate::persist::sync_directory(parent)
+                    .with_context(|| format!("sync directory {}", parent.display()))?;
+                return Ok(());
             }
             Err(error) => return Err(error.into()),
         }
+        crate::persist::durability_checkpoint(crate::persist::STAGE_AFTER_NAME_PUBLISH);
         fs::remove_file(&self.temporary)?;
-        FilesystemStorage::sync_directory(parent)?;
+        crate::persist::sync_directory(parent)
+            .with_context(|| format!("sync directory {}", parent.display()))?;
         Ok(())
     }
 }
@@ -234,8 +236,11 @@ impl Storage for FilesystemStorage {
             .open(&temporary)?;
         writeln!(file, "{next}")?;
         file.sync_all()?;
+        crate::persist::durability_checkpoint(crate::persist::STAGE_AFTER_FILE_FLUSH);
         fs::rename(&temporary, self.root.join("HEAD"))?;
-        Self::sync_directory(&self.root)?;
+        crate::persist::durability_checkpoint(crate::persist::STAGE_AFTER_NAME_PUBLISH);
+        crate::persist::sync_directory(&self.root)
+            .with_context(|| format!("sync directory {}", self.root.display()))?;
         fs2::FileExt::unlock(&lock)?;
         Ok(())
     }
@@ -399,6 +404,8 @@ impl ObjectStage for CarrierObjectStage {
             return Ok(());
         }
         fs::create_dir_all(target.parent().expect("carrier object path has parent"))?;
+        // The fast-forward push is the compare-and-swap. This rename only
+        // updates a temporary checkout and is not a filesystem durability boundary.
         fs::rename(&self.staging, target)?;
         Ok(())
     }
