@@ -332,7 +332,7 @@ Exactly one wins.
   storage root. Immutable objects are hard-linked from `.staging` into
   `objects/<prefix>/` on the same filesystem and are not replaced. New
   directories and the parent of a published name are flushed; a flush error
-  fails the operation. Limits are in `DURABILITY.md`.
+  fails the operation. Limits are in `docs/durability.md`.
 - Carrier Git uses a normal fast-forward push of
   `refs/heads/git-remote-e2ee`; receive-pack ref update is the CAS.
 

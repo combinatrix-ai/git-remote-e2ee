@@ -312,7 +312,7 @@ directories are flushed through the preexisting ancestor, and the parent
 directory is flushed again afterwards. A flush error fails the call. Stages
 stay inside the backend's own filesystem or checkout, so publication does not
 cross filesystems. Crash and power-loss limits are in
-[DURABILITY.md](DURABILITY.md). The carrier-Git backend
+[docs/durability.md](docs/durability.md). The carrier-Git backend
 implements head CAS as a normal fast-forward push to the outer branch. A future
 S3 backend can use multipart upload plus conditional writes, but each provider
 must be capability-tested; “S3 compatible” does not by itself promise correct
@@ -334,7 +334,7 @@ cargo fmt --all -- --check
 ```
 
 The ignored power-cut harness is not part of that default run. Protocol,
-Windows commands, and durability limits are in [DURABILITY.md](DURABILITY.md).
+Windows commands, and durability limits are in [docs/durability.md](docs/durability.md).
 
 The test suite includes:
 

@@ -24,7 +24,7 @@
 //!
 //! This asks the operating system to commit the directory entry. It does not
 //! prove that a particular disk honoured the flush, and it is not a substitute
-//! for a hard power cut. See `DURABILITY.md`.
+//! for a hard power cut. See `docs/durability.md`.
 
 use std::io;
 use std::path::Path;
@@ -792,7 +792,7 @@ mod tests {
     /// The wait inside `mode=mutate` is the window for a QEMU hard power cut. Killing the
     /// process is not a power cut and is not what this harness is for.
     #[test]
-    #[ignore = "blocks until an external hard power cut; see DURABILITY.md"]
+    #[ignore = "blocks until an external hard power cut; see docs/durability.md"]
     fn durability_power_cut_harness() {
         run_power_cut_harness();
     }
