@@ -1,8 +1,8 @@
 # Filesystem durability
 
 This describes what a successful filesystem publication promises, what it does
-not promise, and how to run the Windows hard-power-cut harness. No hard power
-cut was executed in this repository checkout.
+not promise, and how to run the Windows virtual-power-cut harness. The native
+Windows and virtual-power-cut results below were verified on 2026-09-23.
 
 ## Publication sequence
 
@@ -117,7 +117,55 @@ inside the selected stage.
   is not success.
 - Storage can still freeze, delete, or equivocate. Client pins detect rollback
   only for state that was durably recorded.
-- No power-loss testing was done by the implementation change itself.
+- The experiment below kills the guest/QEMU process; the underlying host and
+  storage remain powered. Physical power loss and other filesystems remain
+  unverified.
+
+## Verified Windows results (2026-09-23)
+
+Code revision: `a40a193be85fccc6c837dce03680a87f654dc579`.
+Windows 11 on NTFS, in a nested QEMU/KVM VM using a qcow2 disk with
+`cache=none` and `no-flush=false`.
+
+- All 63 native Windows tests passed under a limited user token. The one
+  ignored test is the externally controlled power-cut harness.
+- Host format, all-target tests, and Clippy with warnings denied passed, as
+  did Windows-target Clippy and cross-builds. GitHub CI passed.
+- Nine virtual power cuts passed, one per cell below. The harness ran as
+  SYSTEM through the guest agent, using isolated fixture data and no real
+  repository keys.
+
+| Operation | After file flush, before publication | After publication, before directory flush | After persistence returned success |
+| --- | --- | --- | --- |
+| Client state | Complete old state | Complete old state | Complete new state |
+| Filesystem HEAD | Complete old HEAD | Complete old HEAD | Complete new HEAD |
+| Immutable object | New object absent | New object absent | Complete new object |
+
+The baseline immutable object retained its exact bytes in all three cases.
+The pre-acknowledgement checks permit complete old or new state; every
+pre-acknowledgement cut in this run recovered the old state. This demonstrates
+that returning from rename/link alone did not establish persistence in these
+observations. It is not a controlled comparison against a separate no-flush
+implementation.
+
+The guest connected to an external listener before mutation. At the selected
+checkpoint the listener immediately issued `docker kill --signal KILL` against
+the VM container. Receipt to completion of the kill took 0.421–0.554 seconds.
+No graceful shutdown, snapshot, or extra guest disk flush occurred in that
+interval. The VM was then started and the fixture read back.
+
+After the third cut Windows entered Automatic Repair; choosing Restart
+returned it to normal boot, and the client-state acknowledgement check passed.
+The remaining six cases used a clean reboot before setting up each new trial.
+Windows recovery policy was not disabled. These are nine finite observations,
+not proof of durability across all timing windows, storage devices, or physical
+host power failures.
+
+Library-test executable SHA-256:
+`7c0da9605391e6ccc26476fe43614313475c61103e2b94bb9b1bad500da5ed09`.
+
+Windows API references: [directory handles](https://learn.microsoft.com/en-us/windows/win32/fileio/obtaining-a-handle-to-a-directory),
+[FlushFileBuffers access requirements](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-flushfilebuffers).
 
 ## Power-cut harness
 
@@ -187,7 +235,7 @@ E2EE_DURABILITY_CHECKPOINT op=<op> stage=<stage>
 
 with a trailing LF and no further bytes. The process then sleeps. The listener
 cuts power after reading that line. Restoring the guest is outside this
-repository. Crash results are not recorded here.
+repository. The observed results are recorded above.
 
 Stdout may contain `E2EE_DURABILITY_CONNECTED ...` after the TCP connection and
 before the successor write. That line is not the checkpoint. The guest opens
