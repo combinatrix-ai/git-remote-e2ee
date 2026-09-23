@@ -81,10 +81,20 @@ fn sync_directory_windows(path: &Path) -> io::Result<()> {
 
 /// Create `path` and any missing parents.
 ///
-/// Each created directory is flushed, and so is the deepest ancestor that
-/// already existed, because that is the directory which gained a new child
-/// name. Ancestors above that preexisting directory are left alone. If `path`
-/// already exists, this does not flush anything.
+/// Relative paths are joined to the process working directory. `.` and `..`
+/// stay in the path and are resolved by the operating system, not removed
+/// lexically. An empty path is rejected.
+///
+/// Each directory created by this call is flushed, and so is the deepest
+/// ancestor that already existed, because that directory gained a new child
+/// name. Ancestors above it are not flushed. If `path` already exists, nothing
+/// is flushed.
+///
+/// On failure, directories created by this call are removed when possible so a
+/// retry can flush the ancestor again. If they cannot be removed, the tree is
+/// ambiguous: a later call sees them and does not flush ancestors. That does
+/// not make a previously unflushed entry durable. A failed call is
+/// unacknowledged and must be revalidated.
 pub(crate) fn create_dir_all_durable(path: &Path) -> io::Result<()> {
     if path.as_os_str().is_empty() {
         return Err(io::Error::new(
@@ -92,22 +102,29 @@ pub(crate) fn create_dir_all_durable(path: &Path) -> io::Result<()> {
             "empty directory path",
         ));
     }
+    let anchored = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
     let mut missing = Vec::new();
-    let mut cursor = path;
+    let mut cursor = anchored;
     let preexisting = loop {
         if cursor.exists() {
             break cursor;
         }
-        missing.push(cursor);
-        cursor = cursor
+        let Some(parent) = cursor
             .parent()
+            .map(Path::to_path_buf)
             .filter(|parent| !parent.as_os_str().is_empty())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("no existing ancestor for {}", path.display()),
-                )
-            })?;
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no existing ancestor for {}", path.display()),
+            ));
+        };
+        missing.push(cursor);
+        cursor = parent;
     };
     if !preexisting.is_dir() {
         return Err(io::Error::new(
@@ -118,18 +135,36 @@ pub(crate) fn create_dir_all_durable(path: &Path) -> io::Result<()> {
     if missing.is_empty() {
         return Ok(());
     }
+    let mut created = Vec::new();
     for directory in missing.iter().rev() {
         match std::fs::create_dir(directory) {
-            Ok(()) => {}
+            Ok(()) => created.push(directory.clone()),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
+            Err(error) => {
+                remove_created_directories(&created);
+                return Err(error);
+            }
         }
     }
-    for directory in &missing {
+    if let Err(error) = flush_created_directories(&missing, &preexisting) {
+        remove_created_directories(&created);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn flush_created_directories(missing: &[std::path::PathBuf], preexisting: &Path) -> io::Result<()> {
+    for directory in missing {
         sync_directory(directory)?;
     }
     sync_directory(preexisting)?;
     Ok(())
+}
+
+fn remove_created_directories(created: &[std::path::PathBuf]) {
+    for directory in created.iter().rev() {
+        let _ = std::fs::remove_dir(directory);
+    }
 }
 
 pub(crate) fn durability_checkpoint(stage: &str) {
@@ -249,7 +284,7 @@ mod tests {
         if path.exists() {
             fs::remove_dir_all(path).unwrap();
         }
-        fs::create_dir_all(path).unwrap();
+        create_dir_all_durable(path).unwrap();
     }
 
     fn json_string(value: &serde_json::Value, field: &str) -> Result<String, String> {
@@ -503,6 +538,13 @@ mod tests {
             }
             other => panic!("unknown durability mode {other}"),
         }
+    }
+
+    #[test]
+    fn empty_directory_path_is_rejected() {
+        let error = create_dir_all_durable(Path::new("")).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("empty"));
     }
 
     #[test]

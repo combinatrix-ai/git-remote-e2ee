@@ -11,8 +11,11 @@ objects use the same flush rules:
 
 1. Create any missing directory that will hold the published name, then flush
    each created directory and the deepest ancestor that already existed.
-   Ancestors above that directory are not flushed. If that ancestor cannot be
-   flushed, creation fails.
+   A relative path is anchored at the process working directory; `.` and `..`
+   are left for the operating system to resolve. Ancestors above the
+   preexisting directory are not flushed. If that ancestor cannot be flushed,
+   creation fails and the directories this call created are removed when
+   possible. A failed create is unacknowledged.
 2. Write a temporary file and `File::sync_all` it. Return the error if that
    fails.
 3. Publish the name.
@@ -65,12 +68,9 @@ The helper opens the directory with Rust `OpenOptionsExt`:
 `sync_all` is `FlushFileBuffers` on that handle. Open and flush errors both
 fail the publication.
 
-A Windows 11 NTFS probe observed this combination succeeding with flush error
-`0` for a limited interactive `codex` token. Creating an S4U scheduled task was
-denied, so the first native tests use that interactive token. A later power-cut
-run may execute the harness as SYSTEM through the guest agent. The probe is an
-API result on a running system. It is not a hard power cut, and this tree does
-not claim one was run here.
+A Windows 11 NTFS API probe with a limited user observed `FlushFileBuffers`
+returning success on that handle. That probe is not a crash or power-loss
+result. Crash evidence is still pending.
 
 `MoveFileExW` / `MOVEFILE_WRITE_THROUGH` is not used. `HEAD` and client state
 still use rename. Objects still use a hard link across `.staging` and
@@ -107,9 +107,14 @@ inside the selected stage.
 - Flush success does not prove a disk cache honored the request.
 - Directories above the preexisting ancestor are not flushed. `.staging` is
   not a published name; losing it loses only an unfinished write.
+- A failed directory create removes the directories that call created when it
+  can. If cleanup cannot remove them, a retry sees an existing directory and
+  does not flush ancestors. Those leftover entries are unacknowledged. A failed
+  publication must be revalidated; it does not prove that an earlier unflushed
+  ancestor entry is durable.
 - A directory flush that fails after `rename` or `hard_link` returns an error
-  and does not try to roll the name back. The name may already be visible.
-  The caller must not treat that error as success.
+  and does not roll the name back. The name may already be visible. That error
+  is not success.
 - Storage can still freeze, delete, or equivocate. Client pins detect rollback
   only for state that was durably recorded.
 - No power-loss testing was done by the implementation change itself.
@@ -180,14 +185,14 @@ At the selected stage the same socket does `write_all` and `flush` of exactly:
 E2EE_DURABILITY_CHECKPOINT op=<op> stage=<stage>
 ```
 
-with a trailing LF and no further bytes. The guest then sleeps. The listener
-cuts on receipt (`docker kill --signal KILL codex-windows`), then restores the
-guest with `docker compose up -d` from `/home/exedev/windows`.
+with a trailing LF and no further bytes. The process then sleeps. The listener
+cuts power after reading that line. Restoring the guest is outside this
+repository. Crash results are not recorded here.
 
 Stdout may contain `E2EE_DURABILITY_CONNECTED ...` after the TCP connection and
-before the successor write. That line is not the checkpoint. Do not use a
-PowerShell raw socket; the guest connects outbound. A guest agent that only
-captures stdout after exit will not see the process while it is waiting.
+before the successor write. That line is not the checkpoint. The guest opens
+the TCP connection itself. A guest agent that only captures stdout after exit
+will not see the process while it is waiting.
 
 There is no production environment backdoor. The variables are read only by
 this ignored test.
