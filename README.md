@@ -21,7 +21,7 @@ The implemented v4 protocol gives every published generation a fresh random
 root key. Each active reader receives one small public-key envelope for that
 generation; pack ciphertext is stored only once, independent of reader count,
 and is authenticated in bounded-memory 1 MiB segments.
-See the [design overview](DESIGN.md) and [normative specification](docs/spec.md).
+See the [design overview](docs/design.md) and [normative specification](docs/spec.md).
 
 ## Why this exists
 
@@ -323,7 +323,7 @@ No published object or `HEAD` points to it, and stale `.stage-*` entries may be
 deleted when no writer is running. Automatic age-based cleanup belongs to
 future garbage collection.
 
-See [DESIGN.md](DESIGN.md) for the protocol and threat-model details.
+See [docs/design.md](docs/design.md) for the protocol and threat-model details.
 
 ## Tests
 

@@ -1,6 +1,6 @@
 # Design
 
-This document summarizes the implemented v4 architecture. [`docs/spec.md`](docs/spec.md)
+This document summarizes the implemented v4 architecture. [`spec.md`](spec.md)
 defines the protocol invariants and security claims in detail.
 
 ## Goal
@@ -139,7 +139,7 @@ storage root. File contents are flushed before the name is published. A
 directory created for that publication is flushed through the preexisting
 ancestor, and the parent directory is flushed again after the new name is
 published. A flush error fails the call. Immutable objects are durable before
-the pointer moves, within the limits in [`docs/durability.md`](docs/durability.md).
+the pointer moves, within the limits in [`durability.md`](durability.md).
 Abandoned `.stage-*` files are unreachable; automatic cleanup is deferred to
 future GC.
 Manifest and policy objects still use bounded buffered parsing with a 16 MiB
