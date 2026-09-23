@@ -1,6 +1,6 @@
 # Design
 
-This document summarizes the implemented v4 architecture. [`SPEC.md`](SPEC.md)
+This document summarizes the implemented v4 architecture. [`spec.md`](spec.md)
 defines the protocol invariants and security claims in detail.
 
 ## Goal
@@ -131,10 +131,17 @@ compare_and_swap_head(expected, next)
 ```
 
 The ciphertext digest is computed during the write. `finish(id)` validates the
-digest and atomically publishes the staged object under that ID. Filesystem
-storage serializes CAS with an advisory lock and publishes `HEAD` with atomic
-rename. Immutable objects are durable before the pointer moves. Abandoned
-`.stage-*` files are unreachable; automatic cleanup is deferred to future GC.
+digest and publishes the staged object by hard-linking it from `.staging` into
+`objects/<prefix>/`. Those are different directories on the same filesystem.
+An existing object id is not replaced. Filesystem storage serializes CAS with
+an advisory lock and publishes `HEAD` by renaming a temporary file in the
+storage root. File contents are flushed before the name is published. A
+directory created for that publication is flushed through the preexisting
+ancestor, and the parent directory is flushed again after the new name is
+published. A flush error fails the call. Immutable objects are durable before
+the pointer moves, within the limits in [`durability.md`](durability.md).
+Abandoned `.stage-*` files are unreachable; automatic cleanup is deferred to
+future GC.
 Manifest and policy objects still use bounded buffered parsing with a 16 MiB
 hard limit; large pack objects always use the streaming path.
 

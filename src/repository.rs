@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
 
@@ -741,7 +741,8 @@ fn client_state_path(repo: &Path, remote_name: &str) -> Result<std::path::PathBu
     let directory = git_state_directory(repo)?
         .join("git-remote-e2ee")
         .join(remote_name);
-    fs::create_dir_all(&directory)?;
+    crate::persist::create_dir_all_durable(&directory)
+        .with_context(|| format!("create {}", directory.display()))?;
     Ok(directory.join("state.json"))
 }
 
@@ -816,9 +817,40 @@ fn persist_client_state(path: &Path, state: &ClientState) -> Result<()> {
         .open(&temporary)?;
     file.write_all(&serde_json::to_vec_pretty(state)?)?;
     file.sync_all()?;
+    crate::persist::durability_checkpoint(crate::persist::STAGE_AFTER_FILE_FLUSH);
     fs::rename(&temporary, path)?;
-    File::open(path.parent().context("client state path has no parent")?)?.sync_all()?;
+    crate::persist::durability_checkpoint(crate::persist::STAGE_AFTER_NAME_PUBLISH);
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .context("client state path has no parent")?;
+    crate::persist::sync_directory(parent)
+        .with_context(|| format!("sync directory {}", parent.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn testing_write_client_state(
+    path: &Path,
+    head_id: &str,
+    generation: u64,
+) -> Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        crate::persist::create_dir_all_durable(parent)?;
+    }
+    let state = ClientState {
+        format_version: 4,
+        packs: Vec::new(),
+        head_id: Some(head_id.to_owned()),
+        generation: Some(generation),
+        imported_generation: Some(generation),
+        policy_generation: Some(1),
+        repository_root: Some("durability-fixture".to_owned()),
+    };
+    persist_client_state(path, &state)
 }
 
 fn validate_remote_name(name: &str) -> Result<()> {

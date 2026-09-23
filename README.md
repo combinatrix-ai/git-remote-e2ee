@@ -21,7 +21,7 @@ The implemented v4 protocol gives every published generation a fresh random
 root key. Each active reader receives one small public-key envelope for that
 generation; pack ciphertext is stored only once, independent of reader count,
 and is authenticated in bounded-memory 1 MiB segments.
-See the [design overview](DESIGN.md) and [normative specification](SPEC.md).
+See the [design overview](docs/design.md) and [normative specification](docs/spec.md).
 
 ## Why this exists
 
@@ -304,9 +304,15 @@ read_head()
 compare_and_swap_head(expected, next)
 ```
 
-The filesystem backend implements head CAS with an advisory lock and atomic
-rename. Stages are created inside the backend's own filesystem or checkout, so
-publication does not depend on cross-filesystem rename. The carrier-Git backend
+The filesystem backend implements head CAS with an advisory lock and a rename
+in the storage root. Object publication hard-links a staged file from
+`.staging` into `objects/<prefix>/` on the same filesystem and does not replace
+an existing id. File contents are flushed before the name is published, new
+directories are flushed through the preexisting ancestor, and the parent
+directory is flushed again afterwards. A flush error fails the call. Stages
+stay inside the backend's own filesystem or checkout, so publication does not
+cross filesystems. Crash and power-loss limits are in
+[docs/durability.md](docs/durability.md). The carrier-Git backend
 implements head CAS as a normal fast-forward push to the outer branch. A future
 S3 backend can use multipart upload plus conditional writes, but each provider
 must be capability-tested; “S3 compatible” does not by itself promise correct
@@ -317,7 +323,7 @@ No published object or `HEAD` points to it, and stale `.stage-*` entries may be
 deleted when no writer is running. Automatic age-based cleanup belongs to
 future garbage collection.
 
-See [DESIGN.md](DESIGN.md) for the protocol and threat-model details.
+See [docs/design.md](docs/design.md) for the protocol and threat-model details.
 
 ## Tests
 
@@ -326,6 +332,9 @@ cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
+
+The ignored power-cut harness is not part of that default run. Protocol,
+Windows commands, and durability limits are in [docs/durability.md](docs/durability.md).
 
 The test suite includes:
 
@@ -367,7 +376,7 @@ request limits, and provider-specific policy.
 
 An opt-in local harness measures initial encryption, fresh reconstruction,
 verification, and incremental updates without contacting the source
-repository's configured remote. See [BENCHMARKS.md](BENCHMARKS.md). Benchmark
+repository's configured remote. See [docs/benchmarks.md](docs/benchmarks.md). Benchmark
 outputs, repository keys, and reconstructed data must not be committed.
 
 ## License

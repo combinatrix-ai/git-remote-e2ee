@@ -507,3 +507,88 @@ fn rejects_tag_destinations_consistently() {
     assert!(error.to_string().contains("only refs/heads"));
     assert_eq!(encrypted.verify().unwrap().generation, 0);
 }
+
+fn git_e2ee(workdir: &Path, args: &[impl AsRef<std::ffi::OsStr>]) -> std::process::Output {
+    let output = Command::new(env!("CARGO_BIN_EXE_git-e2ee"))
+        .current_dir(workdir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git-e2ee {:?} status {:?}\nstdout {}\nstderr {}",
+        args.iter().map(|arg| arg.as_ref()).collect::<Vec<_>>(),
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+#[test]
+fn init_with_relative_storage_creates_the_store_in_the_child_cwd() {
+    let root = tempfile::tempdir().unwrap();
+    let work = root.path().join("work");
+    fs::create_dir(&work).unwrap();
+    let key_path = root.path().join("fixture.key.json");
+    KeyFile::generate().write_new(&key_path).unwrap();
+    git_e2ee(
+        &work,
+        &[
+            "init",
+            "--storage",
+            "relative-store",
+            "--key",
+            key_path.to_str().unwrap(),
+        ],
+    );
+    assert!(work.join("relative-store/objects").is_dir());
+    assert!(work.join("relative-store/manifests").is_dir());
+    assert!(work.join("relative-store/policies").is_dir());
+    assert!(!root.path().join("relative-store").exists());
+}
+
+#[test]
+fn relative_dotdot_storage_follows_the_filesystem() {
+    let root = tempfile::tempdir().unwrap();
+    let work = root.path().join("work");
+    let nested = work.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    let key_path = root.path().join("fixture.key.json");
+    KeyFile::generate().write_new(&key_path).unwrap();
+    git_e2ee(
+        &nested,
+        &[
+            "init",
+            "--storage",
+            "../sibling-store",
+            "--key",
+            key_path.to_str().unwrap(),
+        ],
+    );
+    assert!(work.join("sibling-store/objects").is_dir());
+    assert!(!nested.join("sibling-store").exists());
+
+    #[cfg(unix)]
+    {
+        let holder = tempfile::tempdir().unwrap();
+        let outside_parent = holder.path().join("outside-parent");
+        let outside = outside_parent.join("target");
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, work.join("link")).unwrap();
+        let key_path = root.path().join("fixture-dotdot.key.json");
+        KeyFile::generate().write_new(&key_path).unwrap();
+        git_e2ee(
+            &work,
+            &[
+                "init",
+                "--storage",
+                "link/../dotdot-store",
+                "--key",
+                key_path.to_str().unwrap(),
+            ],
+        );
+        assert!(outside_parent.join("dotdot-store/objects").is_dir());
+        assert!(!work.join("dotdot-store").exists());
+    }
+}
