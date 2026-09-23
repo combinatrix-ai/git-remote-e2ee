@@ -1,6 +1,6 @@
 # Design
 
-This document summarizes the implemented v4 architecture. [`SPEC.md`](SPEC.md)
+This document summarizes the implemented v4 architecture. [`docs/spec.md`](docs/spec.md)
 defines the protocol invariants and security claims in detail.
 
 ## Goal

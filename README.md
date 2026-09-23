@@ -21,7 +21,7 @@ The implemented v4 protocol gives every published generation a fresh random
 root key. Each active reader receives one small public-key envelope for that
 generation; pack ciphertext is stored only once, independent of reader count,
 and is authenticated in bounded-memory 1 MiB segments.
-See the [design overview](DESIGN.md) and [normative specification](SPEC.md).
+See the [design overview](DESIGN.md) and [normative specification](docs/spec.md).
 
 ## Why this exists
 
@@ -376,7 +376,7 @@ request limits, and provider-specific policy.
 
 An opt-in local harness measures initial encryption, fresh reconstruction,
 verification, and incremental updates without contacting the source
-repository's configured remote. See [BENCHMARKS.md](BENCHMARKS.md). Benchmark
+repository's configured remote. See [docs/benchmarks.md](docs/benchmarks.md). Benchmark
 outputs, repository keys, and reconstructed data must not be committed.
 
 ## License
