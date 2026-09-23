@@ -101,7 +101,12 @@ impl FilesystemStorage {
     }
 
     fn sync_directory(path: &Path) -> Result<()> {
+        // Like `fsync`ing a directory on Unix, but Windows directory `sync_all` is unreliable
+        // (commonly failing with `Access is denied (os error 5)`), so we skip it there.
+        #[cfg(not(windows))]
         File::open(path)?.sync_all()?;
+        #[cfg(windows)]
+        let _ = path;
         Ok(())
     }
 }

@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
 
@@ -817,7 +817,12 @@ fn persist_client_state(path: &Path, state: &ClientState) -> Result<()> {
     file.write_all(&serde_json::to_vec_pretty(state)?)?;
     file.sync_all()?;
     fs::rename(&temporary, path)?;
-    File::open(path.parent().context("client state path has no parent")?)?.sync_all()?;
+    // On Unix we sync the parent directory to make the atomic rename durable.
+    // On Windows, syncing directories via `File::open(dir)?.sync_all()` is unreliable and
+    // can fail with `Access is denied (os error 5)`. We still keep file sync + atomic
+    // rename, but directory durability cannot be guaranteed the same way.
+    #[cfg(not(windows))]
+    std::fs::File::open(path.parent().context("client state path has no parent")?)?.sync_all()?;
     Ok(())
 }
 
