@@ -878,6 +878,7 @@ pub(crate) fn testing_write_client_state(
         imported_generation: Some(generation),
         policy_generation: Some(1),
         repository_root: Some("durability-fixture".to_owned()),
+        verified_refs: BTreeMap::new(),
     };
     persist_client_state(path, &state)
 }
