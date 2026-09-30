@@ -58,21 +58,33 @@ show it to you either. There are no web diffs, pull-request reviews, code
 search, or hosted CI on the plaintext. You are also responsible for your keys:
 if every authorized key is lost, the data cannot be recovered by anyone.
 
-## How it works
+## Why git-remote-e2ee
 
-1. **Every device has its own key.** There is no shared passphrase. An
-   administrator authorizes a device using only its public key and can revoke it
-   later.
-2. **Git runs on your machine; the helper encrypts what leaves it.** Git hands
-   the helper ordinary packs and refs. The helper encrypts them and uploads
-   opaque objects, then atomically moves one opaque `HEAD` pointer.
-3. **The storage only stores.** It keeps immutable ciphertext and performs one
-   compare-and-swap on `HEAD`. Fast-forward checks, conflict handling, and
-   history verification all happen on clients, so a concurrent push can never
-   silently overwrite someone else's work.
+Encrypting a whole Git repository is not new;
+[`git-remote-gcrypt`](https://github.com/spwhitton/git-remote-gcrypt) has done
+it for years. `git-remote-e2ee` keeps that goal and fixes three things that
+make encrypted remotes painful to live with:
 
-Storage backends today: a **local or mounted directory**, and **any ordinary
-Git remote** (GitHub, GitLab, a bare repository) used as a ciphertext carrier.
+- **Fast: incremental updates on any backend.** A push uploads only the new Git
+  pack plus a few KiB of metadata, including when GitHub or GitLab is the
+  storage. gcrypt re-uploads the entire history on every push to a Git or SFTP
+  backend, and can repack without warning.
+- **Safe: no silent force pushes.** Fast-forward checks run on the client, and
+  the storage moves `HEAD` only by compare-and-swap. When two people push at
+  once, one wins and the other gets an ordinary rejection. With gcrypt every
+  push is effectively a force push, so the second push can erase the first.
+- **No master key: every device has its own key.** There is no repository
+  password or shared private key to hand around. An administrator adds a
+  device by its public key and revokes it on its own, without rewriting
+  history. transcrypt shares one password, and git-crypt shares one repository
+  key that cannot be revoked.
+
+Under the hood, Git runs on your machine as usual. The helper encrypts the
+packs and refs Git hands it, uploads them as opaque immutable objects, and then
+atomically moves one opaque `HEAD` pointer. Storage backends today: a **local
+or mounted directory**, and **any ordinary Git remote** (GitHub, GitLab, a bare
+repository) used as a ciphertext carrier. The full comparison, including where
+other tools are the better choice, is in [How it compares](#how-it-compares).
 
 ## Quick start
 
