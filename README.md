@@ -65,19 +65,22 @@ Encrypting a whole Git repository is not new;
 it for years. `git-remote-e2ee` keeps that goal and fixes three things that
 make encrypted remotes painful to live with:
 
-- **Fast: incremental updates on any backend.** A push uploads only the new Git
-  pack plus a few KiB of metadata, including when GitHub or GitLab is the
-  storage. gcrypt re-uploads the entire history on every push to a Git or SFTP
-  backend, and can repack without warning.
+- **Fast: pushes upload only what changed.** A push uploads the new Git pack
+  plus a little metadata (3–4 KiB in total for a tiny commit with one
+  device), on every backend. gcrypt re-uploads the entire history on every push
+  to a Git or SFTP backend, and can repack without warning. One caveat today:
+  with a Git host as storage, each operation first clones the whole encrypted
+  carrier repository, so downloads are not yet incremental there.
 - **Safe: no silent force pushes.** Fast-forward checks run on the client, and
   the storage moves `HEAD` only by compare-and-swap. When two people push at
   once, one wins and the other gets an ordinary rejection. With gcrypt every
   push is effectively a force push, so the second push can erase the first.
-- **No master key: every device has its own key.** There is no repository
-  password or shared private key to hand around. An administrator adds a
-  device by its public key and revokes it on its own, without rewriting
-  history. transcrypt shares one password, and git-crypt shares one repository
-  key that cannot be revoked.
+- **No master key: every device has its own key.** There is no long-lived
+  repository password or shared private key to hand around. Each published
+  generation gets a fresh random key, delivered separately to each authorized
+  device. An administrator adds a device by its public key and revokes it on
+  its own, without rewriting history. transcrypt shares one password, and
+  git-crypt shares one repository key and does not support revoking access.
 
 Under the hood, Git runs on your machine as usual. The helper encrypts the
 packs and refs Git hands it, uploads them as opaque immutable objects, and then
@@ -159,7 +162,7 @@ questions:
 | Revoke one collaborator | ×⁸ | × | △⁹ | ○¹⁰ |
 | Separate reader, writer, and administrator roles | × | × | × | △¹¹ |
 | Concurrent pushes can't silently overwrite each other | ○ | ○ | ×¹² | ○ |
-| Small updates upload small amounts of data | △¹³ | △¹³ | △⁵ | ○ |
+| Small updates upload small amounts of data | △¹³ | △¹³ | △⁵ | ○¹⁶ |
 | Detects a rolled-back or forked remote | × | × | × | △¹⁴ |
 | Tags and remote branch deletion | ○ | ○ | ○ | ×¹⁵ |
 | Mature, stable format | ○ | ○ | ○ | × |
@@ -202,6 +205,10 @@ questions:
     [Security model](#security-model).
 15. Pushes are limited to `refs/heads/*` for now. Tag pushes and branch
     deletion fail without publishing anything.
+16. Uploads are incremental on every backend. With a Git host as storage, the
+    current implementation clones the whole carrier repository for each
+    operation, so every fetch and push also downloads the full encrypted
+    history until a persistent cache lands.
 
 ### Other approaches
 
@@ -276,8 +283,10 @@ single run:
 Plain Git is not directly comparable. A Git server indexes objects and builds
 packs per fetch, while encrypted remotes store and replay opaque packs. That is
 cheap on dumb storage, but it rules out server-side features such as partial
-clone. Each update stores only its new pack plus a few KiB of metadata. Adding a
-reader rewrote zero existing pack bytes. See [docs/benchmarks.md](docs/benchmarks.md) for
+clone. Each update stores only its new pack plus metadata: 3–4 KiB in total with one
+device, growing to roughly 30 KiB per update at 100 readers. Adding a reader
+rewrote zero existing pack bytes. These numbers are for the directory backend;
+the Git-carrier backend currently re-clones the carrier on each operation. See [docs/benchmarks.md](docs/benchmarks.md) for
 the method, the remaining cases, and the limitations.
 
 ## FAQ

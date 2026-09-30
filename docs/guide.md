@@ -155,6 +155,9 @@ compare-and-swap race. Inspect the winning state and run the command again.
   deletion fail without publishing anything.
 - A push that loses a race with another writer fails. Fetch, integrate, and
   push again.
+- With a Git host as storage, each operation clones the whole carrier
+  repository into a temporary directory. Uploads are incremental, but downloads
+  grow with the total encrypted history until a persistent cache lands.
 - Shallow and partial clones are not supported. A fresh clone downloads and
   verifies the complete history.
 
