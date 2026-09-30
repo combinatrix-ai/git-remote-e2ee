@@ -193,6 +193,81 @@ Old manifest headers retain device envelopes. Later compromise of a device
 private key can retroactively expose every generation addressed to that device.
 There is no forward secrecy for stored history.
 
+## Anonymous recipients (v5, in progress)
+
+v4 lets storage see each device's per-repository public keys, its roles, and
+every membership change. The reason is structural: envelopes carry a recipient
+device ID so a device can find its own, and verifiers compare that ID set with
+a plaintext policy. v5 removes that exposure so storage learns only a bounded
+reader count, the same class of leak as `gpg --throw-keyids` in
+git-remote-gcrypt.
+
+### What changes
+
+1. **Anonymous, padded envelopes.** The plaintext header carries a list of
+   HPKE envelopes with no recipient ID. The list is padded with dummy
+   envelopes to the next power of two, with a minimum of four. A dummy is a
+   random 32-byte encapsulated key plus random bytes of real ciphertext length,
+   indistinguishable from a real envelope without the recipient private key.
+   The list is sorted by encapsulated-key bytes, so position carries no
+   identity across generations. The HPKE AAD still binds the repository root,
+   format, generation, `C_t`, and the recipient's device ID. The recipient
+   knows its own ID, and the AAD is not transmitted.
+2. **Trial decryption, once per fetch.** A device tries its HPKE key against
+   each envelope of the newest manifest until one opens and the result matches
+   `C_t`. Older generation keys come from the backward link chain as in v4, so
+   only the head generation costs trial decryption: O(padded reader count)
+   X25519 operations per fetch, not per generation. The list length is capped
+   (4096) to bound work on malicious input. If nothing opens, the client
+   reports that this device is not an active reader of the current generation:
+   it was revoked, was never added, or its envelope is malformed.
+3. **Sealed header.** Everything that identified devices moves out of the
+   plaintext header into a sealed header, encrypted under a `K_t`-derived
+   subkey: policy ID and policy generation, signer device ID, transition type,
+   cumulative pack count, the envelope audit (item 5), and the Ed25519
+   signature. The signature covers the plaintext header bytes, the sealed
+   header content without the signature, and the encrypted body digest. The
+   plaintext header keeps only the format version, repository root,
+   generation, previous manifest ID, `C_t`, the envelope list, and the digests
+   needed to locate and authenticate the sealed parts.
+4. **Policy inside the transition manifest.** v5 removes the separate
+   plaintext `policies/` objects. A policy travels inside the encrypted body of
+   the manifest that introduces it: genesis, device add, revoke, or rotate.
+   Later manifests reference it by policy ID inside their sealed header, and
+   readers reach it through the backward key chain. Storage can no longer tell
+   a membership change from a content push, except by size.
+5. **Envelope audit.** Without visible recipient IDs, verifiers cannot compare
+   an envelope ID set with the active-reader set, so a malicious writer could
+   corrupt one reader's envelope unnoticed by everyone else. The sealed header
+   therefore records, for each envelope, either the recipient device ID and the
+   32-byte seed that fed the HPKE encapsulation RNG, or a dummy marker. After
+   opening its own envelope, every verifier deterministically re-seals `K_t`
+   for each real entry with that seed and the recipient's public key from the
+   policy. It requires byte equality with the stored envelope and exactly one
+   envelope per active reader. Dummy entries only need to be absent from the
+   reader mapping. A seed reveals only the shared secret for that envelope,
+   which yields `K_t`, and every verifier already holds `K_t`. The seed is
+   never reused.
+
+### What storage still learns
+
+The padded envelope count (an upper bound on active readers), object sizes,
+upload timing, generation count, total growth, and the opaque repository root.
+Device public keys, roles, signer identity, and the fact of a membership change
+become encrypted.
+
+### Costs and limits
+
+- Format break: v5 does not read v4 repositories and ships no migration, which
+  is acceptable for a prototype.
+- Padding adds at most 2x envelope metadata per generation.
+- A device that cannot open any envelope cannot tell revocation from
+  corruption. Continuity pins still reject rollback for returning clients.
+- A reader can still see the complete policy after decryption, exactly as in
+  v4.
+- The revocation race window, retroactive exposure on device-key compromise,
+  and the absence of forward secrecy are unchanged.
+
 ## Cost model
 
 For new encrypted pack bytes `S`, active readers `N`, and a small envelope `G`:
