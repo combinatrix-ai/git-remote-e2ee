@@ -15,8 +15,8 @@
 <p align="center">
   <a href="#クイックスタート">クイックスタート</a>
   · <a href="#他のツールとの比較">他のツールとの比較</a>
-  · <a href="DESIGN.md">設計</a>
-  · <a href="SPEC.md">仕様</a>
+  · <a href="docs/design.md">設計</a>
+  · <a href="docs/spec.md">仕様</a>
   · <a href="README.md">English</a>
 </p>
 
@@ -166,7 +166,7 @@ Git を暗号化するツールには大きく2つの系統があり、解決し
 - トラフィック分析（更新時刻、オブジェクトのサイズ、全体の増え方は見えます）
 - 将来の量子計算機による攻撃（鍵交換は X25519 です）
 
-鍵は過去向きの鎖になっています。現在の鍵でそれ以前の履歴をすべて復号できるので、新しい端末もリポジトリ全体を読めますが、古い鍵でそれより新しいものは復号できません。これは key regression であって、すでに公開された履歴に対する前方秘匿性ではありません。脅威モデルの詳細は [DESIGN.md](DESIGN.md) と [SPEC.md](SPEC.md)、問題の報告は [SECURITY.md](SECURITY.md) を参照してください。
+鍵は過去向きの鎖になっています。現在の鍵でそれ以前の履歴をすべて復号できるので、新しい端末もリポジトリ全体を読めますが、古い鍵でそれより新しいものは復号できません。これは key regression であって、すでに公開された履歴に対する前方秘匿性ではありません。脅威モデルの詳細は [docs/design.md](docs/design.md) と [docs/spec.md](docs/spec.md)、問題の報告は [SECURITY.md](SECURITY.md) を参照してください。
 
 ## 性能
 
@@ -179,7 +179,7 @@ Git を暗号化するツールには大きく2つの系統があり、解決し
 | ごく小さな push | 0.17 秒 | 0.54 秒 | 0.08 秒 |
 | ごく小さな更新の fetch | 0.12 秒 | 0.50 秒 | 0.09 秒 |
 
-通常の Git とは単純に比べられません。Git サーバーはオブジェクトを索引し、fetch のたびに pack を作りますが、暗号化リモートは中身の見えない pack を保存してそのまま再生します。単純な保存先では効率的ですが、partial clone のようなサーバー側の機能は使えなくなります。更新ごとに保存されるのは新しい pack と数 KiB のメタデータだけで、読み手を1人追加しても既存の pack は1バイトも書き換わりませんでした。測定方法、その他のケース、制約は [BENCHMARKS.md](BENCHMARKS.md) にあります。
+通常の Git とは単純に比べられません。Git サーバーはオブジェクトを索引し、fetch のたびに pack を作りますが、暗号化リモートは中身の見えない pack を保存してそのまま再生します。単純な保存先では効率的ですが、partial clone のようなサーバー側の機能は使えなくなります。更新ごとに保存されるのは新しい pack と数 KiB のメタデータだけで、読み手を1人追加しても既存の pack は1バイトも書き換わりませんでした。測定方法、その他のケース、制約は [docs/benchmarks.md](docs/benchmarks.md) にあります。
 
 ## よくある質問
 
@@ -210,9 +210,10 @@ Git を暗号化するツールには大きく2つの系統があり、解決し
 ## ドキュメント（英語）
 
 - [利用ガイド](docs/guide.md): バックエンド、clone、端末の管理、保存形式
-- [DESIGN.md](DESIGN.md): 設計の概要と脅威モデル
-- [SPEC.md](SPEC.md): プロトコルの規範的な仕様
-- [BENCHMARKS.md](BENCHMARKS.md): ベンチマークの方法と結果
+- [docs/design.md](docs/design.md): 設計の概要と脅威モデル
+- [docs/spec.md](docs/spec.md): プロトコルの規範的な仕様
+- [docs/benchmarks.md](docs/benchmarks.md): ベンチマークの方法と結果
+- [docs/durability.md](docs/durability.md): ファイルシステムバックエンドのクラッシュ・停電時の保証
 - [CONTRIBUTING.md](CONTRIBUTING.md): ビルド、テスト、テストの範囲
 
 ## ライセンス

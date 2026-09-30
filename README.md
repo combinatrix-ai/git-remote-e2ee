@@ -15,8 +15,8 @@
 <p align="center">
   <a href="#quick-start">Quick start</a>
   · <a href="#how-it-compares">How it compares</a>
-  · <a href="DESIGN.md">Design</a>
-  · <a href="SPEC.md">Specification</a>
+  · <a href="docs/design.md">Design</a>
+  · <a href="docs/spec.md">Specification</a>
   · <a href="README.ja.md">日本語</a>
 </p>
 
@@ -245,7 +245,7 @@ It does **not** prevent:
 Keys work as a backward chain. The current key can decrypt all earlier
 history, which lets a new device read the whole repository, but an old key
 cannot decrypt anything newer. This is key regression, not forward secrecy for
-history already published. See [DESIGN.md](DESIGN.md) and [SPEC.md](SPEC.md)
+history already published. See [docs/design.md](docs/design.md) and [docs/spec.md](docs/spec.md)
 for the full threat model, and [SECURITY.md](SECURITY.md) to report an issue.
 
 ## Performance
@@ -265,7 +265,7 @@ Plain Git is not directly comparable. A Git server indexes objects and builds
 packs per fetch, while encrypted remotes store and replay opaque packs. That is
 cheap on dumb storage, but it rules out server-side features such as partial
 clone. Each update stores only its new pack plus a few KiB of metadata. Adding a
-reader rewrote zero existing pack bytes. See [BENCHMARKS.md](BENCHMARKS.md) for
+reader rewrote zero existing pack bytes. See [docs/benchmarks.md](docs/benchmarks.md) for
 the method, the remaining cases, and the limitations.
 
 ## FAQ
@@ -310,9 +310,10 @@ and optional transparency-log anchoring.
 
 - [User guide](docs/guide.md): backends, cloning, device management, and the
   storage layout
-- [DESIGN.md](DESIGN.md): design overview and threat model
-- [SPEC.md](SPEC.md): normative protocol specification
-- [BENCHMARKS.md](BENCHMARKS.md): benchmark method and results
+- [docs/design.md](docs/design.md): design overview and threat model
+- [docs/spec.md](docs/spec.md): normative protocol specification
+- [docs/benchmarks.md](docs/benchmarks.md): benchmark method and results
+- [docs/durability.md](docs/durability.md): crash and power-loss guarantees of the filesystem backend
 - [CONTRIBUTING.md](CONTRIBUTING.md): building, testing, and what the test
   suite covers
 

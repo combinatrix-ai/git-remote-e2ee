@@ -2,7 +2,7 @@
 
 This guide covers everyday use. For why the tool exists and how it compares to
 alternatives, see the [README](../README.md). For the protocol, see
-[DESIGN.md](../DESIGN.md) and [SPEC.md](../SPEC.md).
+the [design overview](design.md) and the [specification](spec.md).
 
 ## Install
 
@@ -171,9 +171,13 @@ compare_and_swap_head(expected, next)
 ```
 
 The filesystem backend implements head compare-and-swap with an advisory lock
-and atomic rename. Stages are created inside the backend's own filesystem or
-checkout, so publication does not depend on cross-filesystem rename. The
-carrier-Git backend implements it as a normal fast-forward push to the outer
+and a rename in the storage root. Object publication hard-links a staged file
+from `.staging` into `objects/<prefix>/` on the same filesystem and never
+replaces an existing ID. File contents are flushed before a name is published,
+new directories are flushed through the preexisting ancestor, and the parent
+directory is flushed again afterwards; a flush error fails the call. Crash and
+power-loss limits are in [durability.md](durability.md). The carrier-Git
+backend implements compare-and-swap as a normal fast-forward push to the outer
 branch. A future S3 backend can use multipart upload plus conditional writes,
 but each provider must be capability-tested: "S3 compatible" does not by itself
 promise correct compare-and-swap behavior.

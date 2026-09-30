@@ -13,8 +13,8 @@ Issues and pull requests are welcome. For security problems, follow
   availability, rollback, freeze, and equivocation limits precisely.
 - Never commit key files or decrypted test data. Test secrets must live only in
   temporary directories.
-- Protocol changes must update [SPEC.md](SPEC.md) and, where relevant,
-  [DESIGN.md](DESIGN.md) in the same change.
+- Protocol changes must update [docs/spec.md](docs/spec.md) and, where relevant,
+  [docs/design.md](docs/design.md) in the same change.
 
 ## Build and test
 
@@ -24,7 +24,9 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-CI runs the same three commands.
+CI runs the same three commands. The ignored power-cut harness is not part of
+the default run; its protocol, Windows commands, and durability limits are in
+[docs/durability.md](docs/durability.md).
 
 The test suite covers:
 
@@ -53,6 +55,6 @@ request limits, and provider-specific policy.
 ## Benchmarks
 
 The opt-in harness in `scripts/` measures encryption, reconstruction,
-verification, and incremental updates. See [BENCHMARKS.md](BENCHMARKS.md).
+verification, and incremental updates. See [docs/benchmarks.md](docs/benchmarks.md).
 Benchmark outputs, repository keys, and reconstructed data must not be
 committed.

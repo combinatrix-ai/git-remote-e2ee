@@ -6,8 +6,8 @@ rather than opening a public issue.
 
 `git-remote-e2ee` is an early prototype and has not been independently
 audited. Its intended guarantees and known limits are listed in the
-[README](README.md#security-model) and specified in [DESIGN.md](DESIGN.md) and
-[SPEC.md](SPEC.md). Reports are especially welcome about:
+[README](README.md#security-model) and specified in [docs/design.md](docs/design.md) and
+[docs/spec.md](docs/spec.md). Reports are especially welcome about:
 
 - plaintext, refs, paths, or other inner metadata reaching storage;
 - accepting tampered, rolled-back, or forked state that a returning clone
