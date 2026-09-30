@@ -60,34 +60,33 @@ if every authorized key is lost, the data cannot be recovered by anyone.
 
 ## Why git-remote-e2ee
 
-Encrypting a whole Git repository is not new;
+Encrypting a whole Git repository is not new:
 [`git-remote-gcrypt`](https://github.com/spwhitton/git-remote-gcrypt) has done
-it for years. `git-remote-e2ee` keeps that goal and fixes three things that
-make encrypted remotes painful to live with:
+it with GnuPG for years. `git-remote-e2ee` keeps that goal and fixes what makes
+an encrypted remote painful to live with:
 
 - **Fast: pushes upload only what changed.** A push uploads the new Git pack
-  plus a little metadata (3–4 KiB in total for a tiny commit with one
-  device), on every backend. gcrypt re-uploads the entire history on every push
-  to a Git or SFTP backend, and can repack without warning. One caveat today:
-  with a Git host as storage, each operation first clones the whole encrypted
-  carrier repository, so downloads are not yet incremental there.
+  plus a little metadata (3–4 KiB in total for a tiny commit with one device),
+  on every backend. gcrypt re-uploads the entire history on every push to a Git
+  or SFTP backend such as GitHub, and can repack without warning. One caveat
+  today: with a Git host as storage, each operation first clones the whole
+  encrypted carrier repository, so downloads are not yet incremental there.
 - **Safe: no silent force pushes.** Fast-forward checks run on the client, and
   the storage moves `HEAD` only by compare-and-swap. When two people push at
   once, one wins and the other gets an ordinary rejection. With gcrypt every
-  push is effectively a force push, so the second push can erase the first.
-- **No master key: every device has its own key.** There is no long-lived
-  repository password or shared private key to hand around. Each published
-  generation gets a fresh random key, delivered separately to each authorized
-  device. An administrator adds a device by its public key and revokes it on
-  its own, without rewriting history. transcrypt shares one password, and
-  git-crypt shares one repository key and does not support revoking access.
+  push is effectively a force push, so a push made without pulling first can
+  erase someone else's work.
+- **Managed membership: one key per device, no GPG.** Like gcrypt, there is no
+  shared passphrase: every device has its own key. Unlike gcrypt, only
+  administrators can change who has access, revoking a device is a built-in
+  operation that publishes a fresh key without rewriting history, and a clone
+  that has synced before rejects a rolled-back or forked remote.
 
 Under the hood, Git runs on your machine as usual. The helper encrypts the
 packs and refs Git hands it, uploads them as opaque immutable objects, and then
 atomically moves one opaque `HEAD` pointer. Storage backends today: a **local
 or mounted directory**, and **any ordinary Git remote** (GitHub, GitLab, a bare
-repository) used as a ciphertext carrier. The full comparison, including where
-other tools are the better choice, is in [How it compares](#how-it-compares).
+repository) used as a ciphertext carrier.
 
 ## Quick start
 
@@ -123,50 +122,45 @@ the directory backend, cloning, and revoking devices.
 
 ## How it compares
 
-There are two families of encrypted-Git tools, and they answer different
-questions:
-
-- **File filters** ([`git-crypt`](https://github.com/AGWA/git-crypt),
-  [`transcrypt`](https://github.com/elasticdog/transcrypt)) encrypt the contents
-  of selected files inside an otherwise normal repository. The host still sees
-  the repository's structure and history, and keeps working normally for
-  everything left unencrypted.
-- **Encrypted remotes**
-  ([`git-remote-gcrypt`](https://github.com/spwhitton/git-remote-gcrypt),
-  `git-remote-e2ee`) encrypt the whole repository, history included. The host
-  sees opaque blobs and nothing else of the inner repository.
+There are two kinds of encrypted-Git tools. **File-level tools**, represented
+here by [`git-crypt`](https://github.com/AGWA/git-crypt), encrypt the contents
+of selected files inside an otherwise normal repository. **Encrypted remotes**,
+[`git-remote-gcrypt`](https://github.com/spwhitton/git-remote-gcrypt) and
+`git-remote-e2ee`, encrypt the whole repository, history included.
 
 ### What the storage host can learn
 
-| | Private repo | `git-crypt` | `transcrypt` | `git-remote-gcrypt` | `git-remote-e2ee` |
-|---|:---:|:---:|:---:|:---:|:---:|
-| Contents of files you chose to protect | visible | hidden | hidden | hidden | hidden |
-| Contents of all other files | visible | visible | visible | hidden | hidden |
-| File names and directory layout | visible | visible | visible | hidden | hidden |
-| Commit messages, authors, and dates | visible | visible | visible | hidden | hidden |
-| Branch names and the commit graph | visible | visible | visible | hidden | hidden |
-| Which files changed, their sizes, identical files | visible | visible¹ | visible | hidden | hidden |
-| When you push, and roughly how much | visible | visible | visible | visible | visible |
-| Collaborator keys | account list | key fingerprints² | — (shared password) | count only³ | count, public keys, roles⁴ |
+| | Private repo | `git-crypt` | `git-remote-gcrypt` | `git-remote-e2ee` |
+|---|:---:|:---:|:---:|:---:|
+| Contents of files you chose to protect | visible | hidden | hidden | hidden |
+| Contents of all other files | visible | visible | hidden | hidden |
+| File names and directory layout | visible | visible | hidden | hidden |
+| Commit messages, authors, and dates | visible | visible | hidden | hidden |
+| Branch names and the commit graph | visible | visible | hidden | hidden |
+| Which files changed, their sizes, identical files | visible | visible¹ | hidden | hidden |
+| When you push, and roughly how much | visible | visible | visible | visible |
+| Collaborators | account list | key fingerprints² | count only³ | count, public keys, roles⁴ |
 
 ### What each tool can do
 
-| | `git-crypt` | `transcrypt` | `git-remote-gcrypt` | `git-remote-e2ee` |
-|---|:---:|:---:|:---:|:---:|
-| Normal `clone`, `pull`, and `push` | ○ | ○ | ○ | ○ |
-| GitHub or GitLab as storage | ○ | ○ | △⁵ | ○ |
-| Hosted diffs, review, and search for unencrypted parts | ○ | ○ | × | × |
-| Encrypt only selected files | ○ | ○ | × | × |
-| Tampering detected | △⁶ | ×⁷ | ○ | ○ |
-| No shared secret; add people by public key | ○² | × | ○ | ○ |
-| Revoke one collaborator | ×⁸ | × | △⁹ | ○¹⁰ |
-| Separate reader, writer, and administrator roles | × | × | × | △¹¹ |
-| Concurrent pushes can't silently overwrite each other | ○ | ○ | ×¹² | ○ |
-| Small updates upload small amounts of data | △¹³ | △¹³ | △⁵ | ○¹⁶ |
-| Detects a rolled-back or forked remote | × | × | × | △¹⁴ |
-| Tags and remote branch deletion | ○ | ○ | ○ | ×¹⁵ |
-| Mature, stable format | ○ | ○ | ○ | × |
-| Cryptography | AES-256-CTR, HMAC-SHA1 SIV | AES-256-CBC via OpenSSL | OpenPGP (GnuPG) | XChaCha20-Poly1305, HPKE (X25519), Ed25519 |
+| | `git-crypt` | `git-remote-gcrypt` | `git-remote-e2ee` |
+|---|:---:|:---:|:---:|
+| Normal `clone`, `pull`, and `push` | ○ | ○ | ○ |
+| GitHub or GitLab as storage | ○ | △⁵ | △⁶ |
+| Hosted diffs, review, and search for unencrypted parts | ○ | × | × |
+| Encrypt only selected files | ○ | × | × |
+| Push uploads only new data | △⁷ | △⁵ | ○ |
+| Concurrent pushes can't silently overwrite each other | ○ | ×⁸ | ○ |
+| Tampering detected | △⁹ | ○ | ○ |
+| One key per person or device, no shared passphrase | △¹⁰ | ○ | ○ |
+| Only administrators can change membership | × | ×¹¹ | ○ |
+| Revoke one collaborator | ×¹² | ×¹³ | ○¹⁴ |
+| Separate reader and writer roles | × | × | △¹⁵ |
+| Detects a rolled-back or forked remote | × | × | △¹⁶ |
+| Works without GnuPG | ○¹⁰ | × | ○ |
+| Tags and remote branch deletion | ○ | ○ | ×¹⁷ |
+| Mature, stable format | ○ | ○ | × |
+| Cryptography | AES-256-CTR, HMAC-SHA1 SIV | OpenPGP (GnuPG) | XChaCha20-Poly1305, HPKE (X25519), Ed25519 |
 
 ○ supported · △ with caveats · × not supported
 
@@ -184,59 +178,42 @@ questions:
    [documentation](https://manpages.debian.org/trixie/git-remote-gcrypt/git-remote-gcrypt.1.en.html)
    says a Git or SFTP backend uploads the entire history on every push, and it
    may repack the remote without warning.
-6. git-crypt authenticates encrypted file contents; file names, history, and
+6. Pushes upload only new data, but the current implementation clones the whole
+   carrier repository for each operation, so every fetch and push also
+   downloads the full encrypted history until a persistent cache lands. With a
+   directory as storage, both directions are incremental.
+7. A changed encrypted file becomes a new, unrelated ciphertext blob, so Git
+   cannot delta-compress it against the previous version.
+8. Every gcrypt push is effectively a force push. Its explicit-force option
+   prevents accidents but does not coordinate concurrent writers.
+9. git-crypt authenticates encrypted file contents; file names, history, and
    which files are encrypted are ordinary Git data.
-7. transcrypt uses unauthenticated CBC; its README lists ciphertext
-   malleability as a known limitation.
-8. git-crypt's README states that it does not support revoking access.
-   Rotating the key means re-encrypting the protected files by hand.
-9. Participants can be removed from `gcrypt.participants`, but gcrypt does not
-   document a revocation workflow.
-10. Revocation publishes a fresh key without rewriting history. Like every tool
-    here, it cannot take back data the device already had.
-11. The protocol separates the three roles, but the CLI currently grants either
-    read and write, or read, write, and administration.
-12. Every gcrypt push is effectively a force push. Its explicit-force option
-    prevents accidents but does not coordinate concurrent writers.
-13. A changed encrypted file becomes a new, unrelated ciphertext blob, so Git
-    cannot delta-compress it against the previous version.
-14. A clone that has synced before rejects rollback or a diverging history. A
+10. git-crypt's GPG mode wraps one symmetric repository key to each user's GPG
+    key. Without GPG, everyone shares the same exported key file.
+11. gcrypt's recipient list is the local `gcrypt.participants` setting of
+    whoever pushes, so any participant who can push decides who can read the
+    next state.
+12. git-crypt's README states that it does not support revoking access.
+13. A participant can be dropped from `gcrypt.participants`, but gcrypt does
+    not document a revocation workflow.
+14. Revocation publishes a fresh key without rewriting history. It cannot take
+    back data the device already had.
+15. The protocol separates reader, writer, and administrator, but the CLI
+    currently grants either read and write, or read, write, and administration.
+16. A clone that has synced before rejects rollback or a diverging history. A
     brand-new clone cannot tell without an external anchor; see
     [Security model](#security-model).
-15. Pushes are limited to `refs/heads/*` for now. Tag pushes and branch
+17. Pushes are limited to `refs/heads/*` for now. Tag pushes and branch
     deletion fail without publishing anything.
-16. Uploads are incremental on every backend. With a Git host as storage, the
-    current implementation clones the whole carrier repository for each
-    operation, so every fetch and push also downloads the full encrypted
-    history until a persistent cache lands.
-
-### Other approaches
-
-- **Keybase encrypted Git** is end-to-end encrypted, but it only works with
-  Keybase's own service.
-- **An encrypted filesystem under a bare repository** (rclone crypt,
-  Cryptomator, gocryptfs) hides contents, but not the repository's file
-  structure, sizes, or update pattern. Two machines pushing at once through a
-  sync service can also corrupt the repository.
-- **git-annex encrypted special remotes** protect large annexed files, not the
-  Git history itself.
 
 ### When another tool is a better fit
 
-- **git-crypt**: only a few files are secret, and you want GitHub or GitLab to
-  keep working normally for the rest.
-- **transcrypt**: the same, and a shared password with a simple shell setup is
-  acceptable.
-- **git-remote-gcrypt**: you want an established whole-repository tool, already
-  use GPG, and can use its local or rsync backend.
+- **git-remote-gcrypt**: you want an established tool with a stable format,
+  already use GPG, and work alone or can coordinate pushes.
+- **A file-level tool such as git-crypt**: only a few files are secret, and you
+  want GitHub or GitLab to keep working normally for the rest.
 - **An ordinary private repository**: you trust the host and want pull
   requests, search, previews, and CI.
-- **Anything mature**: you need a stable format, recovery tooling, tags, or
-  shallow clones today.
-
-Choose `git-remote-e2ee` when the whole repository and its history must be
-opaque to storage, each collaborator should hold their own key, and you want
-Git's normal conflict behavior on storage you do not trust.
 
 ## Security model
 
