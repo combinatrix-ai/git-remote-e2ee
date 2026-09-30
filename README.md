@@ -76,11 +76,13 @@ an encrypted remote painful to live with:
   once, one wins and the other gets an ordinary rejection. With gcrypt every
   push is effectively a force push, so a push made without pulling first can
   erase someone else's work.
-- **Managed membership: one key per device, no GPG.** Like gcrypt, there is no
-  shared passphrase: every device has its own key. Unlike gcrypt, only
-  administrators can change who has access, revoking a device is a built-in
-  operation that publishes a fresh key without rewriting history, and a clone
-  that has synced before rejects a rolled-back or forked remote.
+- **No master key: every device has its own key.** gcrypt encrypts to GPG keys,
+  by default to your own, so using it from several machines usually means
+  copying one GPG private key to all of them. That one key opens the whole
+  history and every future push, and a lost laptop cannot be cut off on its
+  own. `git-remote-e2ee` gives each device its own key and needs no GPG. Only
+  administrators can change who has access, and revoking a device publishes a
+  fresh key without rewriting history.
 
 Under the hood, Git runs on your machine as usual. The helper encrypts the
 packs and refs Git hands it, uploads them as opaque immutable objects, and then
@@ -152,7 +154,7 @@ of selected files inside an otherwise normal repository. **Encrypted remotes**,
 | Push uploads only new data | △⁷ | △⁵ | ○ |
 | Concurrent pushes can't silently overwrite each other | ○ | ×⁸ | ○ |
 | Tampering detected | △⁹ | ○ | ○ |
-| One key per person or device, no shared passphrase | △¹⁰ | ○ | ○ |
+| A separate key for every device | △¹⁰ | △¹⁸ | ○ |
 | Only administrators can change membership | × | ×¹¹ | ○ |
 | Revoke one collaborator | ×¹² | ×¹³ | ○¹⁴ |
 | Separate reader and writer roles | × | × | △¹⁵ |
@@ -205,6 +207,11 @@ of selected files inside an otherwise normal repository. **Encrypted remotes**,
     [Security model](#security-model).
 17. Pushes are limited to `refs/heads/*` for now. Tag pushes and branch
     deletion fail without publishing anything.
+18. gcrypt encrypts each push with a fresh pack key and lists all pack keys in
+    a manifest encrypted to every GPG key in `gcrypt.participants`. Without
+    that setting it encrypts to your default GPG key, so several machines
+    normally share one private key. Listing a separate GPG key per machine is
+    possible, but gcrypt provides no workflow for managing or revoking them.
 
 ### When another tool is a better fit
 
