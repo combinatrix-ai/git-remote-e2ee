@@ -60,10 +60,11 @@ if every authorized key is lost, the data cannot be recovered by anyone.
 
 ## Why git-remote-e2ee
 
-Encrypting a whole Git repository is not new:
-[`git-remote-gcrypt`](https://github.com/spwhitton/git-remote-gcrypt) has done
-it with GnuPG for years. `git-remote-e2ee` keeps that goal and fixes what makes
-an encrypted remote painful to live with:
+Encrypting Git is not new. File-level tools such as
+[`git-crypt`](https://github.com/AGWA/git-crypt) encrypt selected files, and
+[`git-remote-gcrypt`](https://github.com/spwhitton/git-remote-gcrypt) has
+encrypted whole repositories with GnuPG for years. `git-remote-e2ee` hides the
+whole repository like gcrypt, and fixes what makes that painful to live with:
 
 - **Fast: pushes upload only what changed.** A push uploads the new Git pack
   plus a little metadata (3–4 KiB in total for a tiny commit with one device),
@@ -76,13 +77,12 @@ an encrypted remote painful to live with:
   once, one wins and the other gets an ordinary rejection. With gcrypt every
   push is effectively a force push, so a push made without pulling first can
   erase someone else's work.
-- **No master key: every device has its own key.** gcrypt encrypts to GPG keys,
-  by default to your own, so using it from several machines usually means
-  copying one GPG private key to all of them. That one key opens the whole
-  history and every future push, and a lost laptop cannot be cut off on its
-  own. `git-remote-e2ee` gives each device its own key and needs no GPG. Only
-  administrators can change who has access, and revoking a device publishes a
-  fresh key without rewriting history.
+- **No master key: nothing long-lived is shared.** git-crypt protects a
+  repository with one symmetric key that every collaborator ends up holding,
+  and it cannot revoke anyone. `git-remote-e2ee` creates a fresh random key for
+  every push and wraps it separately for each authorized device's own key. An
+  administrator can revoke one device without rewriting history, and it
+  receives nothing published afterwards.
 
 Under the hood, Git runs on your machine as usual. The helper encrypts the
 packs and refs Git hands it, uploads them as opaque immutable objects, and then
@@ -154,7 +154,7 @@ of selected files inside an otherwise normal repository. **Encrypted remotes**,
 | Push uploads only new data | △⁷ | △⁵ | ○ |
 | Concurrent pushes can't silently overwrite each other | ○ | ×⁸ | ○ |
 | Tampering detected | △⁹ | ○ | ○ |
-| A separate key for every device | △¹⁰ | △¹⁸ | ○ |
+| No long-lived key shared by every collaborator | ×¹⁰ | ○ | ○ |
 | Only administrators can change membership | × | ×¹¹ | ○ |
 | Revoke one collaborator | ×¹² | ×¹³ | ○¹⁴ |
 | Separate reader and writer roles | × | × | △¹⁵ |
@@ -190,8 +190,9 @@ of selected files inside an otherwise normal repository. **Encrypted remotes**,
    prevents accidents but does not coordinate concurrent writers.
 9. git-crypt authenticates encrypted file contents; file names, history, and
    which files are encrypted are ordinary Git data.
-10. git-crypt's GPG mode wraps one symmetric repository key to each user's GPG
-    key. Without GPG, everyone shares the same exported key file.
+10. git-crypt uses one symmetric repository key for the life of the
+    repository. GPG mode wraps that same key to each user's GPG key; without
+    GPG, everyone shares the same exported key file.
 11. gcrypt's recipient list is the local `gcrypt.participants` setting of
     whoever pushes, so any participant who can push decides who can read the
     next state.
@@ -207,11 +208,6 @@ of selected files inside an otherwise normal repository. **Encrypted remotes**,
     [Security model](#security-model).
 17. Pushes are limited to `refs/heads/*` for now. Tag pushes and branch
     deletion fail without publishing anything.
-18. gcrypt encrypts each push with a fresh pack key and lists all pack keys in
-    a manifest encrypted to every GPG key in `gcrypt.participants`. Without
-    that setting it encrypts to your default GPG key, so several machines
-    normally share one private key. Listing a separate GPG key per machine is
-    possible, but gcrypt provides no workflow for managing or revoking them.
 
 ### When another tool is a better fit
 
