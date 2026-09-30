@@ -1,482 +1,322 @@
-# git-remote-e2ee
+<h1 align="center">git-remote-e2ee</h1>
 
-[![CI](https://github.com/combinatrix-ai/git-remote-e2ee/actions/workflows/ci.yml/badge.svg)](https://github.com/combinatrix-ai/git-remote-e2ee/actions/workflows/ci.yml)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+<p align="center">
+  <strong>Git your host can't read.</strong><br />
+  End-to-end encrypted Git remotes. Keep using <code>clone</code>, <code>pull</code>, and <code>push</code>;
+  GitHub, a NAS, or any other storage only ever holds ciphertext.
+</p>
 
-End-to-end encrypted Git remotes on storage you do not have to trust with your
-repository contents or Git metadata.
+<p align="center">
+  <a href="https://github.com/combinatrix-ai/git-remote-e2ee/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/combinatrix-ai/git-remote-e2ee/actions/workflows/ci.yml/badge.svg" /></a>
+  <a href="#license"><img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" /></a>
+  <img alt="Status: prototype" src="https://img.shields.io/badge/status-prototype-orange.svg" />
+</p>
 
-`git-remote-e2ee` is a Git remote helper. You keep using ordinary `git clone`,
-`git fetch`, `git pull`, and `git push`; the helper turns Git packs and refs into
-authenticated ciphertext before they leave the client. The storage provider
-sees opaque objects and an opaque latest-manifest pointer, not the inner branch
-names, commit IDs, paths, authors, or messages.
+<p align="center">
+  <a href="#quick-start">Quick start</a>
+  · <a href="#how-it-compares">How it compares</a>
+  · <a href="DESIGN.md">Design</a>
+  · <a href="SPEC.md">Specification</a>
+  · <a href="README.ja.md">日本語</a>
+</p>
+
+<p align="center">
+  <img src="docs/art/overview.svg" alt="On your devices the repository is ordinary Git; the storage host only holds opaque encrypted objects" width="720" />
+</p>
 
 > [!WARNING]
-> This is an early prototype, not yet a safe backup system. The repository
-> format is unstable and there are no compatibility guarantees between
-> versions. Keep an independent copy of every repository and key.
+> This is an early prototype. The repository format is unstable and may change
+> without a migration path. Do not use it as your only copy of anything: keep an
+> independent copy of every repository and every key.
 
-The implemented v4 protocol gives every published generation a fresh random
-root key. Each active reader receives one small public-key envelope for that
-generation; pack ciphertext is stored only once, independent of reader count,
-and is authenticated in bounded-memory 1 MiB segments.
-See the [design overview](DESIGN.md) and [normative specification](SPEC.md).
+## Why end-to-end encryption?
 
-## The problem this project solves
+**"Private" on a Git host means private from other people, not from the host.**
+A private GitHub or GitLab repository is stored in a form the provider can read:
+every file, every commit message, every branch name, and who wrote what. That is
+what lets the host show you diffs and run CI, but it also means your code and
+notes are readable by anyone who gets access to the host's side: a breach, a
+leaked access token or third-party app, an insider, a legal demand, or a policy
+change you did not choose.
 
-Ordinary Git hosting must understand a repository to provide web diffs, pull
-request review, search, and hosted CI. Even a private repository therefore
-reveals its files, paths, branches, commit graph, authors, and messages to the
-host.
+**End-to-end encryption (E2EE) moves the keys to your devices.** Your repository
+is encrypted on your computer before it is uploaded, and only devices you have
+authorized can decrypt it. The host stores data it cannot read. If the host is
+breached or compelled to hand over your repository, there is nothing readable
+to hand over. If someone tampers with the stored data, your clients notice and
+refuse it.
 
-`git-remote-e2ee` is for the different case where the storage provider should
-learn none of that, while trusted clients still need ordinary Git semantics. It
-keeps encryption, history validation, fast-forward checks, and conflict
-handling on clients. The server is reduced to two jobs:
+With `git-remote-e2ee` this happens underneath Git. You add a remote with an
+`e2ee::` URL and keep working exactly as before.
 
-1. store immutable ciphertext objects;
-2. atomically replace one opaque head value if it has not changed.
+**Good fits:** personal notes and journals, research before publication, client
+or NDA work that must live on third-party storage, private configuration, and
+backups on storage you do not control.
 
-The project also addresses collaboration without a repository-wide private key
-or passphrase. Every device has its own key, administrators can add or revoke a
-device without rewriting historical packs, readers and writers can have
-different permissions, and concurrent writers cannot silently overwrite each
-other.
+**What you give up:** because the host cannot read the repository, it cannot
+show it to you either. There are no web diffs, pull-request reviews, code
+search, or hosted CI on the plaintext. You are also responsible for your keys:
+if every authorized key is lost, the data cannot be recovered by anyone.
 
-This tradeoff is intentional: a host that cannot read the repository also
-cannot provide meaningful plaintext diffs, search, or review by itself.
+## How it works
 
-## Comparison with existing tools
+1. **Every device has its own key.** There is no shared passphrase. An
+   administrator authorizes a device using only its public key and can revoke it
+   later.
+2. **Git runs on your machine; the helper encrypts what leaves it.** Git hands
+   the helper ordinary packs and refs. The helper encrypts them and uploads
+   opaque objects, then atomically moves one opaque `HEAD` pointer.
+3. **The storage only stores.** It keeps immutable ciphertext and performs one
+   compare-and-swap on `HEAD`. Fast-forward checks, conflict handling, and
+   history verification all happen on clients, so a concurrent push can never
+   silently overwrite someone else's work.
 
-File-filter tools and encrypted remote helpers solve different problems.
-[`git-crypt`](https://github.com/AGWA/git-crypt) and
-[`transcrypt`](https://github.com/elasticdog/transcrypt) hide selected files in
-an otherwise normal repository. [`git-remote-gcrypt`](https://github.com/spwhitton/git-remote-gcrypt)
-and `git-remote-e2ee` hide the complete inner repository.
+Storage backends today: a **local or mounted directory**, and **any ordinary
+Git remote** (GitHub, GitLab, a bare repository) used as a ciphertext carrier.
 
-Legend: **○** supported, **△** supported with caveats or extra setup, **×** not
-supported.
+## Quick start
 
-| What you can do | `git-crypt` | `transcrypt` | `git-remote-gcrypt` | `git-remote-e2ee` |
+Install from source (a Rust toolchain is required). This installs both
+`git-e2ee`, the setup CLI, and `git-remote-e2ee`, the helper Git calls for
+`e2ee::` URLs. Both must be on `PATH`.
+
+```console
+cargo install --git https://github.com/combinatrix-ai/git-remote-e2ee
+```
+
+Use an empty GitHub repository as encrypted storage and push an existing
+project to it:
+
+```console
+git-e2ee keygen --output ~/.config/git-e2ee/notes.key.json
+git-e2ee carrier-init \
+  --remote https://github.com/you/notes-encrypted.git \
+  --key ~/.config/git-e2ee/notes.key.json
+
+cd my-notes
+git remote add private 'e2ee::git+https://github.com/you/notes-encrypted.git'
+git config remote.private.e2ee-key ~/.config/git-e2ee/notes.key.json
+git push -u private main
+```
+
+From then on, `git pull` and `git push` work as usual. The key file stays on
+your machine; never commit it, and keep a backup somewhere safe.
+
+To use a second machine, give it its own key and authorize its public half.
+The [user guide](docs/guide.md#add-a-second-device) walks through it, as well as
+the directory backend, cloning, and revoking devices.
+
+## How it compares
+
+There are two families of encrypted-Git tools, and they answer different
+questions:
+
+- **File filters** ([`git-crypt`](https://github.com/AGWA/git-crypt),
+  [`transcrypt`](https://github.com/elasticdog/transcrypt)) encrypt the contents
+  of selected files inside an otherwise normal repository. The host still sees
+  the repository's structure and history, and keeps working normally for
+  everything left unencrypted.
+- **Encrypted remotes**
+  ([`git-remote-gcrypt`](https://github.com/spwhitton/git-remote-gcrypt),
+  `git-remote-e2ee`) encrypt the whole repository, history included. The host
+  sees opaque blobs and nothing else of the inner repository.
+
+### What the storage host can learn
+
+| | Private repo | `git-crypt` | `transcrypt` | `git-remote-gcrypt` | `git-remote-e2ee` |
+|---|:---:|:---:|:---:|:---:|:---:|
+| Contents of files you chose to protect | visible | hidden | hidden | hidden | hidden |
+| Contents of all other files | visible | visible | visible | hidden | hidden |
+| File names and directory layout | visible | visible | visible | hidden | hidden |
+| Commit messages, authors, and dates | visible | visible | visible | hidden | hidden |
+| Branch names and the commit graph | visible | visible | visible | hidden | hidden |
+| Which files changed, their sizes, identical files | visible | visible¹ | visible | hidden | hidden |
+| When you push, and roughly how much | visible | visible | visible | visible | visible |
+| Collaborator keys | account list | key fingerprints² | — (shared password) | count only³ | count, public keys, roles⁴ |
+
+### What each tool can do
+
+| | `git-crypt` | `transcrypt` | `git-remote-gcrypt` | `git-remote-e2ee` |
 |---|:---:|:---:|:---:|:---:|
-| Hide the complete repository from the host | × | × | ○ | ○ |
+| Normal `clone`, `pull`, and `push` | ○ | ○ | ○ | ○ |
+| GitHub or GitLab as storage | ○ | ○ | △⁵ | ○ |
+| Hosted diffs, review, and search for unencrypted parts | ○ | ○ | × | × |
 | Encrypt only selected files | ○ | ○ | × | × |
-| Use GitHub or GitLab as storage | ○ | ○ | △¹ | ○ |
-| Keep using normal `clone`, `pull`, and `push` | ○ | ○ | ○ | ○ |
-| Keep a hosted pull-request workflow | ○² | ○² | △² | △² |
-| See encrypted-content diffs on the host | × | × | × | × |
-| Run CI after explicitly providing a key | △ | △ | △ | △ |
-| Avoid distributing one shared passphrase or private key | ○³ | × | ○ | ○ |
-| Add a collaborator using only their public key | ○³ | × | ○ | ○ |
-| Revoke one collaborator independently | △⁴ | × | ○ | ○ |
-| Add a collaborator without rewriting bulk history | ○ | ○ | ○ | ○ |
-| Separate reader, writer, and administrator roles | × | × | × | ○ |
-| Reject concurrent-writer races without silent overwrite | ○ | ○ | ×⁵ | ○ |
-| Transfer only incremental data for small updates | △⁶ | △⁶ | △¹ | ○ |
-| Detect a storage rollback or fork after a prior sync | × | × | × | ○⁷ |
-| Branches | ○ | ○ | ○ | ○ |
-| Tags and remote branch deletion | ○ | ○ | ○ | ×⁸ |
-| Established, production-mature project | ○ | ○ | ○ | △ |
+| Tampering detected | △⁶ | ×⁷ | ○ | ○ |
+| No shared secret; add people by public key | ○² | × | ○ | ○ |
+| Revoke one collaborator | ×⁸ | × | △⁹ | ○¹⁰ |
+| Separate reader, writer, and administrator roles | × | × | × | △¹¹ |
+| Concurrent pushes can't silently overwrite each other | ○ | ○ | ×¹² | ○ |
+| Small updates upload small amounts of data | △¹³ | △¹³ | △⁵ | ○ |
+| Detects a rolled-back or forked remote | × | × | × | △¹⁴ |
+| Tags and remote branch deletion | ○ | ○ | ○ | ×¹⁵ |
+| Mature, stable format | ○ | ○ | ○ | × |
+| Cryptography | AES-256-CTR, HMAC-SHA1 SIV | AES-256-CBC via OpenSSL | OpenPGP (GnuPG) | XChaCha20-Poly1305, HPKE (X25519), Ed25519 |
 
-1. gcrypt is incremental with its local and rsync backends. Its
-   [performance documentation](https://manpages.debian.org/trixie/git-remote-gcrypt/git-remote-gcrypt.1.en.html#PERFORMANCE)
-   warns that arbitrary Git and SFTP backends may upload the complete history
-   on every push.
-2. File-filter repositories retain normal hosted review for visible data, but
-   the host cannot show plaintext diffs for encrypted files. A whole-remote
-   workflow needs an authorized client or CI job to decrypt and produce an
-   inner diff; the carrier repository's own diff is not meaningful.
-3. This refers to git-crypt's GPG-user mode. It still uses an internal
-   repository key, encrypted separately to each GPG recipient.
-4. Revoking a git-crypt user requires rotating the repository key and
-   re-encrypting the protected files.
-5. gcrypt has a longstanding behavior where pushes are effectively force
-   pushes; its explicit-force option prevents accidental use but does not add
-   compare-and-swap writer coordination.
-6. A changed encrypted file becomes a new complete ciphertext blob, so Git
-   cannot efficiently delta-compress it against the previous plaintext.
-7. A returning E2EE client pins observed history and rejects rollback or a
-   different successor chain. A fresh client still needs an authenticated
-   invitation checkpoint or an external anchor.
-8. The current E2EE implementation accepts destinations under
-   `refs/heads/*`; tag pushes and branch deletion fail without publication.
+○ supported · △ with caveats · × not supported
 
-### Performance: practical full sync, incremental updates
+1. git-crypt's README states that it does not hide when a file changes, its
+   length, or whether two files are identical.
+2. In git-crypt's GPG mode, the repository key is encrypted to each user and
+   committed under `.git-crypt/`, named by key fingerprint.
+3. gcrypt hides recipient key IDs by default (`gpg -R`); the number of
+   encrypted-key packets is still observable.
+4. Each device must find its own envelope before it can decrypt anything, so
+   the policy is plaintext-structured: the host sees the number of devices,
+   their per-repository public keys, their roles, and policy changes. Do not
+   reuse device keys between repositories.
+5. gcrypt is incremental with its local and rsync backends, but its
+   [documentation](https://manpages.debian.org/trixie/git-remote-gcrypt/git-remote-gcrypt.1.en.html)
+   says a Git or SFTP backend uploads the entire history on every push, and it
+   may repack the remote without warning.
+6. git-crypt authenticates encrypted file contents; file names, history, and
+   which files are encrypted are ordinary Git data.
+7. transcrypt uses unauthenticated CBC; its README lists ciphertext
+   malleability as a known limitation.
+8. git-crypt's README states that it does not support revoking access.
+   Rotating the key means re-encrypting the protected files by hand.
+9. Participants can be removed from `gcrypt.participants`, but gcrypt does not
+   document a revocation workflow.
+10. Revocation publishes a fresh key without rewriting history. Like every tool
+    here, it cannot take back data the device already had.
+11. The protocol separates the three roles, but the CLI currently grants either
+    read and write, or read, write, and administration.
+12. Every gcrypt push is effectively a force push. Its explicit-force option
+    prevents accidents but does not coordinate concurrent writers.
+13. A changed encrypted file becomes a new, unrelated ciphertext blob, so Git
+    cannot delta-compress it against the previous version.
+14. A clone that has synced before rejects rollback or a diverging history. A
+    brand-new clone cannot tell without an external anchor; see
+    [Security model](#security-model).
+15. Pushes are limited to `refs/heads/*` for now. Tag pushes and branch
+    deletion fail without publishing anything.
 
-The local benchmark supports three practical conclusions:
+### Other approaches
 
-- Full encryption and reconstruction are in the same performance class as
-  plain Git and git-remote-gcrypt for a large repository.
-- Incremental E2EE push and fetch are comparable to plain Git and were faster
-  than git-remote-gcrypt in every measured incremental case.
-- Incremental backend payload and storage grow with the new Git pack plus small
-  protocol metadata, not with the complete repository history.
+- **Keybase encrypted Git** is end-to-end encrypted, but it only works with
+  Keybase's own service.
+- **An encrypted filesystem under a bare repository** (rclone crypt,
+  Cryptomator, gocryptfs) hides contents, but not the repository's file
+  structure, sizes, or update pattern. Two machines pushing at once through a
+  sync service can also corrupt the repository.
+- **git-annex encrypted special remotes** protect large annexed files, not the
+  Git history itself.
 
-The tools were measured once against the same 867 MiB reachable Godot history
-using local-filesystem backends:
+### When another tool is a better fit
 
-| Operation | Plain Git† | `git-remote-gcrypt` | `git-remote-e2ee` |
+- **git-crypt**: only a few files are secret, and you want GitHub or GitLab to
+  keep working normally for the rest.
+- **transcrypt**: the same, and a shared password with a simple shell setup is
+  acceptable.
+- **git-remote-gcrypt**: you want an established whole-repository tool, already
+  use GPG, and can use its local or rsync backend.
+- **An ordinary private repository**: you trust the host and want pull
+  requests, search, previews, and CI.
+- **Anything mature**: you need a stable format, recovery tooling, tags, or
+  shallow clones today.
+
+Choose `git-remote-e2ee` when the whole repository and its history must be
+opaque to storage, each collaborator should hold their own key, and you want
+Git's normal conflict behavior on storage you do not trust.
+
+## Security model
+
+The storage provider is treated as malicious. `git-remote-e2ee` aims to
+guarantee:
+
+- confidentiality of inner contents and Git metadata: files, paths, refs,
+  object IDs, authors, and messages;
+- authenticity and integrity of every fetched state;
+- continuity for a clone that has synced before, so rollback and forks are
+  rejected;
+- that revoked devices get no keys for anything published after revocation.
+
+It does **not** prevent:
+
+- the host deleting data or refusing service;
+- a brand-new clone being shown an old or forked history, or different clients
+  being shown different histories (that needs an external anchor, which is on
+  the roadmap);
+- an authorized writer making destructive changes;
+- a revoked device reading what it could read before revocation;
+- traffic analysis: update times, object sizes, and total growth are visible;
+- future quantum attacks: key exchange uses X25519.
+
+Keys work as a backward chain. The current key can decrypt all earlier
+history, which lets a new device read the whole repository, but an old key
+cannot decrypt anything newer. This is key regression, not forward secrecy for
+history already published. See [DESIGN.md](DESIGN.md) and [SPEC.md](SPEC.md)
+for the full threat model, and [SECURITY.md](SECURITY.md) to report an issue.
+
+## Performance
+
+Full transfers take about as long as plain Git, and small updates stay fast.
+On a local-filesystem backend with the 867 MiB Godot history, measured in a
+single run:
+
+| Operation | Plain Git | `git-remote-gcrypt` | `git-remote-e2ee` |
 |---|---:|---:|---:|
 | Initial push | 30.51 s | 12.26 s | 13.78 s |
 | Fresh fetch | 30.26 s | 30.78 s | 31.75 s |
 | Tiny push | 0.17 s | 0.54 s | 0.08 s |
-| Add incompressible 10 MiB | 0.60 s | 0.66 s | 0.40 s |
-| Add 1,000 small files | 0.56 s | 0.69 s | 0.34 s |
 | Fetch tiny update | 0.12 s | 0.50 s | 0.09 s |
-| Fetch 10 MiB update | 0.58 s | 0.64 s | 0.23 s |
-| Fetch 1,000-file update | 0.08 s | 0.47 s | 0.10 s |
 
-† Plain Git and an opaque encrypted remote do different backend work. Plain
-Git indexes a server-side object database and may construct a new transfer pack
-during fetch. E2EE and gcrypt store encrypted pack files and replay them
-directly. That is efficient on dumb storage, but the host cannot provide
-plaintext diffs, search, shallow or partial-clone negotiation, or other
-server-side Git features.
-
-The corresponding remote growth was incremental:
-
-| Update | Plain Git | `git-remote-gcrypt` | `git-remote-e2ee` |
-|---|---:|---:|---:|
-| Tiny commit | 1.5 KiB | 1.7 KiB | 3.5 KiB |
-| Add incompressible 10 MiB | 10.0 MiB | 10.0 MiB | 10.0 MiB |
-| Add 1,000 small files | 110.2 KiB | 67.2 KiB | 79.6 KiB |
-| Existing 877 MiB encrypted history rewritten | — | 0 bytes (this run) | 0 bytes |
-
-Adding a second E2EE reader wrote 3,379 bytes of policy and envelope metadata
-and rewrote zero existing pack bytes. With 100 active readers, content-pack
-storage and client repository size remained unchanged; only small per-reader
-metadata and public-key wrapping work grew.
-
-These are exploratory single runs, not stable release claims or
-network-hosting benchmarks. The gcrypt result uses its efficient local backend
-and did not cross its periodic repack threshold; its arbitrary Git transport
-has a different performance profile. A fresh clone necessarily transfers and
-checks the complete history.
-
-See [BENCHMARKS.md](BENCHMARKS.md#comparison-with-the-tools-in-the-feature-table)
-for method, memory, disk growth, tool revisions, and limitations.
-
-## When another tool is a better fit
-
-- Use **git-crypt** when only a few files are secret and retaining normal
-  GitHub or GitLab diffs, reviews, search, and integrations for the rest of the
-  repository matters more than hiding the repository as a whole.
-- Use **transcrypt** when selected-file encryption with a shared passphrase is
-  acceptable and its simple shell-based setup is preferable.
-- Use **git-remote-gcrypt** when you need an established whole-remote tool,
-  already use GPG, and can use its efficient local or rsync backend while
-  accepting its force-push and periodic-repack behavior.
-- Use an ordinary **private Git repository** when you trust the host with the
-  plaintext and need first-class hosted pull requests, code search, previews,
-  or CI without managing decryption keys.
-- Do **not** use git-remote-e2ee as the only backup yet. Choose a mature tool if
-  you require stable repository formats, recovery tooling, tags, branch
-  deletion, shallow clones, or a production support commitment today.
-
-Choose `git-remote-e2ee` when the complete repository and its metadata must be
-opaque to storage, collaborators should use independent device keys, membership
-changes must not rewrite bulk history, and incremental synchronization plus
-client-side rollback and writer-race protection are worth giving up server-side
-plaintext features.
-
-## Current features
-
-- Normal Git remote-helper workflow for clone, fetch, pull, and push
-- Per-device HPKE (X25519/HKDF-SHA-256/ChaCha20-Poly1305) generation-key envelopes
-- A fresh random generation root for every successful HEAD publication
-- Domain-separated HKDF subkeys and XChaCha20-Poly1305 payload encryption
-- Streaming authenticated pack encryption and decryption with bounded Rust-side
-  memory rather than whole-pack buffers
-- Incremental Git connectivity verification from a locally pinned, previously
-  verified ref frontier
-- Ed25519-signed, append-only policy and manifest chains
-- 1-of-N recipient access: each authorized device unlocks with only its own key
-- Separate reader, writer, and administrator authorization
-- Atomic device addition and revocation without rewriting historical packs
-- An authenticated backward key chain: the current key unlocks earlier
-  generations, while an earlier key cannot unlock later generations
-- Delta manifests and incremental Git packs rather than full repository snapshots
-- Client-side fast-forward enforcement and explicit force push
-- Atomic stale-writer rejection through compare-and-swap
-- Per-client rollback and manifest-fork detection after first observation
-- Complete signed history, ciphertext, and reconstructed Git object-graph
-  verification before refs or continuity pins move
-- Filesystem storage backend
-- Carrier-Git backend for GitHub, GitLab, a bare repository, or another ordinary
-  Git remote
-
-Push destinations are currently limited to branches under `refs/heads/*`. Tags
-and branch deletion are rejected without publishing a new manifest.
-
-## Install
-
-The project currently builds two binaries:
-
-- `git-e2ee`: repository initialization, key generation, and diagnostic CLI
-- `git-remote-e2ee`: helper invoked automatically by Git for `e2ee::` URLs
-
-```console
-cargo install --path .
-git-e2ee --help
-```
-
-Both binaries must be on `PATH` for native Git integration.
-
-## Quick start: filesystem backend
-
-Create a repository key and encrypted storage directory:
-
-```console
-git-e2ee keygen --output /safe/place/repository.key.json
-git-e2ee init \
-  --storage /srv/encrypted/example \
-  --key /safe/place/repository.key.json
-```
-
-Add it to an existing local Git repository:
-
-```console
-git remote add private 'e2ee::/srv/encrypted/example'
-git config remote.private.e2ee-key /safe/place/repository.key.json
-git push -u private main
-git fetch private
-```
-
-The key path is local Git configuration. The key file is never written to the
-encrypted remote and must never be committed.
-
-## Add and revoke devices
-
-Each device has a different private key. Only the small public device file is
-given to an administrator. If machine A created the repository, set up machine
-B like this (substitute the repository root printed by A's `keygen`):
-
-```console
-# Machine B
-git-e2ee keygen \
-  --repository-root <repository-root> \
-  --output /safe/place/machine-b.key.json
-git-e2ee device-export \
-  --key /safe/place/machine-b.key.json \
-  --output machine-b.public.json
-
-# Machine A, after receiving only machine-b.public.json
-git-e2ee device-add \
-  --storage /srv/encrypted/example \
-  --key /safe/place/repository.key.json \
-  --device machine-b.public.json
-```
-
-The default added device can read and write but cannot change policy. Pass
-`--admin` to grant administration too. `git-e2ee device-list` prints opaque
-device IDs; revoke one with:
-
-```console
-git-e2ee device-revoke \
-  --storage /srv/encrypted/example \
-  --key /safe/place/repository.key.json \
-  --device-id <device-id>
-```
-
-For a carrier-Git backend, use `--remote <carrier-url>` instead of `--storage`
-with `device-add`, `device-list`, and `device-revoke`.
-
-Adding or revoking a device publishes a fresh generation key in one
-compare-and-swap operation. Its header contains one small envelope for each
-active reader, while all historical manifests and packs stay unchanged. A newly
-added reader can use the current key's authenticated backward links to decrypt
-the complete history. A revoked reader retains the snapshot it could already
-decrypt but receives no key for the new generation or later ones.
-The CLI keeps an administrative continuity pin next to the administrator key as
-`<key-file>.admin-state.json`. Preserve that file together with the key.
-
-This is deliberately **not multisig**. The current implementation accepts one
-authorized administrator signature for a policy change. The wire format has an
-administrator threshold and signature array so a future version can add M-of-N,
-but this version fails closed on any threshold other than 1.
-
-## Carrier-Git backend
-
-An ordinary Git repository can act as the ciphertext carrier. It may be empty
-or contain unrelated branches; `git-remote-e2ee` uses its own
-`git-remote-e2ee` branch.
-
-```console
-git-e2ee keygen --output /safe/place/carrier.key.json
-git-e2ee carrier-init \
-  --remote https://git.example/user/encrypted-carrier.git \
-  --key /safe/place/carrier.key.json
-
-git remote add private \
-  'e2ee::git+https://git.example/user/encrypted-carrier.git'
-git config remote.private.e2ee-key /safe/place/carrier.key.json
-git push -u private main
-```
-
-Clone by supplying the key path once:
-
-```console
-git -c e2ee.key=/safe/place/carrier.key.json clone \
-  'e2ee::git+https://git.example/user/encrypted-carrier.git'
-```
-
-The helper persists the path as local `remote.origin.e2ee-key` configuration in
-the new clone. Later `git fetch`, `git pull`, and `git push` need no wrapper.
-
-The carrier stores only the outer structure below:
-
-```text
-refs/heads/git-remote-e2ee
-└── e2ee/
-    ├── HEAD
-    ├── objects/aa/<opaque-id>/00000000
-    ├── manifests/bb/<opaque-id>/00000000
-    └── policies/cc/<opaque-id>/00000000
-```
-
-Ciphertext is divided into 32 MiB chunks so it can be carried as ordinary Git
-blobs. The host can still observe outer commit times, chunk counts and sizes,
-update frequency, and total growth.
-
-## Security model
-
-The storage provider is treated as malicious for confidentiality and integrity.
-Authenticated encryption, ciphertext-addressed objects, signatures, and the
-manifest hash chain detect modification. A returning client pins the newest
-manifest it has observed and rejects a lower generation or a history that no
-longer descends from that pin.
-
-The current security claim is:
-
-- confidentiality of inner repository contents and Git metadata;
-- authenticity and integrity of fetched repository state;
-- continuity from the state previously observed by the same local clone.
-- future-generation exclusion after an atomic device revocation.
-
-It does **not** independently prevent:
-
-- rollback presented to a fresh client;
-- equivocation between clients shown different valid histories;
-- freezing a client at its last valid state;
-- deletion or denial of service by storage;
-- destructive changes made by an authorized writer;
-- disclosure of data a revoked device could access before its revocation;
-- disclosure of the complete historical snapshot at or before any leaked
-  generation key;
-- a revoked writer and colluding storage presenting a pre-revocation fork to a
-  fresh or stale client;
-- policy rollback, freezing, or equivocation presented to a fresh client.
-
-Global rollback and equivocation resistance require gossip or an external
-transparency anchor. A returning clone pins both manifest and policy generation.
-The administrative CLI also pins its last published state and does not
-automatically retry a lost CAS race; inspect the winner and rerun the operation.
-
-Generation headers and policy objects must remain plaintext-structured so a
-device can find its envelope without already knowing the generation key.
-Consequently the storage host can see device count, per-repository public keys,
-roles, policy changes, and generation numbers. Device keys should never be
-reused between repositories. Inner refs, object IDs, paths, authors, messages,
-generation keys, derived subkeys, and contents remain encrypted.
-
-A generation key is intentionally a transferable snapshot capability: leaking
-`K_t` exposes generations `0..=t` through the backward links. It does not expose
-generation `t+1` or later. Continued future disclosure therefore requires a
-reader's private device key, repeated release of each later generation key or
-plaintext, or continued access to an authorized device. This is key regression,
-not forward secrecy for already published history.
-
-If two authorized writers race, each may locally create a valid generation key
-and ciphertext, but compare-and-swap permits only one HEAD update. The loser
-must discard its unpublished generation and retry from the winning HEAD. Anyone
-who received the loser's key can decrypt that losing unpublished snapshot; CAS
-prevents it from becoming repository history but cannot retract already shared
-plaintext or keys.
-
-## Storage protocol
-
-The backend-neutral interface has four logical operations. Immutable object
-writes are staged so the final ciphertext ID can be learned while streaming:
-
-```text
-begin_object(kind) -> writable stage; stage.finish(id)
-open_object(kind, id) -> reader
-read_head()
-compare_and_swap_head(expected, next)
-```
-
-The filesystem backend implements head CAS with an advisory lock and atomic
-rename. Stages are created inside the backend's own filesystem or checkout, so
-publication does not depend on cross-filesystem rename. The carrier-Git backend
-implements head CAS as a normal fast-forward push to the outer branch. A future
-S3 backend can use multipart upload plus conditional writes, but each provider
-must be capability-tested; “S3 compatible” does not by itself promise correct
-compare-and-swap behavior.
-
-A killed filesystem writer can leave an unreachable file under `.staging/`.
-No published object or `HEAD` points to it, and stale `.stage-*` entries may be
-deleted when no writer is running. Automatic age-based cleanup belongs to
-future garbage collection.
-
-See [DESIGN.md](DESIGN.md) for the protocol and threat-model details.
-
-## Tests
-
-```console
-cargo test --all-targets
-cargo clippy --all-targets -- -D warnings
-cargo fmt --all -- --check
-```
-
-The test suite includes:
-
-- incremental push and reconstruction into a fresh repository;
-- native clone, fetch, pull, push, dry-run, refspec, and force-push behavior;
-- rollback, same-generation fork, and ciphertext-tampering rejection;
-- streaming-AEAD chunk boundaries, wrong keys/AAD, reordering, duplication,
-  truncation, trailing bytes, forged sizes, and legacy-format rejection;
-- independent device add/read/write, non-admin rejection, genesis-substitution
-  rejection, administrative rollback pinning, device revocation without pack
-  rewrites, and multi-generation offline catch-up;
-- malformed predecessor-link, generation-key commitment, recipient-set, and
-  signed-but-incomplete Git object-graph rejection;
-- two independent carrier writers racing real `git push` processes, with
-  exactly one winner;
-- plaintext-absence checks across carrier history;
-- applicable black-box scenarios independently reimplemented from Git
-  upstream's
-  [`t/t5801-remote-helpers.sh`](https://github.com/git/git/blob/master/t/t5801-remote-helpers.sh).
-
-A local bare Git repository is sufficient for deterministic carrier concurrency
-tests: local-path pushes still execute Git's real `receive-pack`, ref locking,
-and fast-forward checks. Hosted smoke tests remain useful for authentication,
-request limits, and provider-specific policy.
-
-## Roadmap
-
-- M-of-N administrative authorization (future format version; threshold 1 only today)
-- Recovery and device-key replacement workflows
-- Automatic stale-push fetch/retry workflow
-- Persistent partial-clone cache for large carrier repositories
-- S3 conditional-write backend and provider compatibility suite
-- Safe compaction and garbage collection
-- Signed checkpoint transitions for compaction without ambiguous key-chain semantics
-- Optional gossip or transparency-log anchoring
-- Shallow and partial clone support
-
-## Performance benchmarks
-
-An opt-in local harness measures initial encryption, fresh reconstruction,
-verification, and incremental updates without contacting the source
-repository's configured remote. See [BENCHMARKS.md](BENCHMARKS.md). Benchmark
-outputs, repository keys, and reconstructed data must not be committed.
+Plain Git is not directly comparable. A Git server indexes objects and builds
+packs per fetch, while encrypted remotes store and replay opaque packs. That is
+cheap on dumb storage, but it rules out server-side features such as partial
+clone. Each update stores only its new pack plus a few KiB of metadata. Adding a
+reader rewrote zero existing pack bytes. See [BENCHMARKS.md](BENCHMARKS.md) for
+the method, the remaining cases, and the limitations.
+
+## FAQ
+
+**What does the GitHub repository look like?**
+One branch, `git-remote-e2ee`, holding ciphertext under `e2ee/`. It can live
+next to unrelated branches. Do not edit it by hand.
+
+**What if I lose my key?**
+If no remaining device has access, the data is gone. There is no recovery
+service by design. Keep an offline backup of at least one administrator key and
+its `.admin-state.json` file.
+
+**Does revoking a device hide old history from it?**
+No. It keeps whatever it could already decrypt. It cannot read anything
+published after the revocation.
+
+**Can I review pull requests?**
+Not on the host. Review happens on a machine that has a key: fetch the branch
+and diff locally, or give a CI runner its own device key.
+
+**Can the host roll my repository back?**
+It can serve old data. A clone that has synced before detects this and refuses
+it. A fresh clone cannot tell yet.
+
+**Is this post-quantum?**
+No. An attacker who records ciphertext today and later breaks X25519 could read
+it.
+
+## Status and roadmap
+
+Working today: clone, fetch, pull, and push; the directory and carrier-Git
+backends; per-device keys; adding and revoking devices; incremental transfer;
+and rollback and race detection.
+
+Planned: M-of-N administrator approval, key recovery and replacement, automatic
+retry after losing a push race, an S3 conditional-write backend, garbage
+collection and compaction, tags and branch deletion, shallow and partial clone,
+and optional transparency-log anchoring.
+
+## Documentation
+
+- [User guide](docs/guide.md): backends, cloning, device management, and the
+  storage layout
+- [DESIGN.md](DESIGN.md): design overview and threat model
+- [SPEC.md](SPEC.md): normative protocol specification
+- [BENCHMARKS.md](BENCHMARKS.md): benchmark method and results
+- [CONTRIBUTING.md](CONTRIBUTING.md): building, testing, and what the test
+  suite covers
 
 ## License
 
-Licensed under either of
-
-- [Apache License, Version 2.0](LICENSE-APACHE), or
-- [MIT License](LICENSE-MIT)
-
-at your option.
+Licensed under either of the [Apache License, Version 2.0](LICENSE-APACHE) or
+the [MIT License](LICENSE-MIT), at your option.
