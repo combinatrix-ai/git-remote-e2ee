@@ -264,11 +264,14 @@ fn main() -> Result<()> {
 }
 
 fn role_name(roles: &DeviceRoles) -> &'static str {
-    match (roles.reader, roles.writer, roles.administrator) {
-        (true, false, false) => "read",
-        (true, true, false) => "write",
-        (true, true, true) => "admin",
-        _ => "invalid",
+    if roles.administrator {
+        "admin"
+    } else if roles.writer {
+        "write"
+    } else if roles.reader {
+        "read"
+    } else {
+        "none"
     }
 }
 
