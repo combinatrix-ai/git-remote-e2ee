@@ -210,7 +210,10 @@ The plaintext header contains only:
 
 The envelope list length MUST be a power of two from 4 through 4096. Publishers
 wrap `K_t` once for each active reader, add indistinguishable dummy entries
-(random 32-byte encapsulated key and random 48-byte ciphertext) until the list
+(each a genuine HPKE Base-mode seal of a fresh random 32-byte key, under a
+random AAD, to a freshly generated throwaway X25519 recipient; uniformly random
+bytes MUST NOT be used because a real encapsulated key is an X25519 public key
+with its top bit clear) until the list
 reaches the next power of two, with a minimum of four, then sort by raw
 encapsulated-key bytes. Encapsulated keys and ciphertexts MUST have their
 protocol-defined lengths. Duplicate or non-increasing encapsulated keys are
@@ -334,7 +337,7 @@ genesis policy, contains empty refs and no packs, and has no predecessor link.
    the new data.
 5. Encrypt the previous generation key under the predecessor-link subkey.
 6. HPKE-wrap `K_t` once to every active reader using a fresh audit seed, add
-   random dummy envelopes to the padded count, sort by encapsulated-key bytes,
+   dummy envelopes sealed to throwaway recipients up to the padded count, sort by encapsulated-key bytes,
    and put the corresponding audit entries in the sealed header.
 7. Upload the immutable pack and manifest.
 8. Compare-and-swap `HEAD` from the observed parent ID to the new manifest ID.

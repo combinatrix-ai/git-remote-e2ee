@@ -67,7 +67,8 @@ header content without the signature, and the encrypted body digest.
 
 Each envelope hides its recipient ID. Publishers pad the envelope list to the
 next power of two with a minimum of four, sort by encapsulated-key bytes, and
-use random dummies with the same lengths as real envelopes. A device trial
+make each dummy a genuine HPKE seal of a random key to a throwaway X25519
+recipient, so its encapsulated key is a real curve point. A device trial
 decrypts only the head list; predecessor links provide older keys. Every
 verifier uses each audited seed with `rand_chacha` 0.9.0 `ChaCha20Rng` to
 re-seal K_t and check byte equality, then requires exactly one real envelope
@@ -222,8 +223,10 @@ git-remote-gcrypt.
 1. **Anonymous, padded envelopes.** The plaintext header carries a list of
    HPKE envelopes with no recipient ID. The list is padded with dummy
    envelopes to the next power of two, with a minimum of four. A dummy is a
-   random 32-byte encapsulated key plus random bytes of real ciphertext length,
+   genuine HPKE seal of a random key to a throwaway X25519 recipient, so it is
    indistinguishable from a real envelope without the recipient private key.
+   Uniformly random bytes would not do: a real encapsulated key is an X25519
+   public key whose top bit is always clear.
    The list is sorted by encapsulated-key bytes, so position carries no
    identity across generations. The HPKE AAD still binds the repository root,
    format, generation, `C_t`, and the recipient's device ID. The recipient

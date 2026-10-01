@@ -3,15 +3,13 @@ use std::collections::{BTreeMap, HashSet};
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use rand::RngCore;
-use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::crypto::{
     HPKE_CIPHERTEXT_SIZE, HPKE_ENCAPSULATED_KEY_SIZE, KeyFile, SecretKey, SubkeyKind, commit_key,
-    derive_subkey, open_with_key, random_seed, seal_with_key, verify_domain, verify_key_commitment,
-    wrap_generation_key_with_seed,
+    derive_subkey, dummy_generation_envelope, open_with_key, random_seed, seal_with_key,
+    verify_domain, verify_key_commitment, wrap_generation_key_with_seed,
 };
 use crate::policy::PolicyState;
 
@@ -648,9 +646,7 @@ fn build_envelopes(
         ));
     }
     while pairs.len() < count {
-        let encapsulated = random_seed().to_vec();
-        let mut ciphertext = vec![0_u8; HPKE_CIPHERTEXT_SIZE];
-        OsRng.fill_bytes(&mut ciphertext);
+        let (encapsulated, ciphertext) = dummy_generation_envelope()?;
         pairs.push((
             encapsulated.clone(),
             GenerationKeyEnvelope {

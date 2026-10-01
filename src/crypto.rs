@@ -272,6 +272,25 @@ pub fn wrap_generation_key_with_seed(
     Ok((encapsulated.to_bytes().to_vec(), ciphertext))
 }
 
+/// Builds a padding envelope that is a genuine HPKE seal of a random key to a
+/// throwaway recipient, so its encapsulated key is a real X25519 public key and
+/// storage cannot tell it apart from an envelope addressed to a device.
+pub fn dummy_generation_envelope() -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut rng = ChaCha20Rng::from_seed(random_seed());
+    let (_, public) = HpkeKem::gen_keypair(&mut rng);
+    let key = random_key();
+    let (encapsulated, ciphertext) = hpke::single_shot_seal::<HpkeAead, HpkeKdf, HpkeKem, _>(
+        &OpModeS::Base,
+        &public,
+        HPKE_INFO,
+        key.as_slice(),
+        &random_seed(),
+        &mut rng,
+    )
+    .map_err(|_| anyhow::anyhow!("HPKE dummy envelope sealing failed"))?;
+    Ok((encapsulated.to_bytes().to_vec(), ciphertext))
+}
+
 pub fn random_key() -> SecretKey {
     let mut key = [0_u8; 32];
     OsRng.fill_bytes(&mut key);
@@ -630,6 +649,19 @@ fn validate_root(root: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn dummy_envelopes_look_like_real_x25519_encapsulations() {
+        // A real X25519 public key never sets the top bit of its last byte.
+        // Uniformly random padding would set it about half the time, letting
+        // storage count real readers.
+        for _ in 0..256 {
+            let (encapsulated, ciphertext) = dummy_generation_envelope().unwrap();
+            assert_eq!(encapsulated.len(), HPKE_ENCAPSULATED_KEY_SIZE);
+            assert_eq!(ciphertext.len(), HPKE_CIPHERTEXT_SIZE);
+            assert_eq!(encapsulated[31] & 0x80, 0);
+        }
+    }
     use super::*;
 
     fn pack_bytes(size: usize) -> Vec<u8> {
