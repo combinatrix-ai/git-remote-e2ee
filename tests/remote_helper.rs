@@ -5,6 +5,7 @@ use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
 use git_remote_e2ee::crypto::KeyFile;
+use git_remote_e2ee::policy::DeviceRoles;
 use git_remote_e2ee::repository::EncryptedRepository;
 use git_remote_e2ee::storage::FilesystemStorage;
 
@@ -392,6 +393,104 @@ fn native_git_fetch_rejects_same_generation_manifest_fork() {
     assert!(!output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("history forked"),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn native_git_fetch_pins_membership_changes_that_transfer_no_objects() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let destination = temporary.path().join("destination");
+    let remote_path = temporary.path().join("remote");
+    let key_path = temporary.path().join("repository.key.json");
+    let admin_pin = temporary
+        .path()
+        .join("repository.key.json.admin-state.json");
+    initialize_git(&source);
+    initialize_git(&destination);
+
+    let key = KeyFile::generate();
+    key.write_new(&key_path).unwrap();
+    let extra = KeyFile::generate_for_repository(key.repository_root.clone()).unwrap();
+    let encrypted = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key);
+    encrypted.initialize().unwrap();
+    encrypted.pin_admin_state(&admin_pin).unwrap();
+    configure_remote(&source, &remote_path, &key_path);
+    configure_remote(&destination, &remote_path, &key_path);
+
+    fs::write(source.join("note.md"), "first\n").unwrap();
+    git(&source, &["add", "note.md"], false);
+    git(&source, &["commit", "-q", "-m", "first"], false);
+    git(&source, &["push", "private", "main"], true);
+    git(&destination, &["fetch", "private"], true);
+    let before_membership_change = encrypted.current_manifest().unwrap().0;
+
+    // A membership change publishes a new generation without changing refs, so
+    // Git finds nothing to transfer and never sends the helper a fetch command.
+    encrypted
+        .add_device(
+            extra.public_device().unwrap(),
+            DeviceRoles::reader(),
+            &admin_pin,
+        )
+        .unwrap();
+    git(&destination, &["fetch", "private"], true);
+
+    fs::write(
+        remote_path.join("HEAD"),
+        format!("{before_membership_change}\n"),
+    )
+    .unwrap();
+    let output = git_output(&destination, &["fetch", "private"], true);
+    assert!(
+        !output.status.success(),
+        "replaying the pre-change manifest must be rejected"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("rolled back"),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn native_git_fetch_pins_branch_deletions_that_transfer_no_objects() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let destination = temporary.path().join("destination");
+    let remote_path = temporary.path().join("remote");
+    let key_path = temporary.path().join("repository.key.json");
+    initialize_git(&source);
+    initialize_git(&destination);
+
+    let key = KeyFile::generate();
+    key.write_new(&key_path).unwrap();
+    let encrypted = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key);
+    encrypted.initialize().unwrap();
+    configure_remote(&source, &remote_path, &key_path);
+    configure_remote(&destination, &remote_path, &key_path);
+
+    fs::write(source.join("note.md"), "first\n").unwrap();
+    git(&source, &["add", "note.md"], false);
+    git(&source, &["commit", "-q", "-m", "first"], false);
+    git(&source, &["branch", "feature"], false);
+    git(&source, &["push", "private", "main", "feature"], true);
+    git(&destination, &["fetch", "private"], true);
+    let before_deletion = encrypted.current_manifest().unwrap().0;
+
+    git(&source, &["push", "private", "--delete", "feature"], true);
+    git(&destination, &["fetch", "--prune", "private"], true);
+
+    fs::write(remote_path.join("HEAD"), format!("{before_deletion}\n")).unwrap();
+    let output = git_output(&destination, &["fetch", "private"], true);
+    assert!(
+        !output.status.success(),
+        "replaying the pre-deletion manifest must be rejected"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("rolled back"),
         "stderr={}",
         String::from_utf8_lossy(&output.stderr)
     );

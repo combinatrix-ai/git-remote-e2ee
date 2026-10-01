@@ -123,10 +123,14 @@ administrative CAS is never automatically rebased.
   oldest-first.
 - After import, every advertised ref must resolve to a complete local Git
   object graph before the continuity floor or remote-tracking refs move.
-- Listing authenticates and advertises the current manifest but does not
-  advance the continuity floor. The floor advances only after a successful
-  import and connectivity check, or after the client's own publication wins
-  compare-and-swap.
+- Authentication alone never advances the continuity floor. The floor advances
+  after a successful import and connectivity check, after the client's own
+  publication wins compare-and-swap, or during listing when every advertised
+  ref already resolves to a complete local object graph. The last case matters
+  because Git skips the helper's fetch command when nothing needs to be
+  transferred, as after a membership change, a deletion, or a tag pointing at
+  an existing object; without it, such a state would never be pinned and a
+  later replay of the previous state would be accepted.
 - Per-repository/remote client-state updates hold an advisory file lock across
   validation and read-modify-write. The state replacement remains durable and
   atomic, and its manifest and policy generations never move backward.

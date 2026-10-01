@@ -225,7 +225,7 @@ fn revoked_reader_cannot_reach_later_history_but_keeps_prior_snapshot() {
 }
 
 #[test]
-fn membership_observation_does_not_pin_before_fetch_import() {
+fn connected_membership_observation_pins_and_rejects_replay() {
     let temp = tempfile::tempdir().unwrap();
     let remote = temp.path().join("remote");
     let source = temp.path().join("source");
@@ -246,6 +246,9 @@ fn membership_observation_does_not_pin_before_fetch_import() {
     repository.fetch_into(&client, "e2ee").unwrap();
     let before_membership = fs::read_to_string(remote.join("HEAD")).unwrap();
 
+    // The membership change keeps every ref, so the client already holds a
+    // fully connected copy of the advertised state. Native Git would not send
+    // a fetch command here, so observation itself must raise the floor.
     repository
         .add_device(
             key_b.public_device().unwrap(),
@@ -257,29 +260,17 @@ fn membership_observation_does_not_pin_before_fetch_import() {
     assert_eq!(observed.generation, 2);
     let state_path = client.join(".git/git-remote-e2ee/e2ee/state.json");
     let state: serde_json::Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
-    assert_eq!(state["generation"], 1);
-    assert_eq!(state["policy_generation"], 0);
+    assert_eq!(state["generation"], 2);
+    assert_eq!(state["policy_generation"], 1);
     let after_membership = fs::read_to_string(remote.join("HEAD")).unwrap();
 
     fs::write(remote.join("HEAD"), &before_membership).unwrap();
-    assert_eq!(
-        repository
-            .observe_manifest(&client, "e2ee")
-            .unwrap()
-            .generation,
-        1
-    );
-    let state: serde_json::Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
-    assert_eq!(state["generation"], 1);
-
-    fs::write(remote.join("HEAD"), after_membership).unwrap();
-    assert_eq!(
-        repository.fetch_into(&client, "e2ee").unwrap().generation,
-        2
-    );
+    let error = repository.observe_manifest(&client, "e2ee").unwrap_err();
+    assert!(format!("{error:#}").contains("rolled back"), "{error:#}");
     let state: serde_json::Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
     assert_eq!(state["generation"], 2);
-    assert_eq!(state["policy_generation"], 1);
+
+    fs::write(remote.join("HEAD"), after_membership).unwrap();
     commit(&source, "two\n", "two");
     repository
         .push_ref(&source, "refs/heads/main", false)

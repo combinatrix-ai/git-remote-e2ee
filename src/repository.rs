@@ -540,6 +540,25 @@ impl<S: Storage> EncryptedRepository<S> {
         }
         let state = read_client_state(&state_path)?;
         self.validate_pinned_head(&chain, &state)?;
+        // Git skips the helper's fetch command when every advertised object is
+        // already local, for example after a membership change, a deletion, or
+        // a tag that points at an existing object. Advance the floor here only
+        // when the advertised refs are fully connected locally, which is the
+        // same check a fetch would finish with; authentication alone never
+        // moves it. Earlier packs are not needed once these refs are
+        // connected, because later packs are built against these tips.
+        if git::ensure_refs_connected_since(repo, &current.manifest.refs, &state.verified_refs)
+            .is_ok()
+        {
+            let packs: HashSet<String> = state.packs.iter().cloned().collect();
+            write_client_state_locked(
+                &state_path,
+                &packs,
+                &current.id,
+                &current.manifest,
+                &current.manifest.refs,
+            )?;
+        }
         Ok(current.manifest.clone())
     }
 

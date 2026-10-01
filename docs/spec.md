@@ -404,11 +404,14 @@ refs, pinning the new head, or publishing a successor. A signed ref advance
 whose required pack delta is absent is invalid even when every cryptographic
 check succeeds.
 
-Authenticating and listing a manifest is only an observation; it MUST NOT
-advance the continuity floor. A helper client's head, generation, repository
-root, and policy-generation floor advances only after pack import and the
-complete-ref connectivity check succeed, or after that client successfully
-publishes its own successor with compare-and-swap. A failed or incomplete
+Authenticating a manifest alone MUST NOT advance the continuity floor. A
+helper client's head, generation, repository root, and policy-generation floor
+advances only when the complete-ref connectivity check succeeds for that
+manifest's refs, either after pack import or, during listing, because every
+advertised ref is already connected locally; or after that client successfully
+publishes its own successor with compare-and-swap. A client MUST NOT rely on
+receiving a fetch command to pin a state, because Git omits it when no objects
+need to be transferred. A failed or incomplete
 import leaves the previous floor intact, so an authenticated but unusable
 publication cannot make a later valid successor look like rollback.
 
