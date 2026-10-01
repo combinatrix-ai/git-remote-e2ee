@@ -176,9 +176,23 @@ reader count, and total growth. Public keys, device IDs, roles, signer identity,
 and membership changes are encrypted; object-size patterns can still suggest
 that a membership transition occurred. Inner Git metadata remains encrypted.
 
-The current carrier implementation clones a temporary checkout for each helper
-process. Uploads are incremental, but a persistent partial-clone cache is
-needed before multi-gigabyte repositories are practical.
+Each helper process fetches the carrier branch into a persistent bare object
+cache, then creates a disposable checkout that borrows the cache's objects.
+Fetches transfer only objects missing from the cache. The cache is keyed by the
+SHA-256 of a normalized remote URL; a file lock serializes updates across helper
+processes, and automatic garbage collection is disabled so borrowed objects
+remain available. The carrier branch is fetched again immediately before each
+CAS, and the CAS remains a normal fast-forward push. A stale cache therefore
+cannot authorize a write against an outdated branch tip.
+
+Recovery publishes a fresh cache generation instead of replacing objects that
+an in-flight temporary checkout may still borrow. Obsolete generations are
+retained so those checkouts remain valid; repeated cache corruption can therefore
+consume additional local disk space.
+
+The cache contains carrier Git objects and metadata only. It never stores keys,
+plaintext, or decrypted repository data. Its default location and the
+`GIT_REMOTE_E2EE_CACHE_DIR` override are documented in the [user guide](guide.md#git-host-as-storage-carrier-git-backend).
 
 ## Concurrency
 

@@ -498,6 +498,5 @@ Planned extensions:
 1. checkpoint/compaction and garbage collection with explicit authority;
 2. M-of-N administrator authorization and recovery;
 3. automatic stale-push retry with explicit merge behavior;
-4. persistent partial-clone carrier cache;
-5. S3 backend with conditional-write compatibility tests;
-6. optional gossip or transparency-log anchoring.
+4. S3 backend with conditional-write compatibility tests;
+5. optional gossip or transparency-log anchoring.

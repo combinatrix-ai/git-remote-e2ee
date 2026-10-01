@@ -62,6 +62,18 @@ Ciphertext is split into 32 MiB chunks so it can be stored as ordinary Git
 blobs. The host can still observe outer commit times, chunk counts and sizes,
 update frequency, and total growth.
 
+Each helper process fetches the carrier branch into a persistent local bare
+object cache, then uses a disposable checkout that borrows those cached Git
+objects. The cache is shared by helper and `git-e2ee` processes for the same
+normalized remote URL. It is stored at
+`$XDG_CACHE_HOME/git-remote-e2ee/carrier/<sha256-of-normalized-remote>` or, when
+`XDG_CACHE_HOME` is unset, `~/.cache/git-remote-e2ee/carrier/<sha256-of-normalized-remote>`.
+Set `GIT_REMOTE_E2EE_CACHE_DIR` to override the parent directory that contains
+the per-remote cache directories; tests and isolated runs should set it to a
+temporary directory. Fetches are serialized across processes, and each refresh
+downloads only missing carrier objects. The cache stores carrier Git objects
+and metadata only: no keys, plaintext, or decrypted data.
+
 ## Directory as storage (filesystem backend)
 
 A local or mounted directory can hold the encrypted repository:
@@ -154,9 +166,9 @@ compare-and-swap race. Inspect the winning state and run the command again.
   deletion fail without publishing anything.
 - A push that loses a race with another writer fails. Fetch, integrate, and
   push again.
-- With a Git host as storage, each operation clones the whole carrier
-  repository into a temporary directory. Uploads are incremental, but downloads
-  grow with the total encrypted history until a persistent cache lands.
+- A new or deleted local carrier cache downloads the complete carrier branch.
+  Later operations reuse its objects and fetch only new carrier objects.
+  `GIT_REMOTE_E2EE_CACHE_DIR` overrides the cache parent directory.
 - Shallow and partial clones are not supported. A fresh clone downloads and
   verifies the complete history.
 
