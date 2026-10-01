@@ -314,7 +314,7 @@ and diff locally, or give a CI runner its own read-only device key.
 Clients refuse it and stop. A writer can then run `git-e2ee recover`, which
 shows what it found and continues from the last verified state, or from a newer
 legitimate state it discovers in the carrier history. See the
-[user guide](docs/guide.md).
+[user guide](docs/guide.md#recover-from-a-broken-head).
 
 **Can the host roll my repository back?**
 It can serve old data. A clone that has synced before refuses anything older
