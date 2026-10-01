@@ -1,6 +1,6 @@
 # Design
 
-This document summarizes the implemented v4 architecture. [`spec.md`](spec.md)
+This document summarizes the implemented v5 architecture. [`spec.md`](spec.md)
 defines the protocol invariants and security claims in detail.
 
 ## Goal
@@ -35,8 +35,7 @@ private key of a device that remains active.
 
 ```text
 objects/<ciphertext hash>      encrypted incremental Git pack
-manifests/<object hash>        signed header + encrypted generation delta
-policies/<object hash>         signed device registry and roles
+manifests/<object hash>        plaintext discovery header + encrypted sealed header and body
 HEAD                           opaque newest-manifest pointer
 ```
 
@@ -44,9 +43,10 @@ Only `HEAD` is mutable. Updating it requires compare-and-swap against the exact
 value observed by the publisher.
 
 The manifest body contains complete current refs, only packs introduced by its
-generation, and the predecessor-key link. Historical pack descriptors are not
-copied into every new manifest. The signed manifest chain is the append-only
-pack delta log.
+generation, the predecessor-key link, and the complete signed policy when that
+manifest introduces one. Historical pack descriptors are not copied into
+every new manifest. The signed manifest chain is the append-only pack delta
+log; there are no separate `policies/` objects.
 
 ## Cryptography
 
@@ -57,11 +57,21 @@ pack delta log.
   for Git packs
 - SHA-256 content IDs and generation-key commitments
 
-The signature covers exact header bytes and the encrypted body digest. The
-header includes the complete reader-envelope list and generation-key
-commitment. Every verifier checks that envelope device IDs exactly equal the
-selected policy's active-reader set. Each recipient checks its unwrapped key
-against the signed commitment before body decryption.
+The plaintext header contains only format version, repository root, generation,
+previous manifest ID, generation-key commitment, anonymous padded envelopes,
+and the digests of the encrypted body and sealed-header content. The
+K_t-encrypted sealed header contains policy ID and generation, signer device
+ID, transition type, cumulative pack count, envelope audit, and Ed25519
+signature. The signature covers the exact plaintext header bytes, the sealed
+header content without the signature, and the encrypted body digest.
+
+Each envelope hides its recipient ID. Publishers pad the envelope list to the
+next power of two with a minimum of four, sort by encapsulated-key bytes, and
+use random dummies with the same lengths as real envelopes. A device trial
+decrypts only the head list; predecessor links provide older keys. Every
+verifier uses each audited seed with `rand_chacha` 0.9.0 `ChaCha20Rng` to
+re-seal K_t and check byte equality, then requires exactly one real envelope
+for each active reader in the encrypted policy.
 
 Subkey contexts use the repository root, fixed-width generation, object kind,
 and dense generation-local ordinal. Pack AAD binds the same identity. Keys are
@@ -77,13 +87,15 @@ roles are independent, with two liveness constraints:
 
 Readers receive generation envelopes. Writers sign ordinary manifest updates.
 Administrators sign direct child policies and policy-transition manifests.
+The signed policy bytes travel only in the encrypted body of the manifest that
+introduces them. Later manifests name the current policy in their sealed header.
 
 The repository root is derived from the genesis owner's two public keys.
 Genesis contains exactly that active owner with reader, writer, and
 administrator roles and is self-signed. Child policies are authorized by an
 administrator in the parent policy.
 
-The format retains an administrator threshold and signature array, but v4
+The format retains an administrator threshold and signature array, but v5
 accepts threshold 1 and one signature only. Unsupported thresholds fail closed.
 
 ## Device operations
@@ -142,8 +154,9 @@ published. A flush error fails the call. Immutable objects are durable before
 the pointer moves, within the limits in [`durability.md`](durability.md).
 Abandoned `.stage-*` files are unreachable; automatic cleanup is deferred to
 future GC.
-Manifest and policy objects still use bounded buffered parsing with a 16 MiB
-hard limit; large pack objects always use the streaming path.
+Manifest objects still use bounded buffered parsing with a 16 MiB hard limit;
+large pack objects always use the streaming path. Policy bytes are parsed from
+the decrypted manifest body and are not separate storage objects.
 
 An S3 backend can use create-if-absent immutable writes and a conditional HEAD
 write, but requires a provider capability test; the label "S3 compatible" does
@@ -157,8 +170,10 @@ into a dense canonical sequence of 32 MiB chunks, on the dedicated branch
 A normal fast-forward push is the CAS: two candidates from the same parent
 cannot both win.
 
-The host sees outer commit timing, chunk sizes/counts, update frequency, public
-policy/header metadata, and total growth. Inner Git metadata remains encrypted.
+The host sees outer commit timing, chunk sizes/counts, update frequency, padded
+reader count, and total growth. Public keys, device IDs, roles, signer identity,
+and membership changes are encrypted; object-size patterns can still suggest
+that a membership transition occurred. Inner Git metadata remains encrypted.
 
 The current carrier implementation clones a temporary checkout for each helper
 process. Uploads are incremental, but a persistent partial-clone cache is
@@ -193,13 +208,13 @@ Old manifest headers retain device envelopes. Later compromise of a device
 private key can retroactively expose every generation addressed to that device.
 There is no forward secrecy for stored history.
 
-## Anonymous recipients (v5, in progress)
+## Anonymous recipients (v5)
 
-v4 lets storage see each device's per-repository public keys, its roles, and
-every membership change. The reason is structural: envelopes carry a recipient
-device ID so a device can find its own, and verifiers compare that ID set with
-a plaintext policy. v5 removes that exposure so storage learns only a bounded
-reader count, the same class of leak as `gpg --throw-keyids` in
+v4 let storage see each device's per-repository public keys, its roles, and
+every membership change. The reason was structural: envelopes carried a
+recipient device ID so a device could find its own, and verifiers compared
+that ID set with a plaintext policy. v5 removes that exposure so storage learns
+only the padded reader count, the same class of leak as `gpg --throw-keyids` in
 git-remote-gcrypt.
 
 ### What changes
@@ -221,8 +236,8 @@ git-remote-gcrypt.
    (4096) to bound work on malicious input. If nothing opens, the client
    reports that this device is not an active reader of the current generation:
    it was revoked, was never added, or its envelope is malformed.
-3. **Sealed header.** Everything that identified devices moves out of the
-   plaintext header into a sealed header, encrypted under a `K_t`-derived
+3. **Sealed header.** Everything that identifies devices stays out of the
+   plaintext header and inside a sealed header, encrypted under a `K_t`-derived
    subkey: policy ID and policy generation, signer device ID, transition type,
    cumulative pack count, the envelope audit (item 5), and the Ed25519
    signature. The signature covers the plaintext header bytes, the sealed
@@ -239,8 +254,8 @@ git-remote-gcrypt.
 5. **Envelope audit.** Without visible recipient IDs, verifiers cannot compare
    an envelope ID set with the active-reader set, so a malicious writer could
    corrupt one reader's envelope unnoticed by everyone else. The sealed header
-   therefore records, for each envelope, either the recipient device ID and the
-   32-byte seed that fed the HPKE encapsulation RNG, or a dummy marker. After
+   therefore records, for each envelope, either the recipient device ID and a
+   fresh 32-byte seed that initializes the HPKE encapsulation RNG, or a dummy marker. After
    opening its own envelope, every verifier deterministically re-seals `K_t`
    for each real entry with that seed and the recipient's public key from the
    policy. It requires byte equality with the stored envelope and exactly one
@@ -253,14 +268,15 @@ git-remote-gcrypt.
 
 The padded envelope count (an upper bound on active readers), object sizes,
 upload timing, generation count, total growth, and the opaque repository root.
-Device public keys, roles, signer identity, and the fact of a membership change
-become encrypted.
+Device public keys and IDs, roles, signer identity, and membership data are
+encrypted, though size patterns can still suggest a transition.
 
 ### Costs and limits
 
 - Format break: v5 does not read v4 repositories and ships no migration, which
   is acceptable for a prototype.
-- Padding adds at most 2x envelope metadata per generation.
+- For four or more active readers, padding adds fewer than 2x envelope metadata;
+  one to three readers use the four-entry minimum.
 - A device that cannot open any envelope cannot tell revocation from
   corruption. Continuity pins still reject rollback for returning clients.
 - A reader can still see the complete policy after decryption, exactly as in
@@ -270,14 +286,17 @@ become encrypted.
 
 ## Cost model
 
-For new encrypted pack bytes `S`, active readers `N`, and a small envelope `G`:
+For new encrypted pack bytes `S`, padded reader count `P`, and a small envelope
+`G`:
 
 ```text
-content push delta       S + N*G + O(1)
-membership change       N*G + O(1)
+content push delta       S + P*G + O(1)
+membership change       P*G + O(policy size)
 large content storage   sum(pack ciphertext sizes), independent of N
 ```
 
-Envelope metadata remains linear in readers per generation. Fresh clone time is
-linear in generations until checkpoint compaction exists. The v4 wire format
-reserves a checkpoint transition, but current clients reject it as unimplemented.
+Envelope metadata remains linear in padded readers per generation. A policy
+transition also carries the signed policy history in its encrypted body. Fresh
+clone time is linear in generations until checkpoint compaction exists. The v5
+wire format reserves a checkpoint transition, but current clients reject it as
+unimplemented.

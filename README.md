@@ -141,7 +141,7 @@ of selected files inside an otherwise normal repository. **Encrypted remotes**,
 | Branch names and the commit graph | visible | visible | hidden | hidden |
 | Which files changed, their sizes, identical files | visible | visible¹ | hidden | hidden |
 | When you push, and roughly how much | visible | visible | visible | visible |
-| Collaborators | account list | key fingerprints² | count only³ | count, public keys, roles⁴ |
+| Collaborators | account list | key fingerprints² | count only³ | count only (padded)⁴ |
 
 ### What each tool can do
 
@@ -172,10 +172,10 @@ of selected files inside an otherwise normal repository. **Encrypted remotes**,
    committed under `.git-crypt/`, named by key fingerprint.
 3. gcrypt hides recipient key IDs by default (`gpg -R`); the number of
    encrypted-key packets is still observable.
-4. Each device must find its own envelope before it can decrypt anything, so
-   the policy is plaintext-structured: the host sees the number of devices,
-   their per-repository public keys, their roles, and policy changes. Do not
-   reuse device keys between repositories.
+4. The envelope list is padded to the next power of two, with a minimum of
+   four. Public keys, roles, and membership changes are encrypted, though size
+   patterns may suggest a transition. Do not reuse device keys between
+   repositories.
 5. gcrypt is incremental with its local and rsync backends, but its
    [documentation](https://manpages.debian.org/trixie/git-remote-gcrypt/git-remote-gcrypt.1.en.html)
    says a Git or SFTP backend uploads the entire history on every push, and it
@@ -238,7 +238,8 @@ It does **not** prevent:
   the roadmap);
 - an authorized writer making destructive changes;
 - a revoked device reading what it could read before revocation;
-- traffic analysis: update times, object sizes, and total growth are visible;
+- traffic analysis: update times, object sizes, total growth, and the padded
+  reader count are visible;
 - future quantum attacks: key exchange uses X25519.
 
 Keys work as a backward chain. The current key can decrypt all earlier

@@ -56,7 +56,6 @@ refs/heads/git-remote-e2ee
     ├── HEAD
     ├── objects/aa/<opaque-id>/00000000
     ├── manifests/bb/<opaque-id>/00000000
-    └── policies/cc/<opaque-id>/00000000
 ```
 
 Ciphertext is split into 32 MiB chunks so it can be stored as ordinary Git
