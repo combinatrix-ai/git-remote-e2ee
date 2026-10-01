@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 use git_remote_e2ee::crypto::{KeyFile, PublicDevice};
 use git_remote_e2ee::policy::DeviceRoles;
@@ -13,6 +13,23 @@ use git_remote_e2ee::storage::{FilesystemStorage, GitStorage};
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum DeviceRole {
+    Read,
+    Write,
+    Admin,
+}
+
+impl From<DeviceRole> for DeviceRoles {
+    fn from(role: DeviceRole) -> Self {
+        match role {
+            DeviceRole::Read => Self::reader(),
+            DeviceRole::Write => Self::collaborator(),
+            DeviceRole::Admin => Self::owner(),
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -78,8 +95,8 @@ enum Command {
         key: PathBuf,
         #[arg(long)]
         device: PathBuf,
-        #[arg(long)]
-        admin: bool,
+        #[arg(long, value_enum, default_value = "write")]
+        role: DeviceRole,
     },
     DeviceRevoke {
         #[arg(long, conflicts_with = "remote", required_unless_present = "remote")]
@@ -178,16 +195,12 @@ fn main() -> Result<()> {
             remote,
             key,
             device,
-            admin,
+            role,
         } => {
             let pin = admin_pin_path(&key);
             let public = PublicDevice::read(&device)?;
             let device_id = public.device_id.clone();
-            let roles = if admin {
-                DeviceRoles::owner()
-            } else {
-                DeviceRoles::collaborator()
-            };
+            let roles = DeviceRoles::from(role);
             let (manifest, policy) = match (storage, remote) {
                 (Some(storage), None) => {
                     EncryptedRepository::new(FilesystemStorage::new(storage), KeyFile::read(&key)?)
@@ -239,17 +252,24 @@ fn main() -> Result<()> {
             };
             for device in devices {
                 println!(
-                    "{} reader={} writer={} admin={} status={}",
+                    "{} role={} status={}",
                     device.public.device_id,
-                    device.roles.reader,
-                    device.roles.writer,
-                    device.roles.administrator,
+                    role_name(&device.roles),
                     if device.active() { "active" } else { "revoked" }
                 );
             }
         }
     }
     Ok(())
+}
+
+fn role_name(roles: &DeviceRoles) -> &'static str {
+    match (roles.reader, roles.writer, roles.administrator) {
+        (true, false, false) => "read",
+        (true, true, false) => "write",
+        (true, true, true) => "admin",
+        _ => "invalid",
+    }
 }
 
 fn admin_pin_path(key: &std::path::Path) -> PathBuf {

@@ -1123,6 +1123,30 @@ mod tests {
     }
 
     #[test]
+    fn reader_only_device_cannot_sign_an_ordinary_manifest() {
+        let owner = KeyFile::generate();
+        let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
+        let (genesis, _) = PolicyState::genesis(&owner).unwrap();
+        let mut devices = genesis.body.devices.clone();
+        devices.push(DeviceRecord {
+            public: reader.public_device().unwrap(),
+            roles: DeviceRoles::reader(),
+            revoked_at: None,
+        });
+        let (policy, _) = PolicyState::successor(&genesis, devices, &owner).unwrap();
+        let generation_key = random_key();
+
+        // seal_manifest can construct a cryptographically valid signature from
+        // any key. Verification must still enforce the signer's policy role.
+        let encrypted = writer_manifest(&reader, &policy, &generation_key);
+        let opened = open_manifest(&encrypted, &generation_key).unwrap();
+        let error = verify_manifest(&opened, &policy, None, &generation_key)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("manifest was not signed by an active writer"));
+    }
+
+    #[test]
     fn reader_trials_all_envelopes_and_reports_inactive_membership_clearly() {
         let owner = KeyFile::generate();
         let outsider = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();

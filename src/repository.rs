@@ -349,7 +349,16 @@ impl<S: Storage> EncryptedRepository<S> {
         git::ensure_repository(repo)?;
         let chain = self.current_chain()?;
         let current = chain.first().context("manifest chain is empty")?.clone();
-        if !current.policy.is_active_writer(&self.key.device_id()?) {
+        let device_id = self.key.device_id()?;
+        if !current.policy.is_active_writer(&device_id) {
+            if current.policy.is_active_reader(&device_id) {
+                if let Some(remote_name) = remote_name {
+                    bail!(
+                        "this device is read-only for {remote_name}; ask an administrator for the write role"
+                    )
+                }
+                bail!("this device is read-only; ask an administrator for the write role")
+            }
             bail!("device is not an active writer")
         }
         if let Some(remote_name) = remote_name {
