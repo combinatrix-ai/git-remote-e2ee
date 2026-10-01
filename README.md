@@ -296,16 +296,16 @@ it. A fresh clone cannot tell yet.
 ## Status and roadmap
 
 Working today: clone, fetch, pull, and push, including tags and remote branch
-deletion; the directory and Git-host
-backends; incremental pushes and fetches (the Git-host backend keeps a local
-cache of the carrier); per-device keys; adding and revoking devices; and
-rollback and race detection.
+deletion; the directory and Git-host backends; incremental pushes and fetches
+(the Git-host backend keeps a local cache of the carrier); per-device keys with
+read, write, and admin roles; adding and revoking devices; and rollback and
+race detection.
 
 Planned: M-of-N administrator approval, key recovery and replacement, automatic
 retry after losing a push race, an S3 conditional-write backend, garbage
-collection and compaction, shallow and partial clone,
-optional transparency-log anchoring, and an optional file-level mode that
-encrypts only selected files while keeping per-device keys and revocation.
+collection and compaction, shallow and partial clone, optional
+transparency-log anchoring, and an optional file-level mode that encrypts only
+selected files while keeping per-device keys and revocation.
 
 ## Documentation
 
