@@ -162,6 +162,67 @@ refuses any threshold other than 1.
 The administrative CLI does not retry automatically when it loses a
 compare-and-swap race. Inspect the winning state and run the command again.
 
+## Recover from a broken HEAD
+
+If a storage writer replaces `HEAD` with an invalid manifest, normal fetches
+and pushes stop. Run recovery from a Git repository that has already pinned a
+known good state for that remote. The default command prints a report and does
+not publish or advance the continuity floor:
+
+```console
+git-e2ee recover \
+  --remote https://git.example/user/encrypted-carrier.git \
+  --key /safe/place/carrier.key.json \
+  --repo /work/my-clone \
+  --remote-name private
+```
+
+For a directory backend, use `--storage <directory>` instead of `--remote`.
+The local floor is read from
+`<repo>/.git/git-remote-e2ee/<remote-name>/state.json`; use the same repository
+and remote name that previously fetched or pushed. A fresh clone has no floor,
+so recovery reports that freshness and fork identity are unverified and will
+not publish.
+
+Review the offered manifest IDs, generations, verified signers, replays, and
+any fork report. Recovery is allowed only when the current head is demonstrably
+invalid. It refuses valid, unverifiable, unsupported, unavailable, and
+discontinuous heads. A signer extracted from an invalid head is labelled only
+as a claim until its signature is verified. Read-only devices can inspect the
+report but cannot publish recovery.
+
+To publish from the default base, add `--publish`:
+
+```console
+git-e2ee recover \
+  --remote https://git.example/user/encrypted-carrier.git \
+  --key /safe/place/carrier.key.json \
+  --repo /work/my-clone \
+  --remote-name private \
+  --publish
+```
+
+The default base is the newest authenticated descendant found after the local
+floor, or the floor if there is no descendant. Recovery refuses conflicting
+authenticated descendants. Selecting an older offered base requires both
+`--base <manifest-id>` and `--discard-newer`; this can omit legitimate changes
+or a revocation. A lost compare-and-swap fails. Start a new command and review
+the fresh report before trying again.
+
+The directory backend has no carrier commit history, so it can offer only the
+local floor. Publishing requires `--accept-stale-floor` and prints this warning:
+
+> Updates after this floor may be omitted. This may also omit revocations and
+> disclose subsequently published content to devices excluded by a newer
+> policy.
+
+Carrier recovery restores required ciphertext from prior outer commits when
+available, checks each content ID, verifies the selected refs' complete Git
+object graph in temporary local storage, then publishes a normal fast-forward
+carrier commit. If required ciphertext is no longer available, recovery stops.
+After successful recovery, run the usual `git fetch` or `git pull` to update
+your local remote-tracking refs.
+
 ## Limits today
 
 - Pushes support branches under `refs/heads/*` and tags under `refs/tags/*`;
@@ -176,6 +237,9 @@ compare-and-swap race. Inspect the winning state and run the command again.
 - A new or deleted local carrier cache downloads the complete carrier branch.
   Later operations reuse its objects and fetch only new carrier objects.
   `GIT_REMOTE_E2EE_CACHE_DIR` overrides the cache parent directory.
+- Recovery discovery has fixed limits of 2,048 carrier commits, 256 distinct
+  heads, 64 MiB of manifest data, and 1,000,000 estimated cryptographic
+  operations. It fails closed if any limit is exhausted.
 - Shallow and partial clones are not supported. A fresh clone downloads and
   verifies the complete history.
 

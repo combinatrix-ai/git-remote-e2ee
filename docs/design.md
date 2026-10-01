@@ -320,7 +320,8 @@ verifies against a device record in the authenticated policy.
    push is still a fast-forward. Rebuild the `e2ee/` tree from the ciphertext
    objects the base chain requires, restored byte for byte from the carrier's
    history or the local cache and checked against their content IDs; if any is
-   missing, fail as unavailable. A lost CAS restarts from discovery.
+   missing, fail as unavailable. A lost CAS fails; the operator must start a
+   new `recover` invocation and review its fresh discovery report.
 
 Git does not pass a push of unchanged refs to the helper, so a plain `git push`
 cannot perform recovery; `recover` is the only entry point. It must never
@@ -349,6 +350,31 @@ require the current tip to be a single-parent child of it.
   state, separate from the floor. Do not blacklist unverifiable or unavailable
   states.
 - Never lower the floor. A successful recovery advances it to `R`.
+
+### Current implementation
+
+`git-e2ee recover` accepts `--remote <carrier-url>` or `--storage <directory>`,
+plus `--key`, `--repo`, and `--remote-name`. The repository defaults to `.`
+and the remote name defaults to `origin`; the continuity floor is read from
+`.git/git-remote-e2ee/<remote-name>/state.json`. Without `--publish`, the command
+only reports. Publishing an older offer requires `--discard-newer`. Directory
+publication requires `--accept-stale-floor` and prints the warning above.
+
+Discovery scans the complete available first-parent carrier history, within
+budgets of 2,048 outer commits, 256 distinct heads, 64 MiB of manifest bytes,
+and 1,000,000 estimated cryptographic operations. It scans past replays of the
+floor so a legitimate descendant hidden behind a replay can still be offered.
+An exhausted budget fails closed. A CAS loss is returned to the operator;
+there is no automatic retry with an old selection. This implements the
+restart-at-discovery requirement as a fresh command invocation, matching the
+requirement that a losing recovery fail without retrying blindly.
+
+Before publication, required manifests and packs are restored into the
+disposable carrier checkout, unneeded ciphertext objects are removed from that
+checkout's `e2ee/` tree, and all base-chain packs are imported into a temporary
+bare Git repository to verify complete ref connectivity. The temporary
+repository is deleted when the command exits; the persistent carrier cache
+continues to contain ciphertext Git objects only.
 
 ## Anonymous recipients (v5)
 

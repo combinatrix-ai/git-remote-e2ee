@@ -438,6 +438,52 @@ client state from another wire version is not accepted. The incremental rule ass
 client's existing object database has not been corrupted outside this
 protocol; explicit full verification remains available to check local storage.
 
+### Explicit recovery
+
+`git-e2ee recover` MUST default to a read-only report. It MUST classify the
+observed storage head as valid, invalid, unverifiable, unsupported, unavailable,
+or discontinuous. Recovery publication is permitted only for an invalid head.
+Unverifiable, unsupported, unavailable, and discontinuous heads MUST never be
+overridden. In particular, a device that cannot open the current envelope
+MUST NOT recover from an older floor, because the head may be a valid
+revocation. A signer ID extracted before successful signature verification
+MUST be labelled as a claim, not as the signer.
+
+On carrier Git, discovery MUST inspect bounded outer first-parent history,
+deduplicate manifest IDs, and validate candidates against the authenticated
+policy and predecessor chain. The byte, outer-commit, candidate, and
+cryptographic-operation budgets MUST be fixed. Exhaustion MUST fail closed.
+Discovery MUST report authenticated descendants and replays. If authenticated
+descendants conflict, recovery MUST refuse to choose a fork. A replayed older
+manifest MUST NOT be treated as a newer candidate. Directory storage has no
+outer history and MUST offer only the pinned floor.
+
+The default base MUST be the newest validated descendant of the floor, or the
+floor when no descendant is available. Selecting an older offered base MUST
+require an explicit history-discard confirmation. Directory publication MUST
+require explicit acknowledgement that updates and revocations after the floor
+may be omitted and that subsequently published content may be disclosed to
+devices excluded by a newer policy.
+
+Before publication, the device MUST be an active writer under the selected
+base's policy. Recovery MUST publish a normal signed writer successor whose
+previous ID and generation are the selected base and its generation plus one,
+whose refs and policy are copied from that base, and whose predecessor link
+opens to the base key. It MUST compare-and-swap from the observed storage token
+while keeping that token separate from the selected manifest base. Required
+base-chain ciphertext MUST be available and checked against content IDs. A
+carrier publication MUST restore required historical ciphertext byte-for-byte,
+publish a child of the observed outer tip, and use a normal fast-forward push.
+Before publishing, the selected refs MUST resolve to complete local Git object
+graphs. A lost CAS MUST fail without a blind retry.
+
+Recovery MUST record invalid rejected heads as bounded diagnostic evidence
+separate from client continuity state. That evidence MUST NOT lower the floor
+or make an unverifiable or unavailable head ineligible for a later valid
+operation. A successful recovery advances the floor only after its own CAS
+succeeds. Recovery MUST NOT run from remote-helper `list` or `list for-push`,
+and an ordinary `git push` MUST NOT trigger it.
+
 Force pushes append a normal pack delta and new ref state. Older packs remain
 in historical manifests and may become unreachable in the inner Git graph.
 
