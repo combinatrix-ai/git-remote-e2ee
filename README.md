@@ -17,7 +17,6 @@
   · <a href="#how-it-compares">How it compares</a>
   · <a href="docs/design.md">Design</a>
   · <a href="docs/spec.md">Specification</a>
-  · <a href="README.ja.md">日本語</a>
 </p>
 
 <p align="center">
