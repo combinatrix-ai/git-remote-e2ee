@@ -158,7 +158,7 @@ of selected files inside an otherwise normal repository. **Encrypted remotes**,
 | Roles (read / write / admin) | × | ×¹³ | ○ |
 | Detects a rolled-back or forked remote | × | × | △¹⁴ |
 | No external dependencies | △¹⁵ | ×¹⁶ | ○ |
-| Tags and remote branch deletion | ○ | ○ | ×¹⁷ |
+| Tags and remote branch deletion | ○ | ○ | ○ |
 | Mature, stable format | ○ | ○ | × |
 | Cryptography | AES-256-CTR, HMAC-SHA1 SIV | OpenPGP (GnuPG) | XChaCha20-Poly1305, HPKE (X25519), Ed25519 |
 
@@ -207,8 +207,6 @@ of selected files inside an otherwise normal repository. **Encrypted remotes**,
 15. git-crypt is a C++ program linked against OpenSSL; GPG mode also needs
     GnuPG.
 16. gcrypt is a shell script that requires GnuPG.
-17. Pushes are limited to `refs/heads/*` for now. Tag pushes and branch
-    deletion fail without publishing anything.
 
 </details>
 
@@ -289,7 +287,7 @@ published after the revocation.
 
 **Can I review pull requests?**
 Not on the host. Review happens on a machine that has a key: fetch the branch
-and diff locally, or give a CI runner its own device key.
+and diff locally, or give a CI runner its own read-only device key.
 
 **Can the host roll my repository back?**
 It can serve old data. A clone that has synced before detects this and refuses
@@ -297,14 +295,15 @@ it. A fresh clone cannot tell yet.
 
 ## Status and roadmap
 
-Working today: clone, fetch, pull, and push; the directory and Git-host
+Working today: clone, fetch, pull, and push, including tags and remote branch
+deletion; the directory and Git-host
 backends; incremental pushes and fetches (the Git-host backend keeps a local
 cache of the carrier); per-device keys; adding and revoking devices; and
 rollback and race detection.
 
 Planned: M-of-N administrator approval, key recovery and replacement, automatic
 retry after losing a push race, an S3 conditional-write backend, garbage
-collection and compaction, tags and branch deletion, shallow and partial clone,
+collection and compaction, shallow and partial clone,
 optional transparency-log anchoring, and an optional file-level mode that
 encrypts only selected files while keeping per-device keys and revocation.
 
