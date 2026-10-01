@@ -155,10 +155,10 @@ of selected files inside an otherwise normal repository. **Encrypted remotes**,
 | Tampering detected | △⁸ | ○ | ○ |
 | No master key | ×⁹ | ○ | ○ |
 | Revoke one collaborator | ×¹⁰ | ×¹¹ | ○¹² |
-| Roles (read / write / admin) | × | ×¹³ | △¹⁴ |
-| Detects a rolled-back or forked remote | × | × | △¹⁵ |
-| No external dependencies | △¹⁶ | ×¹⁷ | ○ |
-| Tags and remote branch deletion | ○ | ○ | ×¹⁸ |
+| Roles (read / write / admin) | × | ×¹³ | ○ |
+| Detects a rolled-back or forked remote | × | × | △¹⁴ |
+| No external dependencies | △¹⁵ | ×¹⁶ | ○ |
+| Tags and remote branch deletion | ○ | ○ | ×¹⁷ |
 | Mature, stable format | ○ | ○ | × |
 | Cryptography | AES-256-CTR, HMAC-SHA1 SIV | OpenPGP (GnuPG) | XChaCha20-Poly1305, HPKE (X25519), Ed25519 |
 
@@ -201,15 +201,13 @@ of selected files inside an otherwise normal repository. **Encrypted remotes**,
 13. gcrypt's recipient list is the local `gcrypt.participants` setting of
     whoever pushes, so any participant who can push decides who can read the
     next state.
-14. Only administrators can change membership, and that is enforced. The
-    protocol also has a read-only role, but the CLI cannot grant it yet.
-15. A clone that has synced before rejects rollback or a diverging history. A
+14. A clone that has synced before rejects rollback or a diverging history. A
     brand-new clone cannot tell without an external anchor; see
     [Security model](#security-model).
-16. git-crypt is a C++ program linked against OpenSSL; GPG mode also needs
+15. git-crypt is a C++ program linked against OpenSSL; GPG mode also needs
     GnuPG.
-17. gcrypt is a shell script that requires GnuPG.
-18. Pushes are limited to `refs/heads/*` for now. Tag pushes and branch
+16. gcrypt is a shell script that requires GnuPG.
+17. Pushes are limited to `refs/heads/*` for now. Tag pushes and branch
     deletion fail without publishing anything.
 
 </details>
