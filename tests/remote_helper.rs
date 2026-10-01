@@ -293,17 +293,7 @@ fn native_git_fetch_rejects_same_generation_manifest_fork() {
     let fork = EncryptedRepository::new(FilesystemStorage::new(&fork_path), key);
     fork.initialize().unwrap();
     let fork_head = fork.push_ref(&source, "refs/heads/main", false).unwrap();
-    let fork_manifest = fork_path
-        .join("manifests")
-        .join(&fork_head[..2])
-        .join(&fork_head);
-    let remote_manifest = remote_path
-        .join("manifests")
-        .join(&fork_head[..2])
-        .join(&fork_head);
-    fs::create_dir_all(remote_manifest.parent().unwrap()).unwrap();
-    fs::copy(fork_manifest, remote_manifest).unwrap();
-    copy_tree(&fork_path.join("policies"), &remote_path.join("policies"));
+    copy_tree(&fork_path.join("manifests"), &remote_path.join("manifests"));
     fs::write(remote_path.join("HEAD"), format!("{fork_head}\n")).unwrap();
 
     let output = git_output(&destination, &["fetch", "private"], true);

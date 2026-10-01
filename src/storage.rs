@@ -95,7 +95,6 @@ pub trait Storage {
 pub enum ObjectKind {
     Pack,
     Manifest,
-    Policy,
 }
 
 impl ObjectKind {
@@ -103,7 +102,6 @@ impl ObjectKind {
         match self {
             Self::Pack => "objects",
             Self::Manifest => "manifests",
-            Self::Policy => "policies",
         }
     }
 }
@@ -119,7 +117,7 @@ impl FilesystemStorage {
     }
 
     pub fn initialize(&self) -> Result<()> {
-        for name in ["objects", "manifests", "policies"] {
+        for name in ["objects", "manifests"] {
             let directory = self.root.join(name);
             crate::persist::create_dir_all_durable(&directory)
                 .with_context(|| format!("create {}", directory.display()))?;

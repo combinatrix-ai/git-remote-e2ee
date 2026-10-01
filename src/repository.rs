@@ -15,8 +15,8 @@ use crate::crypto::{
 use crate::git;
 use crate::manifest::{
     Manifest, ManifestAuthorization, ManifestHeader, PackDescriptor, open_manifest, pack_aad,
-    peek_manifest_header, read_manifest_header, seal_manifest, unwrap_generation_key,
-    unwrap_predecessor_key, wrap_predecessor_key,
+    peek_manifest_header, seal_manifest, unwrap_generation_key, unwrap_predecessor_key,
+    verify_manifest, wrap_predecessor_key,
 };
 use crate::policy::{DeviceRecord, DeviceRoles, PolicyState};
 use crate::storage::{ObjectKind, Storage};
@@ -63,10 +63,8 @@ impl<S: Storage> EncryptedRepository<S> {
             bail!("encrypted repository is already initialized")
         }
         let (policy, policy_bytes) = PolicyState::genesis(&self.key)?;
-        self.storage
-            .put_object_if_absent(ObjectKind::Policy, &policy.id, &policy_bytes)?;
         let generation_key = random_key();
-        let genesis = Manifest::genesis(self.key.repository_root.clone(), &policy);
+        let genesis = Manifest::genesis(self.key.repository_root.clone(), &policy, policy_bytes);
         self.commit_manifest(
             None,
             &policy,
@@ -83,8 +81,9 @@ impl<S: Storage> EncryptedRepository<S> {
         roles: DeviceRoles,
         pin_path: &Path,
     ) -> Result<(String, String)> {
-        let current = self.current_state()?;
-        self.validate_pinned_head(&current, &read_client_state(pin_path)?)?;
+        let chain = self.current_chain()?;
+        let current = chain.first().context("manifest chain is empty")?.clone();
+        self.validate_pinned_head(&chain, &read_client_state(pin_path)?)?;
         self.require_admin(&current.policy)?;
         if current.policy.device(&public.device_id).is_some() {
             bail!("device already exists in policy")
@@ -98,14 +97,9 @@ impl<S: Storage> EncryptedRepository<S> {
         let (next_policy, policy_bytes) =
             PolicyState::successor(&current.policy, devices, &self.key)?;
         let next_key = random_key();
-        let next = transition_manifest(&current, &next_policy, &next_key)?;
-        let result = self.publish_policy_transition(
-            &current,
-            &next_policy,
-            &policy_bytes,
-            &next_key,
-            next.clone(),
-        )?;
+        let next = transition_manifest(&current, &next_policy, policy_bytes, &next_key)?;
+        let result =
+            self.publish_policy_transition(&current, &next_policy, &next_key, next.clone())?;
         write_client_state(
             pin_path,
             &HashSet::new(),
@@ -117,8 +111,9 @@ impl<S: Storage> EncryptedRepository<S> {
     }
 
     pub fn revoke_device(&self, device_id: &str, pin_path: &Path) -> Result<(String, String)> {
-        let current = self.current_state()?;
-        self.validate_pinned_head(&current, &read_client_state(pin_path)?)?;
+        let chain = self.current_chain()?;
+        let current = chain.first().context("manifest chain is empty")?.clone();
+        self.validate_pinned_head(&chain, &read_client_state(pin_path)?)?;
         self.require_admin(&current.policy)?;
         let mut devices = current.policy.body.devices.clone();
         let target = devices
@@ -141,14 +136,9 @@ impl<S: Storage> EncryptedRepository<S> {
         let (next_policy, policy_bytes) =
             PolicyState::successor(&current.policy, devices, &self.key)?;
         let next_key = random_key();
-        let next = transition_manifest(&current, &next_policy, &next_key)?;
-        let result = self.publish_policy_transition(
-            &current,
-            &next_policy,
-            &policy_bytes,
-            &next_key,
-            next.clone(),
-        )?;
+        let next = transition_manifest(&current, &next_policy, policy_bytes, &next_key)?;
+        let result =
+            self.publish_policy_transition(&current, &next_policy, &next_key, next.clone())?;
         write_client_state(
             pin_path,
             &HashSet::new(),
@@ -160,9 +150,10 @@ impl<S: Storage> EncryptedRepository<S> {
     }
 
     pub fn pin_admin_state(&self, pin_path: &Path) -> Result<()> {
-        let current = self.current_state()?;
+        let chain = self.current_chain()?;
+        let current = chain.first().context("manifest chain is empty")?;
         let previous = read_client_state(pin_path)?;
-        self.validate_pinned_head(&current, &previous)?;
+        self.validate_pinned_head(&chain, &previous)?;
         write_client_state(
             pin_path,
             &HashSet::new(),
@@ -173,19 +164,24 @@ impl<S: Storage> EncryptedRepository<S> {
     }
 
     pub fn list_devices(&self) -> Result<Vec<DeviceRecord>> {
-        Ok(self.current_state()?.policy.body.devices)
+        Ok(self
+            .current_chain()?
+            .into_iter()
+            .next()
+            .context("manifest chain is empty")?
+            .policy
+            .body
+            .devices)
     }
 
     fn publish_policy_transition(
         &self,
         current: &OpenedState,
         policy: &PolicyState,
-        policy_bytes: &[u8],
         generation_key: &[u8; 32],
         manifest: Manifest,
     ) -> Result<(String, String)> {
-        self.storage
-            .put_object_if_absent(ObjectKind::Policy, &policy.id, policy_bytes)?;
+        policy.validate_successor(&current.policy)?;
         let manifest_id = self.commit_manifest(
             Some(current),
             policy,
@@ -300,6 +296,7 @@ impl<S: Storage> EncryptedRepository<S> {
             refs: next_refs,
             new_packs: vec![descriptor],
             predecessor_key_wrap: Some(predecessor_key_wrap),
+            introduced_policy: None,
         };
         let next_id = self.commit_manifest(
             Some(&current),
@@ -350,16 +347,13 @@ impl<S: Storage> EncryptedRepository<S> {
             bail!("only refs/heads/* destinations are supported")
         }
         git::ensure_repository(repo)?;
-        let current = self.current_state()?;
+        let chain = self.current_chain()?;
+        let current = chain.first().context("manifest chain is empty")?.clone();
         if !current.policy.is_active_writer(&self.key.device_id()?) {
             bail!("device is not an active writer")
         }
         if let Some(remote_name) = remote_name {
-            self.validate_remote_continuity(repo, remote_name, &current)?;
-        } else {
-            // Direct callers do not have a clone-local pin, so validate the
-            // complete signed and encrypted history before extending it.
-            self.walk_chain(current.clone(), None)?;
+            self.validate_remote_continuity(repo, remote_name, &chain)?;
         }
         let next_object = git::resolve_ref(repo, source_ref)?;
         if current.manifest.refs.get(destination_ref) == Some(&next_object) {
@@ -394,27 +388,28 @@ impl<S: Storage> EncryptedRepository<S> {
     pub fn observe_manifest(&self, repo: &Path, remote_name: &str) -> Result<Manifest> {
         git::ensure_repository(repo)?;
         validate_remote_name(remote_name)?;
-        let current = self.current_state()?;
+        let chain = self.current_chain()?;
+        let current = chain.first().context("manifest chain is empty")?.clone();
         let state_path = client_state_path(repo, remote_name)?;
         let state = read_client_state(&state_path)?;
-        self.validate_pinned_head(&current, &state)?;
+        self.validate_pinned_head(&chain, &state)?;
         write_observed_client_state(&state_path, state, &current.id, &current.manifest)?;
-        Ok(current.manifest)
+        Ok(current.manifest.clone())
     }
 
     pub fn import_packs(&self, repo: &Path, remote_name: &str) -> Result<Manifest> {
         git::ensure_repository(repo)?;
         validate_remote_name(remote_name)?;
-        let current = self.current_state()?;
+        let chain = self.current_chain()?;
+        let current = chain.first().context("manifest chain is empty")?.clone();
         let state_path = client_state_path(repo, remote_name)?;
         let state = read_client_state(&state_path)?;
-        self.validate_pinned_head(&current, &state)?;
+        self.validate_pinned_head(&chain, &state)?;
 
         let stop_generation = state.imported_generation;
-        let chain = self.walk_chain(current.clone(), stop_generation)?;
         let mut imported: HashSet<String> = state.packs.into_iter().collect();
         for entry in chain.iter().rev() {
-            if stop_generation == Some(entry.manifest.generation) {
+            if stop_generation.is_some_and(|generation| entry.manifest.generation <= generation) {
                 continue;
             }
             for descriptor in &entry.manifest.new_packs {
@@ -464,10 +459,10 @@ impl<S: Storage> EncryptedRepository<S> {
         &self,
         repo: &Path,
         remote_name: &str,
-        current: &OpenedState,
+        chain: &[OpenedState],
     ) -> Result<()> {
         let state = read_client_state(&client_state_path(repo, remote_name)?)?;
-        self.validate_pinned_head(current, &state)
+        self.validate_pinned_head(chain, &state)
     }
 
     fn pin_manifest(
@@ -482,7 +477,8 @@ impl<S: Storage> EncryptedRepository<S> {
         write_observed_client_state(&state_path, state, head_id, manifest)
     }
 
-    fn validate_pinned_head(&self, current: &OpenedState, state: &ClientState) -> Result<()> {
+    fn validate_pinned_head(&self, chain: &[OpenedState], state: &ClientState) -> Result<()> {
+        let current = chain.first().context("manifest chain is empty")?;
         if let Some(root) = &state.repository_root
             && root != &current.manifest.repository_root
         {
@@ -496,7 +492,6 @@ impl<S: Storage> EncryptedRepository<S> {
         let (Some(pinned_id), Some(pinned_generation)) =
             (state.head_id.as_deref(), state.generation)
         else {
-            self.walk_chain(current.clone(), None)?;
             return Ok(());
         };
         if current.manifest.generation < pinned_generation {
@@ -505,9 +500,9 @@ impl<S: Storage> EncryptedRepository<S> {
                 current.manifest.generation
             )
         }
-        let chain = self.walk_chain(current.clone(), Some(pinned_generation))?;
         let pinned = chain
-            .last()
+            .iter()
+            .find(|entry| entry.manifest.generation == pinned_generation)
             .context("remote manifest chain ended before pinned generation")?;
         if pinned.id != pinned_id {
             bail!("remote manifest history forked from the locally pinned head")
@@ -516,8 +511,8 @@ impl<S: Storage> EncryptedRepository<S> {
     }
 
     pub fn verify(&self) -> Result<Manifest> {
-        let current = self.current_state()?;
-        let chain = self.walk_chain(current.clone(), None)?;
+        let chain = self.current_chain()?;
+        let current = chain.first().context("manifest chain is empty")?;
         let mut count = 0_u64;
         for entry in chain.iter().rev() {
             for pack in &entry.manifest.new_packs {
@@ -547,137 +542,120 @@ impl<S: Storage> EncryptedRepository<S> {
         if count != current.manifest.total_pack_count {
             bail!("manifest delta log pack count mismatch")
         }
-        Ok(current.manifest)
+        Ok(current.manifest.clone())
     }
 
     pub fn current_manifest(&self) -> Result<(String, Manifest)> {
-        let current = self.current_state()?;
+        let current = self
+            .current_chain()?
+            .into_iter()
+            .next()
+            .context("manifest chain is empty")?;
         Ok((current.id, current.manifest))
     }
 
-    fn current_state(&self) -> Result<OpenedState> {
+    fn current_chain(&self) -> Result<Vec<OpenedState>> {
         let head = self
             .storage
             .read_head()?
             .context("encrypted repository is not initialized")?;
-        let (encrypted, header, policy, parent_policy) = self.read_manifest_material(&head)?;
-        let generation_key = unwrap_generation_key(&header, &self.key)?;
-        let manifest = open_manifest(&encrypted, &policy, parent_policy.as_ref(), &generation_key)?;
-        if manifest.generation == 0 {
-            manifest.validate_genesis(&policy)?;
-        }
-        Ok(OpenedState {
-            id: head,
-            manifest,
-            header,
-            policy,
-            generation_key,
-        })
-    }
-
-    fn walk_chain(
-        &self,
-        mut current: OpenedState,
-        stop_generation: Option<u64>,
-    ) -> Result<Vec<OpenedState>> {
-        let mut chain = Vec::new();
+        let (mut id, mut encrypted, mut header) = self.read_manifest_material(&head)?;
+        let mut generation_key = unwrap_generation_key(&header, &self.key)?;
+        let mut opened = open_manifest(&encrypted, &generation_key)?;
+        let mut unverified = Vec::new();
         let mut seen = HashSet::new();
-        let mut seen_pack_ids = HashSet::new();
+
         loop {
-            if !seen.insert(current.id.clone()) {
+            if !seen.insert(id.clone()) {
                 bail!("manifest chain contains a cycle")
             }
-            if stop_generation.is_some_and(|generation| current.manifest.generation < generation) {
-                bail!("manifest chain skipped below requested generation")
+            let Some(previous_id) = opened.manifest.previous.clone() else {
+                if opened.manifest.generation != 0 {
+                    bail!("manifest chain terminated above generation zero")
+                }
+                unverified.push((id, opened, generation_key));
+                break;
+            };
+            let (parent_id, parent_encrypted, parent_header) =
+                self.read_manifest_material(&previous_id)?;
+            let parent_key =
+                unwrap_predecessor_key(&generation_key, &opened.manifest, &parent_header)?;
+            unverified.push((id, opened, generation_key));
+            id = parent_id;
+            encrypted = parent_encrypted;
+            header = parent_header;
+            generation_key = parent_key;
+            opened = open_manifest(&encrypted, &generation_key)?;
+            if opened.header != header {
+                bail!("predecessor manifest header changed while opening")
             }
-            for pack in &current.manifest.new_packs {
+        }
+
+        let mut chain_oldest_first: Vec<OpenedState> = Vec::with_capacity(unverified.len());
+        let mut seen_pack_ids = HashSet::new();
+        for (index, (id, opened, generation_key)) in unverified.into_iter().rev().enumerate() {
+            let manifest = &opened.manifest;
+            for pack in &manifest.new_packs {
                 if !seen_pack_ids.insert(pack.id.clone()) {
                     bail!("manifest chain repeats pack {}", pack.id)
                 }
             }
-            let should_stop = stop_generation == Some(current.manifest.generation);
-            let is_genesis = current.manifest.generation == 0;
-            chain.push(current.clone());
-            if should_stop {
-                break;
-            }
-            if is_genesis {
-                if stop_generation.is_some() {
-                    bail!("manifest chain ended before requested generation")
-                }
-                current.manifest.validate_genesis(&current.policy)?;
-                break;
-            }
-
-            let previous_id = current
-                .manifest
-                .previous
-                .clone()
-                .context("manifest chain terminated above generation zero")?;
-            let (encrypted, previous_header, previous_policy, previous_parent_policy) =
-                self.read_manifest_material(&previous_id)?;
-            let previous_key = unwrap_predecessor_key(
-                &current.generation_key,
-                &current.manifest,
-                &previous_header,
-            )?;
-            let previous_manifest = open_manifest(
-                &encrypted,
-                &previous_policy,
-                previous_parent_policy.as_ref(),
-                &previous_key,
-            )?;
-            current.manifest.validate_successor(
-                &previous_id,
-                &previous_manifest,
-                &current.policy,
-            )?;
-            current = OpenedState {
-                id: previous_id,
-                manifest: previous_manifest,
-                header: previous_header,
-                policy: previous_policy,
-                generation_key: previous_key,
+            let (policy, parent_policy) = if index == 0 {
+                let policy_bytes = manifest
+                    .introduced_policy
+                    .as_deref()
+                    .context("genesis manifest is missing its introduced policy")?;
+                let policy = PolicyState::parse(policy_bytes)?;
+                policy.validate_genesis(&self.key.repository_root)?;
+                manifest.validate_genesis(&policy)?;
+                (policy, None)
+            } else {
+                let parent = chain_oldest_first
+                    .last()
+                    .context("manifest parent is missing")?;
+                let (policy, parent_policy) = match manifest.authorization {
+                    ManifestAuthorization::Writer => {
+                        if manifest.introduced_policy.is_some() {
+                            bail!("ordinary manifest unexpectedly introduces a policy")
+                        }
+                        (parent.policy.clone(), None)
+                    }
+                    ManifestAuthorization::PolicyTransition => {
+                        let bytes = manifest
+                            .introduced_policy
+                            .as_deref()
+                            .context("policy transition is missing its introduced policy")?;
+                        let policy = PolicyState::parse(bytes)?;
+                        policy.validate_successor(&parent.policy)?;
+                        (policy, Some(parent.policy.clone()))
+                    }
+                    ManifestAuthorization::Checkpoint => {
+                        bail!("checkpoint transitions are reserved but not implemented")
+                    }
+                };
+                manifest.validate_successor(&parent.id, &parent.manifest, &policy)?;
+                (policy, parent_policy)
             };
+            verify_manifest(&opened, &policy, parent_policy.as_ref(), &generation_key)?;
+            chain_oldest_first.push(OpenedState {
+                id,
+                manifest: opened.manifest,
+                header: opened.header,
+                policy,
+                generation_key,
+            });
         }
-        Ok(chain)
+        chain_oldest_first.reverse();
+        Ok(chain_oldest_first)
     }
 
-    fn read_manifest_material(
-        &self,
-        id: &str,
-    ) -> Result<(Vec<u8>, ManifestHeader, PolicyState, Option<PolicyState>)> {
+    fn read_manifest_material(&self, id: &str) -> Result<(String, Vec<u8>, ManifestHeader)> {
         let bytes = self.storage.get_object(ObjectKind::Manifest, id)?;
         if object_id(&bytes) != id {
             bail!("manifest ciphertext hash mismatch")
         }
-        let unverified = peek_manifest_header(&bytes)?;
-        let policy = self.read_policy(&unverified.policy_id)?;
-        let parent = match &policy.body.previous {
-            Some(parent_id) => Some(self.read_policy(parent_id)?),
-            None => None,
-        };
-        let header = read_manifest_header(&bytes, &policy, parent.as_ref())?;
-        Ok((bytes, header, policy, parent))
-    }
-
-    fn read_policy(&self, id: &str) -> Result<PolicyState> {
-        let bytes = self.storage.get_object(ObjectKind::Policy, id)?;
-        if object_id(&bytes) != id {
-            bail!("policy object hash mismatch")
-        }
-        let policy = PolicyState::parse(&bytes)?;
-        if policy.id != id {
-            bail!("policy id mismatch")
-        }
-        match &policy.body.previous {
-            Some(previous_id) => {
-                let parent = self.read_policy(previous_id)?;
-                policy.validate_successor(&parent)?;
-            }
-            None => policy.validate_genesis(&self.key.repository_root)?,
-        }
-        Ok(policy)
+        let header = peek_manifest_header(&bytes)?;
+        Ok((id.to_owned(), bytes, header))
     }
 
     fn commit_manifest(
@@ -706,15 +684,16 @@ impl<S: Storage> EncryptedRepository<S> {
         self.storage
             .put_object_if_absent(ObjectKind::Manifest, &id, &encrypted)?;
 
-        let header = read_manifest_header(&encrypted, policy, parent_policy)?;
-        let opened = open_manifest(&encrypted, policy, parent_policy, generation_key)?;
+        let opened = open_manifest(&encrypted, generation_key)?;
+        verify_manifest(&opened, policy, parent_policy, generation_key)?;
         if let Some(previous) = previous {
-            let recovered = unwrap_predecessor_key(generation_key, &opened, &previous.header)?;
+            let recovered =
+                unwrap_predecessor_key(generation_key, &opened.manifest, &previous.header)?;
             if *recovered != *previous.generation_key {
                 bail!("new manifest predecessor link did not recover the parent key")
             }
         }
-        if header.generation != manifest.generation {
+        if opened.header.generation != manifest.generation {
             bail!("new manifest self-check changed generation")
         }
         self.storage
@@ -726,6 +705,7 @@ impl<S: Storage> EncryptedRepository<S> {
 fn transition_manifest(
     current: &OpenedState,
     policy: &PolicyState,
+    policy_bytes: Vec<u8>,
     generation_key: &[u8; 32],
 ) -> Result<Manifest> {
     let generation = current.manifest.generation + 1;
@@ -747,6 +727,7 @@ fn transition_manifest(
             generation,
             &current.id,
         )?),
+        introduced_policy: Some(policy_bytes),
     })
 }
 
@@ -775,18 +756,13 @@ fn client_state_path(repo: &Path, remote_name: &str) -> Result<std::path::PathBu
 fn read_client_state(path: &Path) -> Result<ClientState> {
     match fs::read(path) {
         Ok(contents) => {
-            let mut state: ClientState =
+            let state: ClientState =
                 serde_json::from_slice(&contents).context("parse git-remote-e2ee client state")?;
-            if state.format_version > 4 {
+            if state.format_version != 5 {
                 bail!(
                     "unsupported git-remote-e2ee client state format {}",
                     state.format_version
                 )
-            }
-            // v2 client states used the observed generation as the import
-            // checkpoint because observation and import were one operation.
-            if state.format_version < 3 && state.imported_generation.is_none() {
-                state.imported_generation = state.generation;
             }
             Ok(state)
         }
@@ -805,7 +781,7 @@ fn write_client_state(
     let mut values: Vec<_> = values.iter().cloned().collect();
     values.sort();
     let state = ClientState {
-        format_version: 4,
+        format_version: 5,
         packs: values,
         head_id: Some(head_id.to_owned()),
         generation: Some(manifest.generation),
@@ -824,7 +800,7 @@ fn write_observed_client_state(
     manifest: &Manifest,
 ) -> Result<()> {
     let state = ClientState {
-        format_version: 4,
+        format_version: 5,
         packs: previous.packs,
         head_id: Some(head_id.to_owned()),
         generation: Some(manifest.generation),
@@ -871,7 +847,7 @@ pub(crate) fn testing_write_client_state(
         crate::persist::create_dir_all_durable(parent)?;
     }
     let state = ClientState {
-        format_version: 4,
+        format_version: 5,
         packs: Vec::new(),
         head_id: Some(head_id.to_owned()),
         generation: Some(generation),

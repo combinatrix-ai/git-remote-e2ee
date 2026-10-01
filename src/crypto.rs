@@ -17,16 +17,19 @@ use hpke::{Deserializable, Kem, OpModeR, OpModeS, Serializable};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use rand_09::{SeedableRng, rngs::StdRng};
+use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-const SYMMETRIC_MAGIC: &[u8; 8] = b"E2EES04\0";
-const PACK_STREAM_MAGIC: &[u8; 8] = b"E2EEPK4\0";
-const HPKE_INFO: &[u8] = b"git-remote-e2ee generation key v4";
-const KEY_COMMITMENT_DOMAIN: &[u8] = b"git-remote-e2ee generation key commitment v4\0";
-const SUBKEY_SALT: &[u8] = b"git-remote-e2ee subkey derivation v4\0";
+const SYMMETRIC_MAGIC: &[u8; 8] = b"E2EES05\0";
+const PACK_STREAM_MAGIC: &[u8; 8] = b"E2EEPK5\0";
+const HPKE_INFO: &[u8] = b"git-remote-e2ee generation key v5";
+const KEY_COMMITMENT_DOMAIN: &[u8] = b"git-remote-e2ee generation key commitment v5\0";
+const SUBKEY_SALT: &[u8] = b"git-remote-e2ee subkey derivation v5\0";
+pub const HPKE_ENCAPSULATED_KEY_SIZE: usize = 32;
+pub const HPKE_CIPHERTEXT_SIZE: usize = 32 + 16;
 pub const PACK_STREAM_CHUNK_SIZE: usize = 1024 * 1024;
 const PACK_STREAM_NONCE_SIZE: usize = 19;
 const PACK_STREAM_TAG_SIZE: usize = 16;
@@ -44,6 +47,7 @@ pub enum SubkeyKind {
     ManifestBody = 1,
     Pack = 2,
     PredecessorLink = 3,
+    SealedHeader = 4,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,10 +241,25 @@ pub fn wrap_generation_key(
     generation_key: &[u8; 32],
     aad: &[u8],
 ) -> Result<(Vec<u8>, Vec<u8>)> {
+    wrap_generation_key_with_seed(public_key, generation_key, aad, &random_seed())
+}
+
+pub fn random_seed() -> [u8; 32] {
+    let mut seed = [0_u8; 32];
+    OsRng.fill_bytes(&mut seed);
+    seed
+}
+
+pub fn wrap_generation_key_with_seed(
+    public_key: &str,
+    generation_key: &[u8; 32],
+    aad: &[u8],
+    seed: &[u8; 32],
+) -> Result<(Vec<u8>, Vec<u8>)> {
     let public_bytes = BASE64.decode(public_key)?;
     let public = <HpkeKem as Kem>::PublicKey::from_bytes(&public_bytes)
         .map_err(|_| anyhow::anyhow!("invalid HPKE public key"))?;
-    let mut rng = StdRng::from_os_rng();
+    let mut rng = ChaCha20Rng::from_seed(*seed);
     let (encapsulated, ciphertext) = hpke::single_shot_seal::<HpkeAead, HpkeKdf, HpkeKem, _>(
         &OpModeS::Base,
         &public,
@@ -379,7 +398,7 @@ impl<W: Write> Write for DigestWriter<W> {
 }
 
 fn pack_stream_aad(base_aad: &[u8], header: &[u8]) -> Vec<u8> {
-    let mut aad = b"git-remote-e2ee pack stream v4\0".to_vec();
+    let mut aad = b"git-remote-e2ee pack stream v5\0".to_vec();
     aad.extend_from_slice(&(base_aad.len() as u32).to_le_bytes());
     aad.extend_from_slice(base_aad);
     aad.extend_from_slice(&(header.len() as u32).to_le_bytes());
@@ -816,7 +835,7 @@ mod tests {
         );
 
         let mut legacy = ciphertext;
-        legacy[..PACK_STREAM_MAGIC.len()].copy_from_slice(b"E2EEPK3\0");
+        legacy[..PACK_STREAM_MAGIC.len()].copy_from_slice(b"E2EEPK4\0");
         assert!(open_test_pack(&key, &legacy, sealed.plaintext_size, &sealed.object_id).is_err());
     }
 

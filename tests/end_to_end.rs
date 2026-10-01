@@ -5,7 +5,7 @@ use std::process::Command;
 use git_remote_e2ee::crypto::{KeyFile, object_id, random_key};
 use git_remote_e2ee::manifest::{
     Manifest, ManifestAuthorization, open_manifest, peek_manifest_header, seal_manifest,
-    unwrap_generation_key, wrap_predecessor_key,
+    unwrap_generation_key, verify_manifest, wrap_predecessor_key,
 };
 use git_remote_e2ee::policy::PolicyState;
 use git_remote_e2ee::repository::EncryptedRepository;
@@ -157,11 +157,12 @@ fn returning_client_rejects_signed_ref_advance_without_its_pack() {
         .to_owned();
     let manifest_bytes = read_stored_object(&remote, "manifests", &head);
     let header = peek_manifest_header(&manifest_bytes).unwrap();
-    let policy_bytes = read_stored_object(&remote, "policies", &header.policy_id);
-    let policy = PolicyState::parse(&policy_bytes).unwrap();
+    let (policy, _) = PolicyState::genesis(&key).unwrap();
     policy.validate_genesis(&key.repository_root).unwrap();
     let current_key = unwrap_generation_key(&header, &key).unwrap();
-    let current = open_manifest(&manifest_bytes, &policy, None, &current_key).unwrap();
+    let current = open_manifest(&manifest_bytes, &current_key).unwrap();
+    verify_manifest(&current, &policy, None, &current_key).unwrap();
+    let current = current.manifest().clone();
 
     let next_key = random_key();
     let generation = current.generation + 1;
@@ -188,6 +189,7 @@ fn returning_client_rejects_signed_ref_advance_without_its_pack() {
             )
             .unwrap(),
         ),
+        introduced_policy: None,
     };
     let malicious_bytes = seal_manifest(
         &key,
@@ -440,17 +442,7 @@ fn rejects_same_generation_manifest_fork_after_fetch_pins_history() {
     let fork = EncryptedRepository::new(FilesystemStorage::new(&fork_path), key);
     fork.initialize().unwrap();
     let fork_head = fork.push_ref(&source, "refs/heads/main", false).unwrap();
-    let fork_manifest = fork_path
-        .join("manifests")
-        .join(&fork_head[..2])
-        .join(&fork_head);
-    let remote_manifest = remote_path
-        .join("manifests")
-        .join(&fork_head[..2])
-        .join(&fork_head);
-    fs::create_dir_all(remote_manifest.parent().unwrap()).unwrap();
-    fs::copy(fork_manifest, remote_manifest).unwrap();
-    copy_tree(&fork_path.join("policies"), &remote_path.join("policies"));
+    copy_tree(&fork_path.join("manifests"), &remote_path.join("manifests"));
     fs::write(remote_path.join("HEAD"), format!("{fork_head}\n")).unwrap();
 
     let error = encrypted.fetch_into(&destination, "encrypted").unwrap_err();
@@ -576,7 +568,7 @@ fn init_with_relative_storage_creates_the_store_in_the_child_cwd() {
     );
     assert!(work.join("relative-store/objects").is_dir());
     assert!(work.join("relative-store/manifests").is_dir());
-    assert!(work.join("relative-store/policies").is_dir());
+    assert!(!work.join("relative-store/policies").exists());
     assert!(!root.path().join("relative-store").exists());
 }
 
