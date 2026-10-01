@@ -225,6 +225,19 @@ impl<S: Storage> EncryptedRepository<S> {
         self.push_update_inner(repo, Some(remote_name), source_ref, destination_ref, force)
     }
 
+    pub fn delete_ref(&self, repo: &Path, destination_ref: &str) -> Result<String> {
+        self.change_ref_inner(repo, None, None, destination_ref, false)
+    }
+
+    pub fn delete_ref_for_remote(
+        &self,
+        repo: &Path,
+        remote_name: &str,
+        destination_ref: &str,
+    ) -> Result<String> {
+        self.change_ref_inner(repo, Some(remote_name), None, destination_ref, false)
+    }
+
     fn push_update_inner(
         &self,
         repo: &Path,
@@ -233,50 +246,73 @@ impl<S: Storage> EncryptedRepository<S> {
         destination_ref: &str,
         force: bool,
     ) -> Result<String> {
+        self.change_ref_inner(repo, remote_name, Some(source_ref), destination_ref, force)
+    }
+
+    fn change_ref_inner(
+        &self,
+        repo: &Path,
+        remote_name: Option<&str>,
+        source_ref: Option<&str>,
+        destination_ref: &str,
+        force: bool,
+    ) -> Result<String> {
         let (current, next_object, non_fast_forward) =
-            self.preflight_push(repo, remote_name, source_ref, destination_ref, force)?;
-        if current.manifest.refs.get(destination_ref) == Some(&next_object) {
+            self.preflight_ref_change(repo, remote_name, source_ref, destination_ref, force)?;
+        if next_object
+            .as_ref()
+            .is_some_and(|next| current.manifest.refs.get(destination_ref) == Some(next))
+        {
             return Ok(current.id);
         }
 
         let mut next_refs = current.manifest.refs.clone();
-        next_refs.insert(destination_ref.to_owned(), next_object.clone());
-        let mut exclusions = BTreeMap::new();
-        if !non_fast_forward {
-            for (reference, object) in &current.manifest.refs {
-                if git::object_exists(repo, object)? {
-                    exclusions.insert(reference.clone(), object.clone());
-                }
-            }
+        if let Some(next_object) = &next_object {
+            next_refs.insert(destination_ref.to_owned(), next_object.clone());
+        } else {
+            next_refs.remove(destination_ref);
         }
-        let pack_refs = BTreeMap::from([(destination_ref.to_owned(), next_object)]);
 
         let next_key = random_key();
         let generation = current.manifest.generation + 1;
-        let ordinal = 0;
-        let pack_key = derive_subkey(
-            &next_key,
-            &current.manifest.repository_root,
-            generation,
-            SubkeyKind::Pack,
-            ordinal,
-        )?;
-        let mut pack_source = git::start_incremental_pack(repo, &pack_refs, &exclusions)?;
-        let mut pack_stage = self.storage.begin_object(ObjectKind::Pack)?;
-        let sealed = seal_pack_stream(
-            &pack_key,
-            &mut pack_source,
-            &mut pack_stage,
-            &pack_aad(&current.manifest.repository_root, generation, ordinal),
-        )?;
-        pack_source.finish()?;
-        pack_stage.finish(&sealed.object_id)?;
-        let descriptor = PackDescriptor {
-            id: sealed.object_id,
-            plaintext_size: sealed.plaintext_size,
-            generation,
-            ordinal,
-        };
+        let mut new_packs = Vec::new();
+        let mut total_pack_count = current.manifest.total_pack_count;
+        if let Some(next_object) = next_object {
+            let mut exclusions = BTreeMap::new();
+            if !non_fast_forward {
+                for (reference, object) in &current.manifest.refs {
+                    if git::object_exists(repo, object)? {
+                        exclusions.insert(reference.clone(), object.clone());
+                    }
+                }
+            }
+            let pack_refs = BTreeMap::from([(destination_ref.to_owned(), next_object)]);
+            let ordinal = 0;
+            let pack_key = derive_subkey(
+                &next_key,
+                &current.manifest.repository_root,
+                generation,
+                SubkeyKind::Pack,
+                ordinal,
+            )?;
+            let mut pack_source = git::start_incremental_pack(repo, &pack_refs, &exclusions)?;
+            let mut pack_stage = self.storage.begin_object(ObjectKind::Pack)?;
+            let sealed = seal_pack_stream(
+                &pack_key,
+                &mut pack_source,
+                &mut pack_stage,
+                &pack_aad(&current.manifest.repository_root, generation, ordinal),
+            )?;
+            pack_source.finish()?;
+            pack_stage.finish(&sealed.object_id)?;
+            new_packs.push(PackDescriptor {
+                id: sealed.object_id,
+                plaintext_size: sealed.plaintext_size,
+                generation,
+                ordinal,
+            });
+            total_pack_count += 1;
+        }
         let predecessor_key_wrap = wrap_predecessor_key(
             &next_key,
             &current.generation_key,
@@ -292,9 +328,9 @@ impl<S: Storage> EncryptedRepository<S> {
             policy_id: current.policy.id.clone(),
             policy_generation: current.policy.body.generation,
             authorization: ManifestAuthorization::Writer,
-            total_pack_count: current.manifest.total_pack_count + 1,
+            total_pack_count,
             refs: next_refs,
-            new_packs: vec![descriptor],
+            new_packs,
             predecessor_key_wrap: Some(predecessor_key_wrap),
             introduced_policy: None,
         };
@@ -319,7 +355,7 @@ impl<S: Storage> EncryptedRepository<S> {
         destination_ref: &str,
         force: bool,
     ) -> Result<()> {
-        self.preflight_push(repo, None, source_ref, destination_ref, force)?;
+        self.preflight_ref_change(repo, None, Some(source_ref), destination_ref, force)?;
         Ok(())
     }
 
@@ -331,22 +367,36 @@ impl<S: Storage> EncryptedRepository<S> {
         destination_ref: &str,
         force: bool,
     ) -> Result<()> {
-        self.preflight_push(repo, Some(remote_name), source_ref, destination_ref, force)?;
+        self.preflight_ref_change(
+            repo,
+            Some(remote_name),
+            Some(source_ref),
+            destination_ref,
+            force,
+        )?;
         Ok(())
     }
 
-    fn preflight_push(
+    pub fn validate_delete_ref_for_remote(
+        &self,
+        repo: &Path,
+        remote_name: &str,
+        destination_ref: &str,
+    ) -> Result<()> {
+        self.preflight_ref_change(repo, Some(remote_name), None, destination_ref, false)?;
+        Ok(())
+    }
+
+    fn preflight_ref_change(
         &self,
         repo: &Path,
         remote_name: Option<&str>,
-        source_ref: &str,
+        source_ref: Option<&str>,
         destination_ref: &str,
         force: bool,
-    ) -> Result<(OpenedState, String, bool)> {
-        if !destination_ref.starts_with("refs/heads/") {
-            bail!("only refs/heads/* destinations are supported")
-        }
+    ) -> Result<(OpenedState, Option<String>, bool)> {
         git::ensure_repository(repo)?;
+        let ref_kind = git::validate_inner_ref(repo, destination_ref)?;
         let chain = self.current_chain()?;
         let current = chain.first().context("manifest chain is empty")?.clone();
         let device_id = self.key.device_id()?;
@@ -364,11 +414,31 @@ impl<S: Storage> EncryptedRepository<S> {
         if let Some(remote_name) = remote_name {
             self.validate_remote_continuity(repo, remote_name, &chain)?;
         }
+        let old_object = current.manifest.refs.get(destination_ref);
+        let Some(source_ref) = source_ref else {
+            if old_object.is_none() {
+                bail!("remote ref {destination_ref} does not exist")
+            }
+            if destination_ref == "refs/heads/main" {
+                bail!(
+                    "cannot delete refs/heads/main because it is advertised as the remote default branch"
+                )
+            }
+            return Ok((current, None, false));
+        };
+
         let next_object = git::resolve_ref(repo, source_ref)?;
-        if current.manifest.refs.get(destination_ref) == Some(&next_object) {
-            return Ok((current, next_object, false));
+        if old_object == Some(&next_object) {
+            return Ok((current, Some(next_object), false));
         }
-        let non_fast_forward = if let Some(old_object) = current.manifest.refs.get(destination_ref)
+        if ref_kind == git::InnerRefKind::Branch {
+            git::ensure_branch_target(repo, destination_ref, &next_object)?;
+        }
+        if ref_kind == git::InnerRefKind::Tag && old_object.is_some() && !force {
+            bail!("tag {destination_ref} already exists; use --force to move it")
+        }
+        let non_fast_forward = if ref_kind == git::InnerRefKind::Branch
+            && let Some(old_object) = old_object
         {
             if !git::object_exists(repo, old_object)? {
                 bail!("remote tip for {destination_ref} is missing locally; fetch first")
@@ -380,16 +450,19 @@ impl<S: Storage> EncryptedRepository<S> {
         if non_fast_forward && !force {
             bail!("non-fast-forward update rejected for {destination_ref}")
         }
-        Ok((current, next_object, non_fast_forward))
+        Ok((current, Some(next_object), non_fast_forward))
     }
 
     pub fn fetch_into(&self, repo: &Path, remote_name: &str) -> Result<Manifest> {
         let manifest = self.import_packs(repo, remote_name)?;
         for (reference, object) in &manifest.refs {
-            let short = reference
-                .strip_prefix("refs/heads/")
-                .with_context(|| format!("unsupported remote ref {reference}"))?;
-            git::update_ref(repo, &format!("refs/remotes/{remote_name}/{short}"), object)?;
+            match git::validate_inner_ref(repo, reference)? {
+                git::InnerRefKind::Branch => {
+                    let short = reference.strip_prefix("refs/heads/").unwrap();
+                    git::update_ref(repo, &format!("refs/remotes/{remote_name}/{short}"), object)?;
+                }
+                git::InnerRefKind::Tag => git::update_ref(repo, reference, object)?,
+            }
         }
         Ok(manifest)
     }
@@ -399,6 +472,9 @@ impl<S: Storage> EncryptedRepository<S> {
         validate_remote_name(remote_name)?;
         let chain = self.current_chain()?;
         let current = chain.first().context("manifest chain is empty")?.clone();
+        for reference in current.manifest.refs.keys() {
+            git::validate_inner_ref(repo, reference)?;
+        }
         let state_path = client_state_path(repo, remote_name)?;
         let state = read_client_state(&state_path)?;
         self.validate_pinned_head(&chain, &state)?;
@@ -411,6 +487,9 @@ impl<S: Storage> EncryptedRepository<S> {
         validate_remote_name(remote_name)?;
         let chain = self.current_chain()?;
         let current = chain.first().context("manifest chain is empty")?.clone();
+        for reference in current.manifest.refs.keys() {
+            git::validate_inner_ref(repo, reference)?;
+        }
         let state_path = client_state_path(repo, remote_name)?;
         let state = read_client_state(&state_path)?;
         self.validate_pinned_head(&chain, &state)?;

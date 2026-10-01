@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -20,6 +20,41 @@ pub fn ensure_repository(repo: &Path) -> Result<()> {
 
 pub fn resolve_ref(repo: &Path, reference: &str) -> Result<String> {
     git_text(repo, &["rev-parse", "--verify", reference])
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InnerRefKind {
+    Branch,
+    Tag,
+}
+
+pub fn validate_inner_ref(repo: &Path, reference: &str) -> Result<InnerRefKind> {
+    let kind = if reference.starts_with("refs/heads/") {
+        InnerRefKind::Branch
+    } else if reference.starts_with("refs/tags/") {
+        InnerRefKind::Tag
+    } else {
+        bail!(
+            "unsupported ref namespace for {reference}; only refs/heads/* and refs/tags/* are supported"
+        )
+    };
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["check-ref-format", reference])
+        .output()?;
+    if !output.status.success() {
+        bail!("invalid Git ref name {reference}")
+    }
+    Ok(kind)
+}
+
+pub fn ensure_branch_target(repo: &Path, reference: &str, object: &str) -> Result<()> {
+    let target = resolve_tag_chain(repo, reference, object, "pushed")?;
+    if target.kind != "commit" {
+        bail!("branch ref {reference} must resolve to a commit")
+    }
+    Ok(())
 }
 
 pub fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
@@ -211,15 +246,18 @@ pub fn ensure_refs_connected_since(
     if refs.is_empty() {
         return Ok(());
     }
+    let mut commit_roots = Vec::new();
+    let mut verified_commit_roots = Vec::new();
     for (reference, object) in refs {
-        let expression = format!("{object}^{{commit}}");
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(["cat-file", "-e", &expression])
-            .output()?;
-        if !output.status.success() {
-            bail!("fetched ref {reference} does not resolve to a complete commit")
+        let ref_kind = validate_inner_ref(repo, reference)?;
+        let target = resolve_tag_chain(repo, reference, object, "fetched")?;
+        match target.kind.as_str() {
+            "commit" => commit_roots.push(target.oid),
+            "tree" if ref_kind == InnerRefKind::Tag => {
+                ensure_tree_connected(repo, reference, &target.oid)?
+            }
+            "blob" if ref_kind == InnerRefKind::Tag => {}
+            _ => bail!("fetched ref {reference} does not resolve to a supported Git object"),
         }
     }
 
@@ -229,28 +267,32 @@ pub fn ensure_refs_connected_since(
     // reachable beyond that frontier. Still require the frontier tips to be
     // present locally so corruption or an unexpected local prune fails closed.
     for (reference, object) in verified_refs {
-        let expression = format!("{object}^{{commit}}");
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(["cat-file", "-e", &expression])
-            .output()?;
-        if !output.status.success() {
-            bail!("verified ref {reference} is missing locally")
+        let ref_kind = validate_inner_ref(repo, reference)?;
+        let target = resolve_tag_chain(repo, reference, object, "verified")?;
+        match target.kind.as_str() {
+            "commit" => verified_commit_roots.push(target.oid),
+            "tree" if ref_kind == InnerRefKind::Tag => {
+                ensure_tree_connected(repo, reference, &target.oid)?
+            }
+            "blob" if ref_kind == InnerRefKind::Tag => {}
+            _ => bail!("verified ref {reference} does not resolve to a supported Git object"),
         }
     }
 
+    if commit_roots.is_empty() {
+        return Ok(());
+    }
     let mut command = Command::new("git");
     command
         .arg("-C")
         .arg(repo)
         .args(["rev-list", "--objects", "--missing=print"]);
-    for object in refs.values() {
+    for object in &commit_roots {
         command.arg(object);
     }
-    if !verified_refs.is_empty() {
+    if !verified_commit_roots.is_empty() {
         command.arg("--not");
-        for object in verified_refs.values() {
+        for object in &verified_commit_roots {
             command.arg(object);
         }
     }
@@ -266,6 +308,94 @@ pub fn ensure_refs_connected_since(
         .any(|line| line.starts_with('?'))
     {
         bail!("fetched refs contain missing Git objects")
+    }
+    Ok(())
+}
+
+struct RefTarget {
+    oid: String,
+    kind: String,
+}
+
+fn resolve_tag_chain(repo: &Path, reference: &str, object: &str, label: &str) -> Result<RefTarget> {
+    let mut current = object.to_owned();
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(current.clone()) {
+            bail!("{label} ref {reference} contains a cyclic tag chain")
+        }
+        let kind = match cat_file_type(repo, &current) {
+            Ok(kind) => kind,
+            Err(_) if label == "verified" => {
+                bail!("verified ref {reference} is missing locally")
+            }
+            Err(_) => {
+                bail!("fetched ref {reference} does not resolve to a complete Git object graph")
+            }
+        };
+        if kind != "tag" {
+            return Ok(RefTarget { oid: current, kind });
+        }
+        let body = git_text(repo, &["cat-file", "-p", &current])?;
+        let mut target = None;
+        let mut target_kind = None;
+        for line in body.lines().take_while(|line| !line.is_empty()) {
+            if let Some(value) = line.strip_prefix("object ") {
+                target = Some(value);
+            } else if let Some(value) = line.strip_prefix("type ") {
+                target_kind = Some(value);
+            }
+        }
+        let target = target.context("annotated tag is missing its target object")?;
+        let expected_kind = target_kind.context("annotated tag is missing its target type")?;
+        if cat_file_type(repo, target)? != expected_kind {
+            bail!("annotated tag {reference} has a mismatched target type")
+        }
+        current = target.to_owned();
+    }
+}
+
+fn cat_file_type(repo: &Path, object: &str) -> Result<String> {
+    git_text(repo, &["cat-file", "-t", object])
+}
+
+fn ensure_tree_connected(repo: &Path, reference: &str, tree: &str) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["ls-tree", "-r", "-t", "-z", "--full-tree", tree])
+        .output()?;
+    if !output.status.success() {
+        bail!("fetched tag {reference} contains an incomplete tree")
+    }
+    for entry in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let header = entry
+            .split(|byte| *byte == b'\t')
+            .next()
+            .context("Git ls-tree returned a malformed entry")?;
+        let header = std::str::from_utf8(header)?;
+        let mut fields = header.split_ascii_whitespace();
+        let mode = fields
+            .next()
+            .context("Git ls-tree returned an entry without a mode")?;
+        let _kind = fields
+            .next()
+            .context("Git ls-tree returned an entry without an object type")?;
+        let object = fields
+            .next()
+            .context("Git ls-tree returned an entry without an object ID")?;
+        if mode == "160000" {
+            // A gitlink names a submodule commit that belongs to another
+            // object database and is not part of this tree's connectivity.
+            continue;
+        }
+        if cat_file_type(repo, object).is_err() {
+            bail!("fetched tag {reference} contains missing Git object {object}")
+        }
     }
     Ok(())
 }

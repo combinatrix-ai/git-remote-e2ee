@@ -1,7 +1,12 @@
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier};
+use std::thread;
 
+use anyhow::Result;
 use git_remote_e2ee::crypto::{KeyFile, object_id, random_key};
 use git_remote_e2ee::manifest::{
     Manifest, ManifestAuthorization, open_manifest, peek_manifest_header, seal_manifest,
@@ -9,7 +14,37 @@ use git_remote_e2ee::manifest::{
 };
 use git_remote_e2ee::policy::PolicyState;
 use git_remote_e2ee::repository::EncryptedRepository;
-use git_remote_e2ee::storage::FilesystemStorage;
+use git_remote_e2ee::storage::{FilesystemStorage, ObjectKind, ObjectStage, Storage};
+
+#[derive(Clone)]
+struct BarrierStorage {
+    inner: FilesystemStorage,
+    armed: Arc<AtomicBool>,
+    reads: Arc<AtomicUsize>,
+    barrier: Arc<Barrier>,
+}
+
+impl Storage for BarrierStorage {
+    fn begin_object(&self, kind: ObjectKind) -> Result<Box<dyn ObjectStage>> {
+        self.inner.begin_object(kind)
+    }
+
+    fn open_object(&self, kind: ObjectKind, id: &str) -> Result<Box<dyn Read + Send>> {
+        self.inner.open_object(kind, id)
+    }
+
+    fn read_head(&self) -> Result<Option<String>> {
+        let head = self.inner.read_head()?;
+        if self.armed.load(Ordering::SeqCst) && self.reads.fetch_add(1, Ordering::SeqCst) < 2 {
+            self.barrier.wait();
+        }
+        Ok(head)
+    }
+
+    fn compare_and_swap_head(&self, expected: Option<&str>, next: &str) -> Result<()> {
+        self.inner.compare_and_swap_head(expected, next)
+    }
+}
 
 fn git(repo: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -513,7 +548,67 @@ fn writer_can_add_branch_without_having_other_remote_branch_objects() {
 }
 
 #[test]
-fn rejects_tag_destinations_consistently() {
+fn deletion_and_tag_publication_race_with_exactly_one_cas_winner() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let remote = temporary.path().join("remote");
+    initialize_git(&source);
+    let key = KeyFile::generate();
+    let seed_repository = EncryptedRepository::new(FilesystemStorage::new(&remote), key.clone());
+    seed_repository.initialize().unwrap();
+    let main = commit(&source, "main\n", "main");
+    seed_repository
+        .push_ref(&source, "refs/heads/main", false)
+        .unwrap();
+    git(&source, &["branch", "doomed", &main]);
+    seed_repository
+        .push_ref(&source, "refs/heads/doomed", false)
+        .unwrap();
+    git(&source, &["tag", "race-tag", &main]);
+    let before = seed_repository.verify().unwrap();
+
+    let storage = BarrierStorage {
+        inner: FilesystemStorage::new(&remote),
+        armed: Arc::new(AtomicBool::new(true)),
+        reads: Arc::new(AtomicUsize::new(0)),
+        barrier: Arc::new(Barrier::new(2)),
+    };
+    let deleter = EncryptedRepository::new(storage.clone(), key.clone());
+    let tagger = EncryptedRepository::new(storage, key);
+    let deletion_repo = source.clone();
+    let tag_repo = source.clone();
+    let deletion = thread::spawn(move || deleter.delete_ref(&deletion_repo, "refs/heads/doomed"));
+    let tag_push = thread::spawn(move || {
+        tagger.push_update(&tag_repo, "refs/tags/race-tag", "refs/tags/race-tag", false)
+    });
+    let deletion = deletion.join().unwrap();
+    let tag_push = tag_push.join().unwrap();
+    assert_ne!(deletion.is_ok(), tag_push.is_ok());
+    let loser = if deletion.is_err() {
+        deletion
+    } else {
+        tag_push
+    };
+    assert!(
+        loser
+            .unwrap_err()
+            .to_string()
+            .contains("head changed concurrently")
+    );
+
+    let after = seed_repository.verify().unwrap();
+    assert_eq!(after.generation, before.generation + 1);
+    let deletion_won = !after.refs.contains_key("refs/heads/doomed");
+    let tag_push_won = after.refs.contains_key("refs/tags/race-tag");
+    assert_ne!(deletion_won, tag_push_won);
+    assert_eq!(
+        after.total_pack_count,
+        before.total_pack_count + u64::from(tag_push_won)
+    );
+}
+
+#[test]
+fn rejects_unsupported_ref_namespaces_consistently() {
     let temporary = tempfile::tempdir().unwrap();
     let source = temporary.path().join("source");
     let remote_path = temporary.path().join("remote");
@@ -523,12 +618,10 @@ fn rejects_tag_destinations_consistently() {
     let encrypted = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key);
     encrypted.initialize().unwrap();
     commit(&source, "tagged\n", "tagged");
-    git(&source, &["tag", "v1"]);
-
     let error = encrypted
-        .push_update(&source, "refs/tags/v1", "refs/tags/v1", false)
+        .push_update(&source, "refs/heads/main", "refs/notes/review", false)
         .unwrap_err();
-    assert!(error.to_string().contains("only refs/heads"));
+    assert!(error.to_string().contains("unsupported ref namespace"));
     assert_eq!(encrypted.verify().unwrap().generation, 0);
 }
 
