@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
@@ -8,6 +8,7 @@ use fs2::FileExt;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::crypto::{
     KeyFile, PublicDevice, SecretKey, SubkeyKind, derive_subkey, object_id, open_pack_stream,
@@ -20,7 +21,72 @@ use crate::manifest::{
     verify_manifest, wrap_predecessor_key,
 };
 use crate::policy::{DeviceRecord, DeviceRoles, PolicyState};
-use crate::storage::{ObjectKind, Storage};
+use crate::storage::{HeadObservation, ObjectKind, Storage};
+
+const MAX_RECOVERY_OUTER_COMMITS: usize = 2048;
+const MAX_RECOVERY_CANDIDATES: usize = 256;
+const MAX_RECOVERY_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_RECOVERY_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_RECOVERY_CRYPTO_OPERATIONS: u64 = 1_000_000;
+const MAX_REJECTED_HEADS: usize = 16;
+const STALE_FLOOR_WARNING: &str = "Updates after this floor may be omitted. This may also omit revocations and disclose subsequently published content to devices excluded by a newer policy.";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryClass {
+    Valid,
+    Invalid,
+    Unverifiable,
+    Unsupported,
+    Unavailable,
+    Discontinuous,
+}
+
+impl RecoveryClass {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Valid => "valid",
+            Self::Invalid => "invalid",
+            Self::Unverifiable => "unverifiable",
+            Self::Unsupported => "unsupported",
+            Self::Unavailable => "unavailable",
+            Self::Discontinuous => "discontinuous",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RecoveryCandidate {
+    pub manifest_id: String,
+    pub generation: u64,
+    pub outer_commit: Option<String>,
+    pub verified_signer: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct RecoveryReport {
+    pub classification: RecoveryClass,
+    pub reason: String,
+    pub head_id: Option<String>,
+    pub claimed_signer: Option<String>,
+    pub floor_id: Option<String>,
+    pub floor_generation: Option<u64>,
+    pub candidates: Vec<RecoveryCandidate>,
+    pub default_base: Option<String>,
+    pub replays: Vec<String>,
+    pub conflict: bool,
+    pub freshness_unverified: bool,
+    pub warning: Option<String>,
+    pub blocked_reason: Option<String>,
+    pub published_manifest: Option<String>,
+}
+
+pub struct RecoveryOptions<'a> {
+    pub publish: bool,
+    pub base: Option<&'a str>,
+    pub discard_newer: bool,
+    pub accept_stale_floor: bool,
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct ClientState {
@@ -49,10 +115,45 @@ struct OpenedState {
     header: ManifestHeader,
     policy: PolicyState,
     generation_key: SecretKey,
+    verified_signer: String,
+}
+
+struct CommitHead<'a> {
+    previous: Option<&'a OpenedState>,
+    observation: Option<&'a HeadObservation>,
 }
 
 struct ClientStateLock {
     _file: File,
+}
+
+struct RecoveryBudget {
+    crypto_operations: u64,
+    bytes_read: u64,
+}
+
+impl RecoveryBudget {
+    fn charge_manifest(&mut self, header: &ManifestHeader, byte_count: usize) -> Result<()> {
+        self.bytes_read = self
+            .bytes_read
+            .checked_add(byte_count as u64)
+            .context("recovery byte budget overflow")?;
+        if self.bytes_read > MAX_RECOVERY_BYTES {
+            bail!("recovery manifest byte budget exhausted")
+        }
+        let operations = (header.generation_key_envelopes.len() as u64)
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(1))
+            .context("recovery crypto budget overflow")?;
+        self.crypto_operations = self
+            .crypto_operations
+            .checked_add(operations)
+            .context("recovery crypto budget overflow")?;
+        if self.crypto_operations > MAX_RECOVERY_CRYPTO_OPERATIONS {
+            bail!("recovery cryptographic-operation budget exhausted")
+        }
+        Ok(())
+    }
 }
 
 impl ClientStateLock {
@@ -720,12 +821,602 @@ impl<S: Storage> EncryptedRepository<S> {
         Ok((current.id, current.manifest))
     }
 
+    pub fn recover(
+        &self,
+        repo: &Path,
+        remote_name: &str,
+        options: RecoveryOptions<'_>,
+    ) -> Result<RecoveryReport> {
+        git::ensure_repository(repo)?;
+        validate_remote_name(remote_name)?;
+        let state_path = client_state_path(repo, remote_name)?;
+        let _state_lock = ClientStateLock::acquire(&state_path)?;
+        let state = read_client_state(&state_path)?;
+        let mut report = RecoveryReport {
+            classification: RecoveryClass::Unavailable,
+            reason: "could not read the storage head".to_owned(),
+            head_id: None,
+            claimed_signer: None,
+            floor_id: state.head_id.clone(),
+            floor_generation: state.generation,
+            candidates: Vec::new(),
+            default_base: None,
+            replays: Vec::new(),
+            conflict: false,
+            freshness_unverified: state.head_id.is_none() || state.generation.is_none(),
+            warning: None,
+            blocked_reason: None,
+            published_manifest: None,
+        };
+        let observation = match self.storage.observe_head() {
+            Ok(observation) => observation,
+            Err(error) => {
+                if format!("{error:#}").contains("budget exhausted") {
+                    return Err(error).context("bounded recovery discovery failed");
+                }
+                report.reason = format!("storage head is unavailable: {error:#}");
+                if options.publish {
+                    report.blocked_reason = Some(report.reason.clone());
+                }
+                return Ok(report);
+            }
+        };
+        report.head_id = observation.head_id.clone();
+        let mut budget = RecoveryBudget {
+            crypto_operations: 0,
+            bytes_read: 0,
+        };
+        let current_chain = match observation.head_id.as_deref() {
+            Some(head) => self.chain_from(
+                head,
+                &mut |id| self.read_manifest_material(id),
+                Some(&mut budget),
+            ),
+            None if observation.head_bytes.is_some() => Err(anyhow::anyhow!(
+                "storage HEAD is not a valid manifest object ID"
+            )),
+            None => Err(anyhow::anyhow!("encrypted repository has no storage HEAD")),
+        };
+        match current_chain {
+            Ok(chain) => {
+                report.claimed_signer = chain.first().map(|entry| entry.verified_signer.clone());
+                if state.head_id.is_some() && state.generation.is_some() {
+                    match self.validate_pinned_head(&chain, &state) {
+                        Ok(()) => match self.check_chain_ciphertext_presence(&chain) {
+                            Ok(()) => {
+                                report.classification = RecoveryClass::Valid;
+                                report.reason =
+                                        "storage head is authenticated and continuous with the local floor"
+                                            .to_owned();
+                            }
+                            Err(error) => {
+                                report.classification = RecoveryClass::Unavailable;
+                                report.reason = format!(
+                                    "authenticated storage head has unavailable ciphertext: {error:#}"
+                                );
+                            }
+                        },
+                        Err(error) => {
+                            report.classification = RecoveryClass::Discontinuous;
+                            report.reason =
+                                format!("authenticated storage head is discontinuous: {error:#}");
+                        }
+                    }
+                } else {
+                    match self.check_chain_ciphertext_presence(&chain) {
+                        Ok(()) => {
+                            report.classification = RecoveryClass::Valid;
+                            report.reason =
+                                "storage head is authenticated, but this client has no continuity floor"
+                                    .to_owned();
+                        }
+                        Err(error) => {
+                            report.classification = RecoveryClass::Unavailable;
+                            report.reason = format!(
+                                "authenticated storage head has unavailable ciphertext: {error:#}"
+                            );
+                        }
+                    }
+                    report.freshness_unverified = true;
+                }
+            }
+            Err(error) => {
+                if format!("{error:#}").contains("budget exhausted") {
+                    return Err(error).context("bounded recovery discovery failed");
+                }
+                let (class, reason) =
+                    classify_recovery_error(&error, observation.head_bytes.as_deref());
+                report.classification = class;
+                report.reason = reason;
+                if class == RecoveryClass::Invalid
+                    && let Some(head) = observation.head_id.as_deref()
+                {
+                    report.claimed_signer = self.claimed_signer_for_head(head).ok();
+                }
+            }
+        }
+
+        if report.classification == RecoveryClass::Invalid {
+            let evidence_id = observation.head_id.clone().unwrap_or_else(|| {
+                hex::encode(Sha256::digest(
+                    observation.head_bytes.as_deref().unwrap_or_default(),
+                ))
+            });
+            record_rejected_head(
+                &state_path,
+                &evidence_id,
+                report.classification,
+                &report.reason,
+            )?;
+        } else {
+            report.blocked_reason = Some(match report.classification {
+                RecoveryClass::Valid => {
+                    "the storage head is already valid; recovery is not needed".to_owned()
+                }
+                RecoveryClass::Unverifiable => {
+                    "the storage head cannot be opened by this device; recovery is forbidden"
+                        .to_owned()
+                }
+                RecoveryClass::Unsupported => {
+                    "the storage head uses an unsupported format; recovery is forbidden".to_owned()
+                }
+                RecoveryClass::Unavailable => {
+                    "required storage data is unavailable; recovery is forbidden".to_owned()
+                }
+                RecoveryClass::Discontinuous => {
+                    "the storage head is discontinuous with the local floor; recovery is forbidden"
+                        .to_owned()
+                }
+                RecoveryClass::Invalid => unreachable!(),
+            });
+            return Ok(report);
+        }
+
+        let (Some(floor_id), Some(floor_generation)) = (state.head_id.as_deref(), state.generation)
+        else {
+            report.freshness_unverified = true;
+            report.blocked_reason = Some(
+                "this repository has no authenticated continuity floor; freshness and fork identity are unverified".to_owned(),
+            );
+            return Ok(report);
+        };
+
+        let history = self
+            .storage
+            .recovery_history(MAX_RECOVERY_OUTER_COMMITS, MAX_RECOVERY_MANIFEST_BYTES)?;
+        let carrier_history = history.is_some();
+        let history = history.unwrap_or_default();
+        if history.commits.len() > MAX_RECOVERY_OUTER_COMMITS {
+            bail!("recovery outer-commit budget exhausted")
+        }
+        let historical_bytes = history.manifests.values().try_fold(0_u64, |total, bytes| {
+            total
+                .checked_add(bytes.len() as u64)
+                .context("recovery manifest byte budget overflow")
+        })?;
+        if historical_bytes > MAX_RECOVERY_MANIFEST_BYTES {
+            bail!("recovery manifest byte budget exhausted")
+        }
+        budget.bytes_read = budget
+            .bytes_read
+            .checked_add(historical_bytes)
+            .context("recovery manifest byte budget overflow")?;
+        if budget.bytes_read > MAX_RECOVERY_BYTES {
+            bail!("recovery manifest byte budget exhausted")
+        }
+        if carrier_history
+            && !history
+                .commits
+                .iter()
+                .any(|commit| commit.head_id.as_deref() == Some(floor_id))
+        {
+            report.blocked_reason = Some(format!(
+                "carrier history does not contain the pinned floor manifest {floor_id}; refusing discontinuous recovery"
+            ));
+            report.classification = RecoveryClass::Discontinuous;
+            return Ok(report);
+        }
+
+        let read_history_material = |id: &str| -> Result<(String, Vec<u8>, ManifestHeader)> {
+            match self.read_manifest_material(id) {
+                Ok(material) => Ok(material),
+                Err(current_error) => {
+                    let bytes = history.manifests.get(id).with_context(|| {
+                        format!("historical manifest {id} is unavailable (current read: {current_error:#})")
+                    })?;
+                    if object_id(bytes) != id {
+                        bail!("historical manifest {id} content ID mismatch")
+                    }
+                    let header = peek_manifest_header(bytes)?;
+                    Ok((id.to_owned(), bytes.clone(), header))
+                }
+            }
+        };
+        let floor_chain = match self.chain_from(
+            floor_id,
+            &mut |id| read_history_material(id),
+            Some(&mut budget),
+        ) {
+            Ok(chain) => chain,
+            Err(error) => {
+                report.blocked_reason = Some(format!(
+                    "pinned floor is unavailable or cannot be authenticated: {error:#}"
+                ));
+                return Ok(report);
+            }
+        };
+        let floor = match floor_chain
+            .iter()
+            .find(|entry| entry.id == floor_id && entry.manifest.generation == floor_generation)
+        {
+            Some(floor) => floor,
+            None => {
+                report.blocked_reason = Some(
+                    "client state floor does not match its authenticated manifest generation"
+                        .to_owned(),
+                );
+                return Ok(report);
+            }
+        };
+        if state
+            .repository_root
+            .as_deref()
+            .is_some_and(|root| root != floor.manifest.repository_root)
+            || state
+                .policy_generation
+                .is_some_and(|generation| generation > floor.manifest.policy_generation)
+        {
+            report.blocked_reason = Some(
+                "client state floor metadata does not match the authenticated floor".to_owned(),
+            );
+            return Ok(report);
+        }
+        let floor_candidate = RecoveryCandidate {
+            manifest_id: floor.id.clone(),
+            generation: floor.manifest.generation,
+            outer_commit: history
+                .commits
+                .iter()
+                .find(|commit| commit.head_id.as_deref() == Some(floor_id))
+                .map(|commit| commit.commit_id.clone()),
+            verified_signer: floor.verified_signer.clone(),
+        };
+
+        let mut replay_ids = BTreeSet::new();
+        let mut seen_head_ids = HashSet::new();
+        let mut descendants: Vec<(RecoveryCandidate, Vec<OpenedState>)> = Vec::new();
+        if carrier_history {
+            let mut unique_heads = Vec::new();
+            for commit in &history.commits {
+                if let Some(head) = &commit.head_id {
+                    if seen_head_ids.insert(head.clone()) {
+                        unique_heads.push((head, commit));
+                    } else {
+                        replay_ids.insert(head.clone());
+                    }
+                }
+            }
+            if unique_heads.len() > MAX_RECOVERY_CANDIDATES {
+                bail!("recovery candidate budget exhausted")
+            }
+            for (candidate_id, commit) in unique_heads {
+                if candidate_id == floor_id {
+                    continue;
+                }
+                let candidate_chain = match self.chain_from(
+                    candidate_id,
+                    &mut |id| read_history_material(id),
+                    Some(&mut budget),
+                ) {
+                    Ok(chain) => chain,
+                    Err(error) => {
+                        let (class, _) = classify_recovery_error(&error, None);
+                        match class {
+                            RecoveryClass::Invalid => continue,
+                            RecoveryClass::Unverifiable
+                            | RecoveryClass::Unsupported
+                            | RecoveryClass::Unavailable => {
+                                report.blocked_reason = Some(format!(
+                                    "historical carrier head {candidate_id} is {}: {error:#}",
+                                    class.name()
+                                ));
+                                return Ok(report);
+                            }
+                            RecoveryClass::Discontinuous | RecoveryClass::Valid => continue,
+                        }
+                    }
+                };
+                let candidate = candidate_chain
+                    .first()
+                    .context("validated candidate chain is empty")?;
+                let candidate_in_floor = floor_chain.iter().any(|entry| entry.id == *candidate_id);
+                if candidate.manifest.generation < floor_generation && candidate_in_floor {
+                    replay_ids.insert(candidate_id.clone());
+                    continue;
+                }
+                let floor_position = candidate_chain.iter().position(|entry| {
+                    entry.id == floor_id && entry.manifest.generation == floor_generation
+                });
+                if floor_position.is_none() {
+                    report.blocked_reason = Some(format!(
+                        "authenticated historical head {candidate_id} does not descend from the pinned floor"
+                    ));
+                    return Ok(report);
+                }
+                descendants.push((
+                    RecoveryCandidate {
+                        manifest_id: candidate.id.clone(),
+                        generation: candidate.manifest.generation,
+                        outer_commit: Some(commit.commit_id.clone()),
+                        verified_signer: candidate.verified_signer.clone(),
+                    },
+                    candidate_chain,
+                ));
+            }
+            for (index, (left, left_chain)) in descendants.iter().enumerate() {
+                for (right, right_chain) in descendants.iter().skip(index + 1) {
+                    let left_is_ancestor =
+                        right_chain.iter().any(|entry| entry.id == left.manifest_id);
+                    let right_is_ancestor =
+                        left_chain.iter().any(|entry| entry.id == right.manifest_id);
+                    if !left_is_ancestor && !right_is_ancestor {
+                        report.conflict = true;
+                    }
+                }
+            }
+        }
+        if report.conflict {
+            report.blocked_reason = Some(
+                "authenticated descendants conflict; refusing to choose between forks".to_owned(),
+            );
+            report.candidates.push(floor_candidate);
+            report
+                .candidates
+                .extend(descendants.into_iter().map(|(candidate, _)| candidate));
+            report.replays = replay_ids.into_iter().collect();
+            return Ok(report);
+        }
+
+        let mut offers = vec![(floor_candidate.clone(), floor_chain.clone())];
+        offers.extend(descendants);
+        offers.sort_by_key(|(candidate, _)| candidate.generation);
+        report.candidates = offers
+            .iter()
+            .map(|(candidate, _)| candidate.clone())
+            .collect();
+        report.replays = replay_ids.into_iter().collect();
+        let default_offer = offers.last().context("recovery floor offer is missing")?;
+        report.default_base = Some(default_offer.0.manifest_id.clone());
+        if !carrier_history {
+            report.warning = Some(STALE_FLOOR_WARNING.to_owned());
+        }
+        if !options.publish {
+            return Ok(report);
+        }
+
+        let selected_id = options.base.unwrap_or(&default_offer.0.manifest_id);
+        let selected = match offers
+            .iter()
+            .find(|(candidate, _)| candidate.manifest_id == selected_id)
+        {
+            Some(selected) => selected,
+            None => {
+                report.blocked_reason = Some(format!(
+                    "selected base {selected_id} is not an authenticated recovery offer"
+                ));
+                return Ok(report);
+            }
+        };
+        if selected.0.generation < default_offer.0.generation && !options.discard_newer {
+            report.blocked_reason = Some(format!(
+                "choosing older base {} requires --discard-newer",
+                selected.0.manifest_id
+            ));
+            return Ok(report);
+        }
+        if !carrier_history && !options.accept_stale_floor {
+            report.blocked_reason = Some(format!(
+                "directory recovery requires --accept-stale-floor. {}",
+                STALE_FLOOR_WARNING
+            ));
+            return Ok(report);
+        }
+        let base_state = selected
+            .1
+            .first()
+            .filter(|entry| entry.id == selected.0.manifest_id)
+            .context("selected recovery base is missing from its validated chain")?;
+        if !base_state.policy.is_active_writer(&self.key.device_id()?) {
+            report.blocked_reason =
+                Some("device is not an active writer under the selected base policy".to_owned());
+            return Ok(report);
+        }
+        if let Err(error) = self.restore_base_objects(&selected.1) {
+            report.blocked_reason = Some(format!("required ciphertext is unavailable: {error:#}"));
+            return Ok(report);
+        }
+        if let Err(error) = self.verify_base_graph(&selected.1) {
+            report.blocked_reason = Some(format!(
+                "selected base does not resolve to a complete local object graph: {error:#}"
+            ));
+            return Ok(report);
+        }
+        let required_manifests: Vec<_> = selected.1.iter().map(|entry| entry.id.clone()).collect();
+        let required_packs: Vec<_> = selected
+            .1
+            .iter()
+            .flat_map(|entry| entry.manifest.new_packs.iter().map(|pack| pack.id.clone()))
+            .collect();
+        self.storage
+            .prepare_recovery(&required_manifests, &required_packs)?;
+
+        let next_key = random_key();
+        let generation = base_state.manifest.generation + 1;
+        let next = Manifest {
+            format_version: base_state.manifest.format_version,
+            repository_root: base_state.manifest.repository_root.clone(),
+            generation,
+            previous: Some(base_state.id.clone()),
+            policy_id: base_state.policy.id.clone(),
+            policy_generation: base_state.policy.body.generation,
+            authorization: ManifestAuthorization::Writer,
+            total_pack_count: base_state.manifest.total_pack_count,
+            refs: base_state.manifest.refs.clone(),
+            new_packs: Vec::new(),
+            predecessor_key_wrap: Some(wrap_predecessor_key(
+                &next_key,
+                &base_state.generation_key,
+                &base_state.manifest.repository_root,
+                generation,
+                &base_state.id,
+            )?),
+            introduced_policy: None,
+        };
+        let recovered_id = self.commit_manifest_with_observation(
+            CommitHead {
+                previous: Some(base_state),
+                observation: Some(&observation),
+            },
+            &base_state.policy,
+            None,
+            &next_key,
+            ManifestAuthorization::Writer,
+            next.clone(),
+        )?;
+        self.pin_manifest_locked(&state_path, &recovered_id, &next)?;
+        report.published_manifest = Some(recovered_id);
+        report.blocked_reason = None;
+        Ok(report)
+    }
+
+    fn claimed_signer_for_head(&self, head: &str) -> Result<String> {
+        let (_, encrypted, header) = self.read_manifest_material(head)?;
+        let key = unwrap_generation_key(&header, &self.key)?;
+        Ok(open_manifest(&encrypted, &key)?.claimed_signer_id)
+    }
+
+    fn check_chain_ciphertext_presence(&self, chain: &[OpenedState]) -> Result<()> {
+        for state in chain {
+            for descriptor in &state.manifest.new_packs {
+                self.storage
+                    .open_object(ObjectKind::Pack, &descriptor.id)
+                    .with_context(|| format!("required pack {} is unavailable", descriptor.id))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_base_objects(&self, chain: &[OpenedState]) -> Result<()> {
+        for state in chain {
+            self.ensure_object_available(ObjectKind::Manifest, &state.id)?;
+            for descriptor in &state.manifest.new_packs {
+                self.ensure_object_available(ObjectKind::Pack, &descriptor.id)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_base_graph(&self, chain: &[OpenedState]) -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let init = std::process::Command::new("git")
+            .arg("init")
+            .arg("--bare")
+            .arg("--quiet")
+            .arg(temporary.path())
+            .output()?;
+        if !init.status.success() {
+            bail!(
+                "git init for recovery connectivity check failed: {}",
+                String::from_utf8_lossy(&init.stderr).trim()
+            )
+        }
+        for entry in chain.iter().rev() {
+            for descriptor in &entry.manifest.new_packs {
+                let encrypted = self.storage.open_object(ObjectKind::Pack, &descriptor.id)?;
+                let pack_key = derive_subkey(
+                    &entry.generation_key,
+                    &entry.manifest.repository_root,
+                    descriptor.generation,
+                    SubkeyKind::Pack,
+                    descriptor.ordinal,
+                )?;
+                let mut importer = git::start_pack_import(temporary.path())?;
+                open_pack_stream(
+                    &pack_key,
+                    encrypted,
+                    &mut importer,
+                    &pack_aad(
+                        &entry.manifest.repository_root,
+                        descriptor.generation,
+                        descriptor.ordinal,
+                    ),
+                    descriptor.plaintext_size,
+                    &descriptor.id,
+                )?;
+                importer.finish()?;
+            }
+        }
+        git::ensure_refs_connected_since(
+            temporary.path(),
+            &chain
+                .first()
+                .context("selected recovery chain is empty")?
+                .manifest
+                .refs,
+            &BTreeMap::new(),
+        )
+    }
+
+    fn ensure_object_available(&self, kind: ObjectKind, id: &str) -> Result<()> {
+        if self.storage_object_matches(kind, id)? {
+            return Ok(());
+        }
+        if self.storage.restore_historical_object(kind, id)?
+            && self.storage_object_matches(kind, id)?
+        {
+            return Ok(());
+        }
+        bail!("required {:?} object {id} is missing or corrupt", kind)
+    }
+
+    fn storage_object_matches(&self, kind: ObjectKind, id: &str) -> Result<bool> {
+        let mut reader = match self.storage.open_object(kind, id) {
+            Ok(reader) => reader,
+            Err(_) => return Ok(false),
+        };
+        let mut hasher = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        Ok(hex::encode(hasher.finalize()) == id)
+    }
+
     fn current_chain(&self) -> Result<Vec<OpenedState>> {
         let head = self
             .storage
             .read_head()?
             .context("encrypted repository is not initialized")?;
-        let (mut id, mut encrypted, mut header) = self.read_manifest_material(&head)?;
+        self.chain_from(&head, &mut |id| self.read_manifest_material(id), None)
+    }
+
+    fn chain_from<F>(
+        &self,
+        head: &str,
+        read_material: &mut F,
+        mut budget: Option<&mut RecoveryBudget>,
+    ) -> Result<Vec<OpenedState>>
+    where
+        F: FnMut(&str) -> Result<(String, Vec<u8>, ManifestHeader)>,
+    {
+        let (mut id, mut encrypted, mut header) = read_material(head)?;
+        if let Some(budget) = budget.as_deref_mut() {
+            budget.charge_manifest(&header, encrypted.len())?;
+        }
         let mut generation_key = unwrap_generation_key(&header, &self.key)?;
         let mut opened = open_manifest(&encrypted, &generation_key)?;
         let mut unverified = Vec::new();
@@ -742,8 +1433,10 @@ impl<S: Storage> EncryptedRepository<S> {
                 unverified.push((id, opened, generation_key));
                 break;
             };
-            let (parent_id, parent_encrypted, parent_header) =
-                self.read_manifest_material(&previous_id)?;
+            let (parent_id, parent_encrypted, parent_header) = read_material(&previous_id)?;
+            if let Some(budget) = budget.as_deref_mut() {
+                budget.charge_manifest(&parent_header, parent_encrypted.len())?;
+            }
             let parent_key =
                 unwrap_predecessor_key(&generation_key, &opened.manifest, &parent_header)?;
             unverified.push((id, opened, generation_key));
@@ -803,12 +1496,14 @@ impl<S: Storage> EncryptedRepository<S> {
                 (policy, parent_policy)
             };
             verify_manifest(&opened, &policy, parent_policy.as_ref(), &generation_key)?;
+            let verified_signer = opened.claimed_signer_id.clone();
             chain_oldest_first.push(OpenedState {
                 id,
                 manifest: opened.manifest,
                 header: opened.header,
                 policy,
                 generation_key,
+                verified_signer,
             });
         }
         chain_oldest_first.reverse();
@@ -833,7 +1528,29 @@ impl<S: Storage> EncryptedRepository<S> {
         authorization: ManifestAuthorization,
         manifest: Manifest,
     ) -> Result<String> {
-        match previous {
+        self.commit_manifest_with_observation(
+            CommitHead {
+                previous,
+                observation: None,
+            },
+            policy,
+            parent_policy,
+            generation_key,
+            authorization,
+            manifest,
+        )
+    }
+
+    fn commit_manifest_with_observation(
+        &self,
+        head: CommitHead<'_>,
+        policy: &PolicyState,
+        parent_policy: Option<&PolicyState>,
+        generation_key: &[u8; 32],
+        authorization: ManifestAuthorization,
+        manifest: Manifest,
+    ) -> Result<String> {
+        match head.previous {
             Some(previous) => {
                 manifest.validate_successor(&previous.id, &previous.manifest, policy)?
             }
@@ -852,7 +1569,7 @@ impl<S: Storage> EncryptedRepository<S> {
 
         let opened = open_manifest(&encrypted, generation_key)?;
         verify_manifest(&opened, policy, parent_policy, generation_key)?;
-        if let Some(previous) = previous {
+        if let Some(previous) = head.previous {
             let recovered =
                 unwrap_predecessor_key(generation_key, &opened.manifest, &previous.header)?;
             if *recovered != *previous.generation_key {
@@ -862,8 +1579,13 @@ impl<S: Storage> EncryptedRepository<S> {
         if opened.header.generation != manifest.generation {
             bail!("new manifest self-check changed generation")
         }
-        self.storage
-            .compare_and_swap_head(previous.map(|state| state.id.as_str()), &id)?;
+        if let Some(observation) = head.observation {
+            self.storage
+                .compare_and_swap_observed_head(observation, &id)?;
+        } else {
+            self.storage
+                .compare_and_swap_head(head.previous.map(|state| state.id.as_str()), &id)?;
+        }
         Ok(id)
     }
 }
@@ -895,6 +1617,89 @@ fn transition_manifest(
         )?),
         introduced_policy: Some(policy_bytes),
     })
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RejectedHeadEvidence {
+    head_id: String,
+    classification: RecoveryClass,
+    reason: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct RejectedHeadLog {
+    format_version: u32,
+    entries: Vec<RejectedHeadEvidence>,
+}
+
+fn classify_recovery_error(
+    error: &anyhow::Error,
+    raw_head: Option<&[u8]>,
+) -> (RecoveryClass, String) {
+    let detail = format!("{error:#}");
+    if detail.contains("unsupported") || detail.contains("reserved but not implemented") {
+        return (RecoveryClass::Unsupported, detail);
+    }
+    if detail.contains("device is not an active reader")
+        || detail.contains("cannot open the generation key")
+    {
+        return (RecoveryClass::Unverifiable, detail);
+    }
+    if detail.contains("key file belongs to a different repository") {
+        return (RecoveryClass::Discontinuous, detail);
+    }
+    if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|source| source.kind() != io::ErrorKind::InvalidData)
+    }) {
+        return (RecoveryClass::Unavailable, detail);
+    }
+    if detail.contains("encrypted repository has no storage HEAD") && raw_head.is_none() {
+        return (RecoveryClass::Unavailable, detail);
+    }
+    (RecoveryClass::Invalid, detail)
+}
+
+fn record_rejected_head(
+    state_path: &Path,
+    head_id: &str,
+    classification: RecoveryClass,
+    reason: &str,
+) -> Result<()> {
+    let directory = state_path
+        .parent()
+        .context("client state path has no parent")?;
+    let path = directory.join("rejected-heads.json");
+    let mut log = match fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice::<RejectedHeadLog>(&bytes).unwrap_or_default(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => RejectedHeadLog::default(),
+        Err(error) => return Err(error.into()),
+    };
+    log.format_version = 1;
+    log.entries.retain(|entry| entry.head_id != head_id);
+    let reason: String = reason.chars().take(512).collect();
+    log.entries.push(RejectedHeadEvidence {
+        head_id: head_id.to_owned(),
+        classification,
+        reason,
+    });
+    if log.entries.len() > MAX_REJECTED_HEADS {
+        let remove = log.entries.len() - MAX_REJECTED_HEADS;
+        log.entries.drain(..remove);
+    }
+    let mut random = [0_u8; 8];
+    OsRng.fill_bytes(&mut random);
+    let temporary = directory.join(format!(".rejected-heads-{}.tmp", hex::encode(random)));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    file.write_all(&serde_json::to_vec_pretty(&log)?)?;
+    file.sync_all()?;
+    fs::rename(&temporary, &path)?;
+    crate::persist::sync_directory(directory)?;
+    Ok(())
 }
 
 fn git_state_directory(repo: &Path) -> Result<std::path::PathBuf> {

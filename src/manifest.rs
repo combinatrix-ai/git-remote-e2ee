@@ -212,6 +212,7 @@ struct ManifestEnvelope {
 pub struct OpenedManifest {
     pub(crate) header: ManifestHeader,
     pub(crate) manifest: Manifest,
+    pub(crate) claimed_signer_id: String,
     exact_header: Vec<u8>,
     exact_sealed_content: Vec<u8>,
     signature: Vec<u8>,
@@ -409,6 +410,7 @@ pub fn open_manifest(encrypted: &[u8], generation_key: &[u8; 32]) -> Result<Open
     let signature = BASE64
         .decode(sealed.signature)
         .context("decode manifest signature")?;
+    let claimed_signer_id = content.signer_device_id.clone();
 
     let body_key = derive_subkey(
         generation_key,
@@ -453,6 +455,7 @@ pub fn open_manifest(encrypted: &[u8], generation_key: &[u8; 32]) -> Result<Open
     Ok(OpenedManifest {
         header,
         manifest,
+        claimed_signer_id,
         exact_header,
         exact_sealed_content,
         signature,

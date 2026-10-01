@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -11,6 +12,8 @@ use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::crypto::object_id;
+
 #[derive(Debug, Error)]
 #[error("head changed concurrently (expected {expected:?}, actual {actual:?})")]
 pub struct CasConflict {
@@ -19,6 +22,7 @@ pub struct CasConflict {
 }
 
 const MAX_BUFFERED_OBJECT_SIZE: u64 = 16 * 1024 * 1024;
+const MAX_STORAGE_HEAD_BYTES: u64 = 4096;
 
 pub trait ObjectStage: Write + Send {
     fn finish(self: Box<Self>, id: &str) -> Result<()>;
@@ -89,6 +93,55 @@ pub trait Storage {
 
     fn read_head(&self) -> Result<Option<String>>;
     fn compare_and_swap_head(&self, expected: Option<&str>, next: &str) -> Result<()>;
+
+    fn observe_head(&self) -> Result<HeadObservation> {
+        let head_id = self.read_head()?;
+        let bytes = head_id.as_deref().unwrap_or_default().as_bytes().to_vec();
+        Ok(HeadObservation {
+            head_id,
+            token: bytes.clone(),
+            head_bytes: Some(bytes),
+        })
+    }
+
+    fn compare_and_swap_observed_head(&self, observed: &HeadObservation, next: &str) -> Result<()> {
+        self.compare_and_swap_head(observed.head_id.as_deref(), next)
+    }
+
+    fn recovery_history(
+        &self,
+        _max_commits: usize,
+        _max_manifest_bytes: u64,
+    ) -> Result<Option<RecoveryHistory>> {
+        Ok(None)
+    }
+
+    fn restore_historical_object(&self, _kind: ObjectKind, _id: &str) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn prepare_recovery(&self, _manifest_ids: &[String], _pack_ids: &[String]) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct HeadObservation {
+    pub head_id: Option<String>,
+    pub token: Vec<u8>,
+    pub head_bytes: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RecoveryCommit {
+    pub commit_id: String,
+    pub head_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RecoveryHistory {
+    pub commits: Vec<RecoveryCommit>,
+    pub manifests: std::collections::BTreeMap<String, Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -275,6 +328,87 @@ impl Storage for FilesystemStorage {
         fs2::FileExt::unlock(&lock)?;
         Ok(())
     }
+
+    fn observe_head(&self) -> Result<HeadObservation> {
+        let head_bytes = read_bounded_head_file(&self.root.join("HEAD"))?;
+        let head_id = head_bytes.as_deref().and_then(|bytes| {
+            std::str::from_utf8(bytes)
+                .ok()
+                .map(str::trim)
+                .filter(|value| validate_id(value).is_ok())
+                .map(ToOwned::to_owned)
+        });
+        Ok(HeadObservation {
+            head_id,
+            token: head_bytes.clone().unwrap_or_default(),
+            head_bytes,
+        })
+    }
+
+    fn compare_and_swap_observed_head(&self, observed: &HeadObservation, next: &str) -> Result<()> {
+        validate_id(next)?;
+        let lock = self.lock_file()?;
+        lock.lock_exclusive()?;
+        let actual = match fs::read(self.root.join("HEAD")) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                fs2::FileExt::unlock(&lock)?;
+                return Err(error.into());
+            }
+        };
+        if actual != observed.head_bytes {
+            let actual_id = actual.as_deref().and_then(|bytes| {
+                std::str::from_utf8(bytes)
+                    .ok()
+                    .map(str::trim)
+                    .filter(|value| validate_id(value).is_ok())
+                    .map(ToOwned::to_owned)
+            });
+            fs2::FileExt::unlock(&lock)?;
+            return Err(CasConflict {
+                expected: observed.head_id.clone(),
+                actual: actual_id,
+            }
+            .into());
+        }
+
+        write_filesystem_head_locked(&self.root, next)?;
+        fs2::FileExt::unlock(&lock)?;
+        Ok(())
+    }
+}
+
+fn write_filesystem_head_locked(root: &Path, next: &str) -> Result<()> {
+    let mut random = [0_u8; 8];
+    OsRng.fill_bytes(&mut random);
+    let temporary = root.join(format!(".HEAD-{}", hex::encode(random)));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    writeln!(file, "{next}")?;
+    file.sync_all()?;
+    crate::persist::durability_checkpoint(crate::persist::STAGE_AFTER_FILE_FLUSH);
+    fs::rename(&temporary, root.join("HEAD"))?;
+    crate::persist::durability_checkpoint(crate::persist::STAGE_AFTER_NAME_PUBLISH);
+    crate::persist::sync_directory(root)
+        .with_context(|| format!("sync directory {}", root.display()))?;
+    Ok(())
+}
+
+fn read_bounded_head_file(path: &Path) -> Result<Option<Vec<u8>>> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if file.metadata()?.len() > MAX_STORAGE_HEAD_BYTES {
+        bail!("recovery outer-head byte budget exhausted")
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
 }
 
 fn validate_id(id: &str) -> Result<()> {
@@ -308,6 +442,7 @@ const CARRIER_BRANCH: &str = "git-remote-e2ee";
 const CARRIER_CHUNK_SIZE: usize = 32 * 1024 * 1024;
 const CARRIER_CACHE_ENV: &str = "GIT_REMOTE_E2EE_CACHE_DIR";
 const CARRIER_CACHE_FETCH_REF: &str = "refs/heads/git-remote-e2ee";
+const MAX_RECOVERY_OUTER_COMMITS: usize = 2048;
 
 pub struct GitStorage {
     checkout: tempfile::TempDir,
@@ -534,6 +669,10 @@ impl GitStorage {
         }
     }
 
+    fn local_head_bytes(&self) -> Result<Option<Vec<u8>>> {
+        read_bounded_head_file(&self.root().join("e2ee/HEAD"))
+    }
+
     fn refresh_remote(&self) -> Result<Option<String>> {
         CarrierCache::lock(&self.remote)?.refresh(&self.remote)
     }
@@ -553,6 +692,215 @@ impl GitStorage {
         let value = String::from_utf8(output.stdout)?.trim().to_owned();
         validate_id(&value)?;
         Ok(Some(value))
+    }
+
+    fn head_bytes_at_commit(&self, commit: &str) -> Result<Option<Vec<u8>>> {
+        let object = format!("{commit}:e2ee/HEAD");
+        let size = carrier_git_command()
+            .arg("-C")
+            .arg(self.root())
+            .args(["cat-file", "-s", &object])
+            .output()?;
+        if !size.status.success() {
+            return Ok(None);
+        }
+        let size = String::from_utf8(size.stdout)?.trim().parse::<u64>()?;
+        if size > MAX_STORAGE_HEAD_BYTES {
+            bail!("recovery outer-head byte budget exhausted")
+        }
+        let output = carrier_git_command()
+            .arg("-C")
+            .arg(self.root())
+            .args(["show", &object])
+            .output()?;
+        if output.status.success() {
+            Ok(Some(output.stdout))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn commit_history(&self, limit: usize) -> Result<Vec<String>> {
+        let maximum = limit.saturating_add(1).to_string();
+        let output = carrier_git_command()
+            .arg("-C")
+            .arg(self.root())
+            .args([
+                "rev-list",
+                "--first-parent",
+                &format!("--max-count={maximum}"),
+                "HEAD",
+            ])
+            .output()?;
+        ensure_git_success(&output, "git rev-list carrier history")?;
+        Ok(String::from_utf8(output.stdout)?
+            .lines()
+            .map(ToOwned::to_owned)
+            .collect())
+    }
+
+    fn chunk_entries_at(
+        &self,
+        commit: &str,
+        kind: ObjectKind,
+        id: &str,
+    ) -> Result<Option<Vec<(String, String)>>> {
+        validate_id(id)?;
+        let directory = format!("e2ee/{}/{}/{id}", kind.directory(), &id[..2]);
+        let output = carrier_git_command()
+            .arg("-C")
+            .arg(self.root())
+            .args(["ls-tree", "-r", "-z", commit, "--", &directory])
+            .output()?;
+        ensure_git_success(&output, "git ls-tree historical carrier object")?;
+        if output.stdout.is_empty() {
+            return Ok(None);
+        }
+        if output.stdout.len() > 8 * 1024 * 1024 {
+            bail!("carrier recovery object listing exceeds its size budget")
+        }
+        let mut chunks = Vec::new();
+        for entry in output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+        {
+            let tab = entry
+                .iter()
+                .position(|byte| *byte == b'\t')
+                .context("parse historical carrier tree entry")?;
+            let (metadata, path) = (&entry[..tab], &entry[tab + 1..]);
+            let metadata = std::str::from_utf8(metadata)?;
+            let path = std::str::from_utf8(path)?.to_owned();
+            let mut fields = metadata.split_ascii_whitespace();
+            if fields.next() != Some("100644") || fields.next() != Some("blob") {
+                bail!("historical carrier object contains a non-regular blob")
+            }
+            let blob_id = fields.next().context("historical carrier blob has no id")?;
+            if fields.next().is_some() || !path.starts_with(&format!("{directory}/")) {
+                bail!("unexpected historical carrier object path")
+            }
+            chunks.push((path, blob_id.to_owned()));
+        }
+        chunks.sort_by(|left, right| left.0.cmp(&right.0));
+        if chunks.is_empty() || chunks.len() > 4096 {
+            bail!("historical carrier object has an invalid chunk count")
+        }
+        for (index, (path, _)) in chunks.iter().enumerate() {
+            let expected = format!("{directory}/{index:08}");
+            if path != &expected {
+                bail!("historical carrier object chunks are not a dense canonical sequence")
+            }
+        }
+        Ok(Some(chunks))
+    }
+
+    fn object_at_commit(
+        &self,
+        commit: &str,
+        kind: ObjectKind,
+        id: &str,
+        max_bytes: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(chunks) = self.chunk_entries_at(commit, kind, id)? else {
+            return Ok(None);
+        };
+        let mut bytes = Vec::new();
+        for (index, (path, _)) in chunks.iter().enumerate() {
+            let output = carrier_git_command()
+                .arg("-C")
+                .arg(self.root())
+                .args(["show", &format!("{commit}:{path}")])
+                .output()?;
+            ensure_git_success(&output, "git show historical carrier object")?;
+            let length = output.stdout.len();
+            if (index + 1 < chunks.len() && length != CARRIER_CHUNK_SIZE)
+                || (index + 1 == chunks.len() && (length == 0 || length > CARRIER_CHUNK_SIZE))
+            {
+                bail!("historical carrier object chunk has invalid size")
+            }
+            let next_length = (bytes.len() as u64)
+                .checked_add(length as u64)
+                .context("historical carrier object size overflow")?;
+            if next_length > max_bytes {
+                bail!("carrier recovery manifest byte budget exhausted")
+            }
+            bytes.extend_from_slice(&output.stdout);
+        }
+        if object_id(&bytes) != id {
+            bail!("historical carrier object content id mismatch")
+        }
+        Ok(Some(bytes))
+    }
+
+    fn restore_object_at(&self, commit: &str, kind: ObjectKind, id: &str) -> Result<bool> {
+        let Some(chunks) = self.chunk_entries_at(commit, kind, id)? else {
+            return Ok(false);
+        };
+        let staging = tempfile::Builder::new()
+            .prefix("git-remote-e2ee-restore-")
+            .tempdir_in(self.root())?;
+        let object_dir = staging.path().join("object");
+        fs::create_dir(&object_dir)?;
+        let mut hasher = Sha256::new();
+        for (index, (path, _)) in chunks.iter().enumerate() {
+            let output = carrier_git_command()
+                .arg("-C")
+                .arg(self.root())
+                .args(["show", &format!("{commit}:{path}")])
+                .output()?;
+            ensure_git_success(&output, "git show historical carrier object")?;
+            let length = output.stdout.len();
+            if (index + 1 < chunks.len() && length != CARRIER_CHUNK_SIZE)
+                || (index + 1 == chunks.len() && (length == 0 || length > CARRIER_CHUNK_SIZE))
+            {
+                bail!("historical carrier object chunk has invalid size")
+            }
+            hasher.update(&output.stdout);
+            let chunk_path = object_dir.join(format!("{index:08}"));
+            let mut file = File::create(chunk_path)?;
+            file.write_all(&output.stdout)?;
+            file.sync_all()?;
+        }
+        if hex::encode(hasher.finalize()) != id {
+            bail!("historical carrier object content id mismatch")
+        }
+        let target = self.object_directory(kind, id)?;
+        if target.exists() {
+            fs::remove_dir_all(&target)?;
+        }
+        fs::create_dir_all(
+            target
+                .parent()
+                .context("carrier object path has no parent")?,
+        )?;
+        fs::rename(object_dir, target)?;
+        Ok(true)
+    }
+
+    fn publish_checkout_head(&self, next: &str, expected: Option<String>) -> Result<()> {
+        fs::create_dir_all(self.root().join("e2ee"))?;
+        fs::write(self.root().join("e2ee/HEAD"), format!("{next}\n"))?;
+        git_command(self.root(), &["add", "e2ee"])?;
+        git_command(
+            self.root(),
+            &["commit", "--quiet", "-m", "git-remote-e2ee storage update"],
+        )?;
+        let push = carrier_git_command()
+            .arg("-C")
+            .arg(self.root())
+            .args(["push", "--quiet", "origin"])
+            .arg(format!("HEAD:refs/heads/{CARRIER_BRANCH}"))
+            .output()?;
+        if !push.status.success() {
+            let latest = self.refresh_remote()?;
+            return Err(CasConflict {
+                expected,
+                actual: self.head_at_commit(latest.as_deref())?,
+            }
+            .into());
+        }
+        Ok(())
     }
 }
 
@@ -636,6 +984,167 @@ impl Storage for GitStorage {
         state.base_commit = Some(new_commit);
         Ok(())
     }
+
+    fn observe_head(&self) -> Result<HeadObservation> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("carrier state lock poisoned"))?;
+        let head_bytes = self.local_head_bytes()?;
+        let head_id = head_bytes.as_deref().and_then(|bytes| {
+            std::str::from_utf8(bytes)
+                .ok()
+                .map(str::trim)
+                .filter(|value| validate_id(value).is_ok())
+                .map(ToOwned::to_owned)
+        });
+        Ok(HeadObservation {
+            head_id,
+            token: state
+                .base_commit
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes()
+                .to_vec(),
+            head_bytes,
+        })
+    }
+
+    fn compare_and_swap_observed_head(&self, observed: &HeadObservation, next: &str) -> Result<()> {
+        validate_id(next)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("carrier state lock poisoned"))?;
+        let expected_tip = state.base_commit.clone();
+        if observed.token != expected_tip.as_deref().unwrap_or_default().as_bytes() {
+            bail!("recovery storage token does not match the opened carrier tip")
+        }
+        let remote_tip = self.refresh_remote()?;
+        if remote_tip != expected_tip {
+            return Err(CasConflict {
+                expected: observed.head_id.clone(),
+                actual: self.head_at_commit(remote_tip.as_deref())?,
+            }
+            .into());
+        }
+        let actual_bytes = self.local_head_bytes()?;
+        if actual_bytes != observed.head_bytes {
+            return Err(CasConflict {
+                expected: observed.head_id.clone(),
+                actual: actual_bytes.as_deref().and_then(|bytes| {
+                    std::str::from_utf8(bytes)
+                        .ok()
+                        .map(str::trim)
+                        .filter(|value| validate_id(value).is_ok())
+                        .map(ToOwned::to_owned)
+                }),
+            }
+            .into());
+        }
+        self.publish_checkout_head(next, observed.head_id.clone())?;
+        let new_commit =
+            git_rev_parse(self.root(), "HEAD")?.context("carrier commit was not created")?;
+        state.base_commit = Some(new_commit);
+        Ok(())
+    }
+
+    fn recovery_history(
+        &self,
+        max_commits: usize,
+        max_manifest_bytes: u64,
+    ) -> Result<Option<RecoveryHistory>> {
+        let commits = self.commit_history(max_commits)?;
+        if commits.len() > max_commits {
+            bail!("carrier recovery outer-commit budget exhausted")
+        }
+        let mut history = RecoveryHistory::default();
+        let mut total_bytes = 0_u64;
+        for commit_id in commits {
+            let head_id = self
+                .head_bytes_at_commit(&commit_id)?
+                .as_deref()
+                .and_then(|bytes| {
+                    std::str::from_utf8(bytes)
+                        .ok()
+                        .map(str::trim)
+                        .filter(|value| validate_id(value).is_ok())
+                        .map(ToOwned::to_owned)
+                });
+            if let Some(id) = &head_id
+                && !history.manifests.contains_key(id)
+            {
+                let remaining = max_manifest_bytes.saturating_sub(total_bytes);
+                if let Some(bytes) =
+                    self.object_at_commit(&commit_id, ObjectKind::Manifest, id, remaining)?
+                {
+                    total_bytes = total_bytes
+                        .checked_add(bytes.len() as u64)
+                        .context("carrier recovery manifest byte count overflow")?;
+                    if total_bytes > max_manifest_bytes {
+                        bail!("carrier recovery manifest byte budget exhausted")
+                    }
+                    history.manifests.insert(id.clone(), bytes);
+                }
+            }
+            history.commits.push(RecoveryCommit { commit_id, head_id });
+        }
+        Ok(Some(history))
+    }
+
+    fn restore_historical_object(&self, kind: ObjectKind, id: &str) -> Result<bool> {
+        let commits = self.commit_history(MAX_RECOVERY_OUTER_COMMITS)?;
+        if commits.len() > MAX_RECOVERY_OUTER_COMMITS {
+            bail!("carrier recovery outer-commit budget exhausted")
+        }
+        for commit in commits {
+            if self.restore_object_at(&commit, kind, id)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn prepare_recovery(&self, manifest_ids: &[String], pack_ids: &[String]) -> Result<()> {
+        retain_carrier_objects(
+            &self.root().join("e2ee/manifests"),
+            &manifest_ids.iter().map(String::as_str).collect(),
+        )?;
+        retain_carrier_objects(
+            &self.root().join("e2ee/objects"),
+            &pack_ids.iter().map(String::as_str).collect(),
+        )?;
+        Ok(())
+    }
+}
+
+fn retain_carrier_objects(root: &Path, keep: &HashSet<&str>) -> Result<()> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries.collect::<std::io::Result<Vec<_>>>()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for prefix in entries {
+        if !prefix.file_type()?.is_dir() {
+            fs::remove_file(prefix.path())?;
+            continue;
+        }
+        let objects = fs::read_dir(prefix.path())?.collect::<std::io::Result<Vec<_>>>()?;
+        for object in objects {
+            let id = object.file_name();
+            if id.to_str().is_none_or(|id| !keep.contains(id)) {
+                if object.file_type()?.is_dir() {
+                    fs::remove_dir_all(object.path())?;
+                } else {
+                    fs::remove_file(object.path())?;
+                }
+            }
+        }
+        if fs::read_dir(prefix.path())?.next().is_none() {
+            fs::remove_dir(prefix.path())?;
+        }
+    }
+    Ok(())
 }
 
 struct CarrierCache {
