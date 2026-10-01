@@ -1,8 +1,7 @@
 # Security
 
-Please report vulnerabilities privately through GitHub's
-[private vulnerability reporting](https://github.com/combinatrix-ai/git-remote-e2ee/security/advisories/new)
-rather than opening a public issue.
+Please report vulnerabilities privately to
+**git-remote-e2ee@combinatrix.ai** rather than opening a public issue.
 
 `git-remote-e2ee` is an early prototype and has not been independently
 audited. Its intended guarantees and known limits are listed in the
