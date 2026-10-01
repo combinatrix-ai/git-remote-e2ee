@@ -23,7 +23,8 @@ It is designed to satisfy all of the following:
    envelopes scale with the padded reader count; a policy transition also
    carries its encrypted policy body.
 5. A newly admitted reader receives full history by default.
-6. Concurrent publications have exactly one visible winner.
+6. Concurrent publications have exactly one visible winner, provided storage
+   honors the compare-and-swap contract.
 
 The protocol provides confidentiality, authenticity, integrity, and continuity
 from state pinned by the same client. It does not provide global freshness or
@@ -444,7 +445,10 @@ in historical manifests and may become unreachable in the inner Git graph.
 
 The server does not inspect encrypted inner commit parents. Two writers read
 the same opaque `HEAD`, create immutable candidates, and attempt the same CAS.
-Exactly one wins.
+Against storage that honors the CAS contract, exactly one wins. Malicious or
+noncompliant storage can report outcomes inconsistently; that is outside the
+guarantees, and a noncooperating writer to directory storage can also cause an
+ABA change of the compared `HEAD` value.
 
 - Filesystem storage uses locking. `HEAD` is published by rename inside the
   storage root. Immutable objects are hard-linked from `.staging` into
@@ -461,10 +465,12 @@ Unreachable losing objects require later GC.
 
 ## 11. Continuity and invitations
 
-Returning clients pin at least repository root, manifest ID and generation,
-and policy ID and generation. Helper continuity pins advance after a complete
-successful fetch/import or a successful own publication, never from listing
-alone. They reject rollback, a non-descendant manifest, policy
+Returning clients pin repository root, manifest ID and generation, and policy
+generation. The policy ID is not stored separately: the pinned manifest ID
+binds it through the manifest's sealed header. Helper continuity pins advance
+only after the complete-ref connectivity check succeeds (after import, or
+during listing when the advertised refs are already connected locally) or
+after a successful own publication, never from authentication alone. They reject rollback, a non-descendant manifest, policy
 rollback/sideways movement, root substitution, and generation gaps. Local
 client-state updates are serialized and monotonic across concurrent helpers.
 

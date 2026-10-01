@@ -79,7 +79,7 @@ whole repository like gcrypt, and fixes what makes that painful to live with:
   and it cannot revoke anyone. `git-remote-e2ee` creates a fresh random key for
   every push and wraps it separately for each authorized device's own key. An
   administrator can revoke one device without rewriting history, and it
-  receives nothing published afterwards.
+  receives nothing built on top of that revocation.
 
 Under the hood, Git runs on your machine as usual. The helper encrypts the
 packs and refs Git hands it, uploads them as opaque immutable objects, and then
@@ -230,9 +230,10 @@ guarantee:
   authority under the authenticated policy history can author a state that
   conforming clients accept;
 - continuity for a clone that has synced before: it rejects any state older
-  than, or diverging from, the last state it verified;
-- that a revoked device gets no keys for generations built on top of its
-  revocation.
+  than, or diverging from, its continuity floor, the newest state it accepted
+  after a complete connectivity check or its own successful push;
+- that a revoked device gets no keys for generations that conforming writers
+  build on top of its revocation.
 
 Write authority is about what clients accept, not about who can put bytes on
 the storage. Anyone who can write to the storage, including a read-only member
@@ -300,16 +301,19 @@ service by design. Keep an offline backup of at least one administrator key and
 its `.admin-state.json` file.
 
 **Does revoking a device hide old history from it?**
-No. It keeps whatever it could already decrypt. It cannot read anything
-published after the revocation.
+No. It keeps whatever it could already decrypt. It gets no keys for anything
+published on top of the revocation. A writer who never saw the revocation, or
+was shown a stale state, could still publish to the old reader set; see
+[Security model](#security-model).
 
 **Can I review pull requests?**
 Not on the host. Review happens on a machine that has a key: fetch the branch
 and diff locally, or give a CI runner its own read-only device key.
 
 **Can the host roll my repository back?**
-It can serve old data. A clone that has synced before detects this and refuses
-it. A fresh clone cannot tell yet.
+It can serve old data. A clone that has synced before refuses anything older
+than, or diverging from, what it already accepted. A fresh clone, or a clone
+that has not synced since a newer state was published, cannot tell yet.
 
 ## Status and roadmap
 
