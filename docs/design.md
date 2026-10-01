@@ -360,7 +360,10 @@ and the remote name defaults to `origin`; the continuity floor is read from
 only reports. Publishing an older offer requires `--discard-newer`. Directory
 publication requires `--accept-stale-floor` and prints the warning above.
 
-Discovery scans the complete available first-parent carrier history, within
+Discovery scans the available carrier history and refuses any history that
+contains a merge commit, since legitimate publications are always
+single-parent and a merge could hide a legitimate state behind its second
+parent. It works within
 budgets of 2,048 outer commits, 256 distinct heads, 64 MiB of manifest bytes,
 and 1,000,000 estimated cryptographic operations. It scans past replays of the
 floor so a legitimate descendant hidden behind a replay can still be offered.

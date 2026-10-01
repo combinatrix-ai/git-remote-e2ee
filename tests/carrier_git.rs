@@ -1217,6 +1217,136 @@ fn carrier_recovery_offers_hidden_legitimate_content_descendant() {
 }
 
 #[test]
+fn carrier_recovery_refuses_history_with_a_merge_hiding_a_legitimate_state() {
+    let temporary = tempfile::tempdir().unwrap();
+    let _cache = isolated_cache(&temporary);
+    let carrier = temporary.path().join("carrier.git");
+    let source = temporary.path().join("source");
+    let returning = temporary.path().join("returning");
+    init_source(&source, "legitimate content");
+    init_source(&returning, "returning local content");
+    git(
+        temporary.path(),
+        &["init", "--bare", "-q", carrier.to_str().unwrap()],
+        false,
+    );
+
+    let owner = KeyFile::generate();
+    let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
+    let admin_pin = temporary.path().join("owner.admin-state.json");
+    let repository = EncryptedRepository::new(
+        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        owner.clone(),
+    );
+    repository.initialize().unwrap();
+    repository.pin_admin_state(&admin_pin).unwrap();
+    let (floor_id, _) = repository
+        .add_device(
+            reader.public_device().unwrap(),
+            DeviceRoles::reader(),
+            &admin_pin,
+        )
+        .unwrap();
+    let floor_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let floor_bytes = floor_storage
+        .get_object(ObjectKind::Manifest, &floor_id)
+        .unwrap();
+    let floor_header = peek_manifest_header(&floor_bytes).unwrap();
+    let floor_key = unwrap_generation_key(&floor_header, &reader).unwrap();
+    let floor_opened = open_manifest(&floor_bytes, &floor_key).unwrap();
+    let floor_policy = PolicyState::parse(
+        floor_opened
+            .manifest()
+            .introduced_policy
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap();
+    repository.fetch_into(&returning, "private").unwrap();
+    repository
+        .push_ref(&source, "refs/heads/main", false)
+        .unwrap();
+
+    // Put a replay of the floor on the first-parent path and the legitimate
+    // tip on the second parent. The merge still fast-forwards the carrier.
+    let attacker = temporary.path().join("carrier-edit");
+    git(
+        temporary.path(),
+        &[
+            "clone",
+            "-q",
+            "-b",
+            "git-remote-e2ee",
+            carrier.to_str().unwrap(),
+            attacker.to_str().unwrap(),
+        ],
+        false,
+    );
+    git(&attacker, &["config", "user.name", "Carrier editor"], false);
+    git(
+        &attacker,
+        &["config", "user.email", "carrier-editor@example.invalid"],
+        false,
+    );
+    git(
+        &attacker,
+        &["checkout", "-q", "-b", "side", "HEAD~1"],
+        false,
+    );
+    git(
+        &attacker,
+        &["commit", "-q", "--allow-empty", "-m", "replay floor"],
+        false,
+    );
+    git(
+        &attacker,
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "-s",
+            "ours",
+            "-m",
+            "hide",
+            "git-remote-e2ee",
+        ],
+        false,
+    );
+    git(
+        &attacker,
+        &["push", "-q", "origin", "side:git-remote-e2ee"],
+        false,
+    );
+
+    let junk_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let junk_id = create_reader_signed_junk(&junk_storage, &reader, &floor_policy, &floor_id);
+    junk_storage
+        .compare_and_swap_head(Some(&floor_id), &junk_id)
+        .unwrap();
+
+    let recoverer =
+        EncryptedRepository::new(GitStorage::open(carrier.to_str().unwrap()).unwrap(), owner);
+    let error = recoverer
+        .recover(
+            &returning,
+            "private",
+            RecoveryOptions {
+                publish: true,
+                base: None,
+                discard_newer: false,
+                accept_stale_floor: false,
+            },
+        )
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("merge commit"), "{error:#}");
+    let after = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    assert_eq!(
+        after.read_head().unwrap().as_deref(),
+        Some(junk_id.as_str())
+    );
+}
+
+#[test]
 fn carrier_recovery_refuses_conflicting_authenticated_descendants() {
     let temporary = tempfile::tempdir().unwrap();
     let _cache = isolated_cache(&temporary);

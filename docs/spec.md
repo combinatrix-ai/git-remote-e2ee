@@ -449,8 +449,10 @@ MUST NOT recover from an older floor, because the head may be a valid
 revocation. A signer ID extracted before successful signature verification
 MUST be labelled as a claim, not as the signer.
 
-On carrier Git, discovery MUST inspect bounded outer first-parent history,
-deduplicate manifest IDs, and validate candidates against the authenticated
+On carrier Git, discovery MUST inspect bounded outer history and MUST refuse
+to proceed if that history contains any merge commit: every legitimate
+publication is a single-parent fast-forward, and a merge can hide a legitimate
+state behind a non-first parent. Discovery MUST deduplicate manifest IDs, and validate candidates against the authenticated
 policy and predecessor chain. The byte, outer-commit, candidate, and
 cryptographic-operation budgets MUST be fixed. Exhaustion MUST fail closed.
 Discovery MUST report authenticated descendants and replays. If authenticated

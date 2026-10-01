@@ -727,16 +727,28 @@ impl GitStorage {
             .arg(self.root())
             .args([
                 "rev-list",
-                "--first-parent",
+                "--parents",
                 &format!("--max-count={maximum}"),
                 "HEAD",
             ])
             .output()?;
         ensure_git_success(&output, "git rev-list carrier history")?;
-        Ok(String::from_utf8(output.stdout)?
-            .lines()
-            .map(ToOwned::to_owned)
-            .collect())
+        // Every publication is a single-parent fast-forward commit, so
+        // legitimate carrier history is linear. A merge can only come from a
+        // storage-level writer and can hide a legitimate state behind a
+        // non-first parent, so recovery refuses to interpret such history.
+        let mut commits = Vec::new();
+        for line in String::from_utf8(output.stdout)?.lines() {
+            let mut fields = line.split_ascii_whitespace();
+            let commit = fields.next().context("parse carrier history entry")?;
+            if fields.count() > 1 {
+                bail!(
+                    "carrier history contains merge commit {commit}; recovery requires linear carrier history and cannot rule out a hidden legitimate state"
+                )
+            }
+            commits.push(commit.to_owned());
+        }
+        Ok(commits)
     }
 
     fn chunk_entries_at(
