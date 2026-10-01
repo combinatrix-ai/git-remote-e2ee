@@ -68,9 +68,7 @@ whole repository like gcrypt, and fixes what makes that painful to live with:
 - **Fast: pushes upload only what changed.** A push uploads the new Git pack
   plus a little metadata (3–4 KiB in total for a tiny commit with one device),
   on every backend. gcrypt re-uploads the entire history on every push to a Git
-  or SFTP backend such as GitHub, and can repack without warning. One caveat
-  today: with a Git host as storage, each operation first clones the whole
-  encrypted carrier repository, so downloads are not yet incremental there.
+  or SFTP backend such as GitHub, and can repack without warning.
 - **Safe: no silent force pushes.** Fast-forward checks run on the client, and
   the storage moves `HEAD` only by compare-and-swap. When two people push at
   once, one wins and the other gets an ordinary rejection. With gcrypt every
@@ -299,13 +297,15 @@ it.
 ## Status and roadmap
 
 Working today: clone, fetch, pull, and push; the directory and carrier-Git
-backends; per-device keys; adding and revoking devices; incremental transfer;
+backends; per-device keys; adding and revoking devices; incremental uploads;
 and rollback and race detection.
 
-Planned: M-of-N administrator approval, key recovery and replacement, automatic
+Planned: a persistent local cache so fetches from a Git host download only new
+data, M-of-N administrator approval, key recovery and replacement, automatic
 retry after losing a push race, an S3 conditional-write backend, garbage
 collection and compaction, tags and branch deletion, shallow and partial clone,
-and optional transparency-log anchoring.
+optional transparency-log anchoring, and an optional file-level mode that
+encrypts only selected files while keeping per-device keys and revocation.
 
 ## Documentation
 
