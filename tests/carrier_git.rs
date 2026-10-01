@@ -178,6 +178,104 @@ fn carrier_git_supports_native_push_and_clone_without_plaintext() {
 }
 
 #[test]
+fn carrier_git_supports_tags_and_ref_deletion() {
+    let temporary = tempfile::tempdir().unwrap();
+    let _cache = isolated_cache(&temporary);
+    let carrier = temporary.path().join("carrier.git");
+    let source = temporary.path().join("source");
+    let returning = temporary.path().join("returning");
+    let key_path = temporary.path().join("repository.key.json");
+    let main = init_source(&source, "carrier refs");
+    let key = KeyFile::generate();
+    key.write_new(&key_path).unwrap();
+    init_carrier(temporary.path(), &carrier, &key);
+
+    let url = format!("e2ee::git+{}", carrier.display());
+    git(&source, &["remote", "add", "private", &url], false);
+    git(
+        &source,
+        &[
+            "config",
+            "remote.private.e2ee-key",
+            key_path.to_str().unwrap(),
+        ],
+        false,
+    );
+    git(&source, &["push", "private", "main"], true);
+    git(
+        &source,
+        &["tag", "-a", "v-carrier", "-m", "carrier release", &main],
+        false,
+    );
+    git(&source, &["push", "private", "v-carrier"], true);
+
+    let mut clone_command = Command::new("git");
+    clone_command
+        .args([
+            "-c",
+            &format!("e2ee.key={}", key_path.display()),
+            "clone",
+            "-q",
+            &url,
+        ])
+        .arg(&returning);
+    add_helper_to_path(&mut clone_command);
+    let clone_output = clone_command.output().unwrap();
+    assert!(
+        clone_output.status.success(),
+        "clone stdout={} stderr={}",
+        String::from_utf8_lossy(&clone_output.stdout),
+        String::from_utf8_lossy(&clone_output.stderr)
+    );
+    assert_eq!(
+        git(
+            &returning,
+            &["cat-file", "-t", "refs/tags/v-carrier"],
+            false
+        ),
+        "tag"
+    );
+
+    git(&source, &["switch", "-q", "-c", "doomed"], false);
+    fs::write(source.join("note.md"), "branch to delete\n").unwrap();
+    git(&source, &["add", "note.md"], false);
+    git(&source, &["commit", "-q", "-m", "doomed"], false);
+    git(&source, &["push", "private", "doomed"], true);
+    git(&source, &["push", "--delete", "private", "doomed"], true);
+    git(&source, &["push", "private", ":refs/tags/v-carrier"], true);
+    git(
+        &returning,
+        &["fetch", "--prune", "--prune-tags", "origin"],
+        true,
+    );
+
+    assert!(
+        !git_output(
+            &returning,
+            &["show-ref", "--verify", "refs/remotes/origin/doomed"],
+            false
+        )
+        .status
+        .success()
+    );
+    assert!(
+        !git_output(
+            &returning,
+            &["show-ref", "--verify", "refs/tags/v-carrier"],
+            false
+        )
+        .status
+        .success()
+    );
+    let manifest =
+        EncryptedRepository::new(GitStorage::open(carrier.to_str().unwrap()).unwrap(), key)
+            .verify()
+            .unwrap();
+    assert!(!manifest.refs.contains_key("refs/heads/doomed"));
+    assert!(!manifest.refs.contains_key("refs/tags/v-carrier"));
+}
+
+#[test]
 fn carrier_git_allows_exactly_one_concurrent_writer() {
     let temporary = tempfile::tempdir().unwrap();
     let _cache = isolated_cache(&temporary);

@@ -191,6 +191,23 @@ fn exercise_read_only_helper<S: Storage>(
             "rejected push changed storage"
         );
     }
+
+    let before = snapshot_tree(remote_path);
+    let output = git_output(&clone, &["push", "--delete", "origin", "main"], true);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "read-only delete unexpectedly succeeded"
+    );
+    assert!(
+        stderr.contains(expected_error),
+        "delete error did not explain the read-only role: {stderr}"
+    );
+    assert_eq!(
+        snapshot_tree(remote_path),
+        before,
+        "rejected delete changed storage"
+    );
 }
 
 #[test]
