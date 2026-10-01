@@ -6,8 +6,8 @@ use std::sync::{Mutex, MutexGuard};
 
 use git_remote_e2ee::crypto::KeyFile;
 use git_remote_e2ee::policy::DeviceRoles;
-use git_remote_e2ee::repository::EncryptedRepository;
-use git_remote_e2ee::storage::{FilesystemStorage, GitStorage, Storage};
+use git_remote_e2ee::repository::{EncryptedRepository, RecoveryClass, RecoveryOptions};
+use git_remote_e2ee::storage::{FilesystemStorage, GitStorage, ObjectKind, Storage};
 
 static CACHE_ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -242,5 +242,63 @@ fn read_only_devices_use_both_storage_backends_without_publishing() {
         GitStorage::open(carrier.to_str().unwrap()).unwrap(),
         &carrier,
         &carrier_url,
+    );
+}
+
+#[test]
+fn read_only_device_cannot_publish_recovery() {
+    let temporary = tempfile::tempdir().unwrap();
+    let storage_path = temporary.path().join("storage");
+    let reader_repo = temporary.path().join("reader");
+    initialize_git(&reader_repo);
+    let owner = KeyFile::generate();
+    let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
+    let storage = FilesystemStorage::new(&storage_path);
+    let owner_repository = EncryptedRepository::new(storage.clone(), owner);
+    owner_repository.initialize().unwrap();
+    let admin_pin = temporary.path().join("owner.admin-state.json");
+    owner_repository.pin_admin_state(&admin_pin).unwrap();
+    owner_repository
+        .add_device(
+            reader.public_device().unwrap(),
+            DeviceRoles::reader(),
+            &admin_pin,
+        )
+        .unwrap();
+    owner_repository.fetch_into(&reader_repo, "origin").unwrap();
+    let (floor_id, _) = owner_repository.current_manifest().unwrap();
+    let invalid_bytes = b"malformed but content-addressed manifest";
+    let invalid_id = git_remote_e2ee::crypto::object_id(invalid_bytes);
+    storage
+        .put_object_if_absent(ObjectKind::Manifest, &invalid_id, invalid_bytes)
+        .unwrap();
+    storage
+        .compare_and_swap_head(Some(&floor_id), &invalid_id)
+        .unwrap();
+
+    let read_only = EncryptedRepository::new(storage.clone(), reader);
+    let report = read_only
+        .recover(
+            &reader_repo,
+            "origin",
+            RecoveryOptions {
+                publish: true,
+                base: None,
+                discard_newer: false,
+                accept_stale_floor: true,
+            },
+        )
+        .unwrap();
+    assert_eq!(report.classification, RecoveryClass::Invalid);
+    assert!(
+        report
+            .blocked_reason
+            .as_deref()
+            .unwrap()
+            .contains("not an active writer")
+    );
+    assert_eq!(
+        storage.read_head().unwrap().as_deref(),
+        Some(invalid_id.as_str())
     );
 }

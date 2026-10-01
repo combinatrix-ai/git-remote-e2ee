@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -6,9 +7,14 @@ use std::sync::{Arc, Barrier, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use git_remote_e2ee::crypto::KeyFile;
-use git_remote_e2ee::repository::EncryptedRepository;
-use git_remote_e2ee::storage::{CasConflict, GitStorage, Storage};
+use git_remote_e2ee::crypto::{KeyFile, object_id, random_key};
+use git_remote_e2ee::manifest::{
+    Manifest, ManifestAuthorization, open_manifest, peek_manifest_header, seal_manifest,
+    unwrap_generation_key, wrap_predecessor_key,
+};
+use git_remote_e2ee::policy::{DeviceRoles, PolicyState};
+use git_remote_e2ee::repository::{EncryptedRepository, RecoveryClass, RecoveryOptions};
+use git_remote_e2ee::storage::{CasConflict, GitStorage, ObjectKind, Storage};
 
 static CACHE_ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -95,6 +101,107 @@ fn init_carrier(root: &Path, carrier: &Path, key: &KeyFile) {
     )
     .initialize()
     .unwrap();
+}
+
+fn create_reader_signed_junk(
+    storage: &GitStorage,
+    reader: &KeyFile,
+    policy: &PolicyState,
+    parent_id: &str,
+) -> String {
+    let encrypted = storage.get_object(ObjectKind::Manifest, parent_id).unwrap();
+    let header = peek_manifest_header(&encrypted).unwrap();
+    let parent_key = unwrap_generation_key(&header, reader).unwrap();
+    let opened = open_manifest(&encrypted, &parent_key).unwrap();
+    let parent = opened.manifest();
+    let generation_key = random_key();
+    let manifest = Manifest {
+        format_version: parent.format_version,
+        repository_root: parent.repository_root.clone(),
+        generation: parent.generation + 1,
+        previous: Some(parent_id.to_owned()),
+        policy_id: parent.policy_id.clone(),
+        policy_generation: parent.policy_generation,
+        authorization: ManifestAuthorization::Writer,
+        total_pack_count: parent.total_pack_count,
+        refs: parent.refs.clone(),
+        new_packs: Vec::new(),
+        predecessor_key_wrap: Some(
+            wrap_predecessor_key(
+                &generation_key,
+                &parent_key,
+                &parent.repository_root,
+                parent.generation + 1,
+                parent_id,
+            )
+            .unwrap(),
+        ),
+        introduced_policy: None,
+    };
+    let encrypted = seal_manifest(
+        reader,
+        policy,
+        &generation_key,
+        ManifestAuthorization::Writer,
+        manifest,
+    )
+    .unwrap();
+    let id = object_id(&encrypted);
+    storage
+        .put_object_if_absent(ObjectKind::Manifest, &id, &encrypted)
+        .unwrap();
+    id
+}
+
+fn create_writer_successor(
+    storage: &GitStorage,
+    writer: &KeyFile,
+    policy: &PolicyState,
+    parent_id: &str,
+    refs: BTreeMap<String, String>,
+) -> String {
+    let encrypted = storage.get_object(ObjectKind::Manifest, parent_id).unwrap();
+    let header = peek_manifest_header(&encrypted).unwrap();
+    let parent_key = unwrap_generation_key(&header, writer).unwrap();
+    let opened = open_manifest(&encrypted, &parent_key).unwrap();
+    let parent = opened.manifest();
+    let generation_key = random_key();
+    let manifest = Manifest {
+        format_version: parent.format_version,
+        repository_root: parent.repository_root.clone(),
+        generation: parent.generation + 1,
+        previous: Some(parent_id.to_owned()),
+        policy_id: parent.policy_id.clone(),
+        policy_generation: parent.policy_generation,
+        authorization: ManifestAuthorization::Writer,
+        total_pack_count: parent.total_pack_count,
+        refs,
+        new_packs: Vec::new(),
+        predecessor_key_wrap: Some(
+            wrap_predecessor_key(
+                &generation_key,
+                &parent_key,
+                &parent.repository_root,
+                parent.generation + 1,
+                parent_id,
+            )
+            .unwrap(),
+        ),
+        introduced_policy: None,
+    };
+    let encrypted = seal_manifest(
+        writer,
+        policy,
+        &generation_key,
+        ManifestAuthorization::Writer,
+        manifest,
+    )
+    .unwrap();
+    let id = object_id(&encrypted);
+    storage
+        .put_object_if_absent(ObjectKind::Manifest, &id, &encrypted)
+        .unwrap();
+    id
 }
 
 fn add_helper_to_path(command: &mut Command) {
@@ -734,6 +841,593 @@ fn carrier_git_detects_tampered_ciphertext_chunk() {
         error.to_string().contains("invalid pack stream magic"),
         "unexpected verification error: {error:#}"
     );
+}
+
+#[test]
+fn carrier_recovery_chooses_legitimate_descendant_and_restores_deleted_ciphertext() {
+    let temporary = tempfile::tempdir().unwrap();
+    let _cache = isolated_cache(&temporary);
+    let carrier = temporary.path().join("carrier.git");
+    let source = temporary.path().join("source");
+    let returning = temporary.path().join("returning");
+    let fresh = temporary.path().join("fresh");
+    let cache_root = temporary.path().join("carrier-cache");
+    init_source(&source, "legitimate descendant content");
+    init_source(&returning, "returning local content");
+    init_source(&fresh, "fresh local content");
+
+    let owner = KeyFile::generate();
+    let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
+    let admin_pin = temporary.path().join("owner.admin-state.json");
+    git(
+        temporary.path(),
+        &["init", "--bare", "-q", carrier.to_str().unwrap()],
+        false,
+    );
+    let repository = EncryptedRepository::new(
+        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        owner.clone(),
+    );
+    repository.initialize().unwrap();
+    repository.pin_admin_state(&admin_pin).unwrap();
+    let (reader_policy_manifest, _) = repository
+        .add_device(
+            reader.public_device().unwrap(),
+            DeviceRoles::reader(),
+            &admin_pin,
+        )
+        .unwrap();
+    let policy_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let policy_encrypted = policy_storage
+        .get_object(ObjectKind::Manifest, &reader_policy_manifest)
+        .unwrap();
+    let policy_header = peek_manifest_header(&policy_encrypted).unwrap();
+    let policy_key = unwrap_generation_key(&policy_header, &reader).unwrap();
+    let policy_manifest = open_manifest(&policy_encrypted, &policy_key).unwrap();
+    let floor_policy = PolicyState::parse(
+        policy_manifest
+            .manifest()
+            .introduced_policy
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap();
+    let pushed_object = git(&source, &["rev-parse", "HEAD"], false);
+    repository
+        .push_ref(&source, "refs/heads/main", false)
+        .unwrap();
+    let (floor_id, floor_manifest) = repository.current_manifest().unwrap();
+    let pack_id = floor_manifest.new_packs[0].id.clone();
+    repository.fetch_into(&returning, "private").unwrap();
+    let floor_generation: u64 = serde_json::from_slice::<serde_json::Value>(
+        &fs::read(returning.join(".git/git-remote-e2ee/private/state.json")).unwrap(),
+    )
+    .unwrap()["generation"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(floor_manifest.generation, floor_generation);
+    repository
+        .revoke_device(&reader.device_id().unwrap(), &admin_pin)
+        .unwrap();
+    let (legitimate_id, legitimate) = repository.current_manifest().unwrap();
+    assert_eq!(legitimate.refs["refs/heads/main"], pushed_object);
+
+    let attacker = temporary.path().join("carrier-edit");
+    git(
+        temporary.path(),
+        &[
+            "clone",
+            "-q",
+            "-b",
+            "git-remote-e2ee",
+            carrier.to_str().unwrap(),
+            attacker.to_str().unwrap(),
+        ],
+        false,
+    );
+    git(&attacker, &["config", "user.name", "Carrier editor"], false);
+    git(
+        &attacker,
+        &["config", "user.email", "carrier-editor@example.invalid"],
+        false,
+    );
+    fs::remove_dir_all(
+        attacker
+            .join("e2ee/objects")
+            .join(&pack_id[..2])
+            .join(&pack_id),
+    )
+    .unwrap();
+    fs::write(attacker.join("e2ee/HEAD"), format!("{floor_id}\n")).unwrap();
+    git(&attacker, &["add", "-A", "e2ee"], false);
+    git(
+        &attacker,
+        &["commit", "-q", "-m", "replay floor and delete pack"],
+        false,
+    );
+    git(
+        &attacker,
+        &["push", "-q", "origin", "git-remote-e2ee"],
+        false,
+    );
+
+    let replay_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let junk_id = create_reader_signed_junk(&replay_storage, &reader, &floor_policy, &floor_id);
+    replay_storage
+        .compare_and_swap_head(Some(&floor_id), &junk_id)
+        .unwrap();
+
+    let recovery_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let recoverer = EncryptedRepository::new(recovery_storage, owner.clone());
+    let report = recoverer
+        .recover(
+            &returning,
+            "private",
+            RecoveryOptions {
+                publish: false,
+                base: None,
+                discard_newer: false,
+                accept_stale_floor: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(report.classification, RecoveryClass::Invalid);
+    assert_eq!(report.default_base.as_deref(), Some(legitimate_id.as_str()));
+    assert!(report.replays.contains(&floor_id));
+    assert!(
+        report
+            .candidates
+            .iter()
+            .any(|candidate| candidate.manifest_id == legitimate_id)
+    );
+
+    let older_base = recoverer
+        .recover(
+            &returning,
+            "private",
+            RecoveryOptions {
+                publish: true,
+                base: Some(&floor_id),
+                discard_newer: false,
+                accept_stale_floor: false,
+            },
+        )
+        .unwrap();
+    assert!(
+        older_base
+            .blocked_reason
+            .as_deref()
+            .unwrap()
+            .contains("--discard-newer")
+    );
+
+    let recovered = recoverer
+        .recover(
+            &returning,
+            "private",
+            RecoveryOptions {
+                publish: true,
+                base: None,
+                discard_newer: false,
+                accept_stale_floor: false,
+            },
+        )
+        .unwrap();
+    let recovered_id = recovered.published_manifest.unwrap();
+    let (current_id, manifest) = recoverer.current_manifest().unwrap();
+    assert_eq!(current_id, recovered_id);
+    assert_eq!(manifest.previous.as_deref(), Some(legitimate_id.as_str()));
+    assert_eq!(manifest.generation, floor_generation + 2);
+    assert_eq!(manifest.refs["refs/heads/main"], pushed_object);
+    assert!(
+        GitStorage::open(carrier.to_str().unwrap())
+            .unwrap()
+            .open_object(ObjectKind::Pack, &pack_id)
+            .is_ok()
+    );
+    let recovered_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let recovered_bytes = recovered_storage
+        .get_object(ObjectKind::Manifest, &current_id)
+        .unwrap();
+    let recovered_header = peek_manifest_header(&recovered_bytes).unwrap();
+    assert!(unwrap_generation_key(&recovered_header, &reader).is_err());
+
+    recoverer.fetch_into(&returning, "private").unwrap();
+    recoverer.fetch_into(&fresh, "private").unwrap();
+    assert_eq!(
+        git(
+            &fresh,
+            &["show", "refs/remotes/private/main:note.md"],
+            false
+        ),
+        "legitimate descendant content"
+    );
+    let carrier_head = Command::new("git")
+        .arg(format!("--git-dir={}", carrier.display()))
+        .args(["show", "refs/heads/git-remote-e2ee:e2ee/HEAD"])
+        .output()
+        .unwrap();
+    assert!(carrier_head.status.success());
+    assert_eq!(
+        String::from_utf8(carrier_head.stdout).unwrap().trim(),
+        current_id
+    );
+    assert!(cache_root.exists());
+}
+
+#[test]
+fn carrier_recovery_offers_hidden_legitimate_content_descendant() {
+    let temporary = tempfile::tempdir().unwrap();
+    let _cache = isolated_cache(&temporary);
+    let carrier = temporary.path().join("carrier.git");
+    let source = temporary.path().join("source");
+    let returning = temporary.path().join("returning");
+    let fresh = temporary.path().join("fresh");
+    init_source(&source, "legitimate descendant content");
+    init_source(&returning, "returning local content");
+    init_source(&fresh, "fresh local content");
+    git(
+        temporary.path(),
+        &["init", "--bare", "-q", carrier.to_str().unwrap()],
+        false,
+    );
+
+    let owner = KeyFile::generate();
+    let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
+    let admin_pin = temporary.path().join("owner.admin-state.json");
+    let repository = EncryptedRepository::new(
+        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        owner.clone(),
+    );
+    repository.initialize().unwrap();
+    repository.pin_admin_state(&admin_pin).unwrap();
+    let (floor_id, _) = repository
+        .add_device(
+            reader.public_device().unwrap(),
+            DeviceRoles::reader(),
+            &admin_pin,
+        )
+        .unwrap();
+    let floor_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let floor_bytes = floor_storage
+        .get_object(ObjectKind::Manifest, &floor_id)
+        .unwrap();
+    let floor_header = peek_manifest_header(&floor_bytes).unwrap();
+    let floor_key = unwrap_generation_key(&floor_header, &reader).unwrap();
+    let floor_opened = open_manifest(&floor_bytes, &floor_key).unwrap();
+    let floor_policy = PolicyState::parse(
+        floor_opened
+            .manifest()
+            .introduced_policy
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap();
+    repository.fetch_into(&returning, "private").unwrap();
+
+    let pushed_object = git(&source, &["rev-parse", "HEAD"], false);
+    repository
+        .push_ref(&source, "refs/heads/main", false)
+        .unwrap();
+    let (legitimate_id, legitimate) = repository.current_manifest().unwrap();
+    assert_eq!(legitimate.refs["refs/heads/main"], pushed_object);
+
+    let attacker = temporary.path().join("carrier-edit");
+    git(
+        temporary.path(),
+        &[
+            "clone",
+            "-q",
+            "-b",
+            "git-remote-e2ee",
+            carrier.to_str().unwrap(),
+            attacker.to_str().unwrap(),
+        ],
+        false,
+    );
+    git(&attacker, &["config", "user.name", "Carrier editor"], false);
+    git(
+        &attacker,
+        &["config", "user.email", "carrier-editor@example.invalid"],
+        false,
+    );
+    fs::write(attacker.join("e2ee/HEAD"), format!("{floor_id}\n")).unwrap();
+    git(&attacker, &["add", "-A", "e2ee"], false);
+    git(&attacker, &["commit", "-q", "-m", "replay floor"], false);
+    git(
+        &attacker,
+        &["push", "-q", "origin", "git-remote-e2ee"],
+        false,
+    );
+
+    let replay_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let junk_id = create_reader_signed_junk(&replay_storage, &reader, &floor_policy, &floor_id);
+    replay_storage
+        .compare_and_swap_head(Some(&floor_id), &junk_id)
+        .unwrap();
+
+    let recoverer =
+        EncryptedRepository::new(GitStorage::open(carrier.to_str().unwrap()).unwrap(), owner);
+    let report = recoverer
+        .recover(
+            &returning,
+            "private",
+            RecoveryOptions {
+                publish: false,
+                base: None,
+                discard_newer: false,
+                accept_stale_floor: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(report.classification, RecoveryClass::Invalid);
+    assert_eq!(report.default_base.as_deref(), Some(legitimate_id.as_str()));
+    assert!(report.replays.contains(&floor_id));
+    assert!(report.candidates.iter().any(|candidate| {
+        candidate.manifest_id == legitimate_id && candidate.generation == legitimate.generation
+    }));
+
+    let stale_choice = recoverer
+        .recover(
+            &returning,
+            "private",
+            RecoveryOptions {
+                publish: true,
+                base: Some(&floor_id),
+                discard_newer: false,
+                accept_stale_floor: false,
+            },
+        )
+        .unwrap();
+    assert!(
+        stale_choice
+            .blocked_reason
+            .as_deref()
+            .unwrap()
+            .contains("--discard-newer")
+    );
+
+    let recovered = recoverer
+        .recover(
+            &returning,
+            "private",
+            RecoveryOptions {
+                publish: true,
+                base: None,
+                discard_newer: false,
+                accept_stale_floor: false,
+            },
+        )
+        .unwrap();
+    let recovered_id = recovered.published_manifest.unwrap();
+    let (head, manifest) = recoverer.current_manifest().unwrap();
+    assert_eq!(head, recovered_id);
+    assert_eq!(manifest.previous.as_deref(), Some(legitimate_id.as_str()));
+    assert_eq!(manifest.refs["refs/heads/main"], pushed_object);
+    recoverer.fetch_into(&returning, "private").unwrap();
+    recoverer.fetch_into(&fresh, "private").unwrap();
+    assert_eq!(
+        git(
+            &fresh,
+            &["show", "refs/remotes/private/main:note.md"],
+            false
+        ),
+        "legitimate descendant content"
+    );
+}
+
+#[test]
+fn carrier_recovery_refuses_conflicting_authenticated_descendants() {
+    let temporary = tempfile::tempdir().unwrap();
+    let _cache = isolated_cache(&temporary);
+    let carrier = temporary.path().join("carrier.git");
+    let returning = temporary.path().join("returning");
+    init_source(&returning, "local state");
+    git(
+        temporary.path(),
+        &["init", "--bare", "-q", carrier.to_str().unwrap()],
+        false,
+    );
+
+    let owner = KeyFile::generate();
+    let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
+    let admin_pin = temporary.path().join("owner.admin-state.json");
+    let repository = EncryptedRepository::new(
+        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        owner.clone(),
+    );
+    repository.initialize().unwrap();
+    repository.pin_admin_state(&admin_pin).unwrap();
+    let (floor_id, _) = repository
+        .add_device(
+            reader.public_device().unwrap(),
+            DeviceRoles::reader(),
+            &admin_pin,
+        )
+        .unwrap();
+    repository.fetch_into(&returning, "private").unwrap();
+
+    let policy_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let policy_encrypted = policy_storage
+        .get_object(ObjectKind::Manifest, &floor_id)
+        .unwrap();
+    let policy_header = peek_manifest_header(&policy_encrypted).unwrap();
+    let policy_key = unwrap_generation_key(&policy_header, &owner).unwrap();
+    let policy_manifest = open_manifest(&policy_encrypted, &policy_key).unwrap();
+    let policy = PolicyState::parse(
+        policy_manifest
+            .manifest()
+            .introduced_policy
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap();
+
+    let first_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let first_fork = create_writer_successor(
+        &first_storage,
+        &owner,
+        &policy,
+        &floor_id,
+        BTreeMap::from([("refs/heads/main".to_owned(), "1".repeat(40))]),
+    );
+    first_storage
+        .compare_and_swap_head(Some(&floor_id), &first_fork)
+        .unwrap();
+    let second_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let second_fork = create_writer_successor(
+        &second_storage,
+        &owner,
+        &policy,
+        &floor_id,
+        BTreeMap::from([("refs/heads/main".to_owned(), "2".repeat(40))]),
+    );
+    second_storage
+        .compare_and_swap_head(Some(&first_fork), &second_fork)
+        .unwrap();
+    let junk_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let junk = create_reader_signed_junk(&junk_storage, &reader, &policy, &floor_id);
+    junk_storage
+        .compare_and_swap_head(Some(&second_fork), &junk)
+        .unwrap();
+
+    let recovery_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let report = EncryptedRepository::new(recovery_storage, owner)
+        .recover(
+            &returning,
+            "private",
+            RecoveryOptions {
+                publish: true,
+                base: None,
+                discard_newer: false,
+                accept_stale_floor: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(report.classification, RecoveryClass::Invalid);
+    assert!(report.conflict);
+    assert!(
+        report
+            .blocked_reason
+            .as_deref()
+            .unwrap()
+            .contains("refusing to choose between forks")
+    );
+    assert!(
+        report
+            .candidates
+            .iter()
+            .any(|candidate| candidate.manifest_id == first_fork)
+    );
+    assert!(
+        report
+            .candidates
+            .iter()
+            .any(|candidate| candidate.manifest_id == second_fork)
+    );
+    let current = GitStorage::open(carrier.to_str().unwrap())
+        .unwrap()
+        .read_head()
+        .unwrap();
+    assert_eq!(current.as_deref(), Some(junk.as_str()));
+}
+
+#[test]
+fn carrier_recovery_loses_cas_without_retrying_when_another_writer_publishes() {
+    let temporary = tempfile::tempdir().unwrap();
+    let _cache = isolated_cache(&temporary);
+    let carrier = temporary.path().join("carrier.git");
+    let returning = temporary.path().join("returning");
+    init_source(&returning, "local state");
+    git(
+        temporary.path(),
+        &["init", "--bare", "-q", carrier.to_str().unwrap()],
+        false,
+    );
+
+    let owner = KeyFile::generate();
+    let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
+    let admin_pin = temporary.path().join("owner.admin-state.json");
+    let repository = EncryptedRepository::new(
+        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        owner.clone(),
+    );
+    repository.initialize().unwrap();
+    repository.pin_admin_state(&admin_pin).unwrap();
+    let (floor_id, _) = repository
+        .add_device(
+            reader.public_device().unwrap(),
+            DeviceRoles::reader(),
+            &admin_pin,
+        )
+        .unwrap();
+    repository.fetch_into(&returning, "private").unwrap();
+    let policy_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let policy_encrypted = policy_storage
+        .get_object(ObjectKind::Manifest, &floor_id)
+        .unwrap();
+    let policy_header = peek_manifest_header(&policy_encrypted).unwrap();
+    let policy_key = unwrap_generation_key(&policy_header, &reader).unwrap();
+    let policy_manifest = open_manifest(&policy_encrypted, &policy_key).unwrap();
+    let policy = PolicyState::parse(
+        policy_manifest
+            .manifest()
+            .introduced_policy
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap();
+
+    let bad_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let junk = create_reader_signed_junk(&bad_storage, &reader, &policy, &floor_id);
+    bad_storage
+        .compare_and_swap_head(Some(&floor_id), &junk)
+        .unwrap();
+    let stale_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let stale_recoverer = EncryptedRepository::new(stale_storage, owner.clone());
+    let offered = stale_recoverer
+        .recover(
+            &returning,
+            "private",
+            RecoveryOptions {
+                publish: false,
+                base: None,
+                discard_newer: false,
+                accept_stale_floor: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(offered.classification, RecoveryClass::Invalid);
+    assert_eq!(offered.default_base.as_deref(), Some(floor_id.as_str()));
+
+    let competing_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let winner = create_writer_successor(
+        &competing_storage,
+        &owner,
+        &policy,
+        &floor_id,
+        BTreeMap::new(),
+    );
+    competing_storage
+        .compare_and_swap_head(Some(&junk), &winner)
+        .unwrap();
+
+    let error = stale_recoverer
+        .recover(
+            &returning,
+            "private",
+            RecoveryOptions {
+                publish: true,
+                base: None,
+                discard_newer: false,
+                accept_stale_floor: false,
+            },
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("concurrently"));
+    let latest =
+        EncryptedRepository::new(GitStorage::open(carrier.to_str().unwrap()).unwrap(), owner);
+    assert_eq!(latest.current_manifest().unwrap().0, winner);
 }
 
 #[test]
