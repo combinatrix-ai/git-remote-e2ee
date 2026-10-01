@@ -1,7 +1,9 @@
+use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 
 use base64::Engine;
 use git_remote_e2ee::crypto::{KeyFile, object_id};
@@ -9,6 +11,8 @@ use git_remote_e2ee::manifest::{ManifestHeader, peek_manifest_header};
 use git_remote_e2ee::policy::DeviceRoles;
 use git_remote_e2ee::repository::EncryptedRepository;
 use git_remote_e2ee::storage::{FilesystemStorage, GitStorage, Storage};
+
+static CACHE_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn filesystem_storage_hides_device_metadata_and_pads_reader_envelopes() {
@@ -25,6 +29,13 @@ fn filesystem_storage_hides_device_metadata_and_pads_reader_envelopes() {
 #[test]
 fn carrier_history_hides_device_metadata_and_pads_reader_envelopes() {
     let temporary = tempfile::tempdir().unwrap();
+    let _cache_lock = CACHE_ENV_LOCK.lock().unwrap();
+    unsafe {
+        env::set_var(
+            "GIT_REMOTE_E2EE_CACHE_DIR",
+            temporary.path().join("carrier-cache"),
+        )
+    };
     let carrier = temporary.path().join("carrier.git");
     let output = Command::new("git")
         .args(["init", "--bare", "-q"])

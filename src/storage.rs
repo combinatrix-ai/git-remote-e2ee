@@ -306,9 +306,12 @@ fn verify_file_id(path: &Path, id: &str) -> Result<()> {
 
 const CARRIER_BRANCH: &str = "git-remote-e2ee";
 const CARRIER_CHUNK_SIZE: usize = 32 * 1024 * 1024;
+const CARRIER_CACHE_ENV: &str = "GIT_REMOTE_E2EE_CACHE_DIR";
+const CARRIER_CACHE_FETCH_REF: &str = "refs/heads/git-remote-e2ee";
 
 pub struct GitStorage {
     checkout: tempfile::TempDir,
+    remote: String,
     state: Mutex<GitStorageState>,
 }
 
@@ -474,44 +477,32 @@ impl GitStorage {
         if remote.is_empty() {
             bail!("empty carrier Git remote")
         }
-        let checkout = tempfile::Builder::new()
+
+        let mut cache = CarrierCache::lock(remote)?;
+        let mut base_commit = cache.refresh(remote)?;
+        let mut checkout = tempfile::Builder::new()
             .prefix("git-remote-e2ee-carrier-")
             .tempdir()?;
-        let checkout_path = checkout
-            .path()
-            .to_str()
-            .context("carrier checkout path is not UTF-8")?;
-        git_command(
-            checkout
-                .path()
-                .parent()
-                .context("carrier tempdir has no parent")?,
-            &["clone", "--quiet", "--no-checkout", remote, checkout_path],
-        )?;
-        git_command(checkout.path(), &["config", "user.name", "git-remote-e2ee"])?;
-        git_command(
-            checkout.path(),
-            &["config", "user.email", "git-remote-e2ee@invalid"],
-        )?;
-
-        let remote_ref = format!("refs/remotes/origin/{CARRIER_BRANCH}");
-        let base_commit = git_rev_parse(checkout.path(), &remote_ref)?;
-        match &base_commit {
-            Some(_) => {
-                git_command(
-                    checkout.path(),
-                    &["checkout", "--quiet", "-B", CARRIER_BRANCH, &remote_ref],
-                )?;
+        if let Err(error) =
+            create_carrier_checkout(checkout.path(), &cache.path, remote, &base_commit)
+        {
+            if !cache.is_corrupt()? {
+                return Err(error).context("create carrier checkout");
             }
-            None => {
-                git_command(
-                    checkout.path(),
-                    &["checkout", "--quiet", "--orphan", CARRIER_BRANCH],
-                )?;
-            }
+            drop(checkout);
+            cache.rebuild()?;
+            base_commit = cache.refresh(remote)?;
+            checkout = tempfile::Builder::new()
+                .prefix("git-remote-e2ee-carrier-")
+                .tempdir()?;
+            create_carrier_checkout(checkout.path(), &cache.path, remote, &base_commit)
+                .context("create carrier checkout after rebuilding corrupt cache")?;
         }
+        drop(cache);
+
         Ok(Self {
             checkout,
+            remote: remote.to_owned(),
             state: Mutex::new(GitStorageState { base_commit }),
         })
     }
@@ -543,21 +534,8 @@ impl GitStorage {
         }
     }
 
-    fn remote_tip(&self) -> Result<Option<String>> {
-        let output = carrier_git_command()
-            .arg("-C")
-            .arg(self.root())
-            .args(["ls-remote", "--heads", "origin"])
-            .arg(format!("refs/heads/{CARRIER_BRANCH}"))
-            .output()?;
-        if !output.status.success() {
-            bail!(
-                "git ls-remote failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )
-        }
-        let text = String::from_utf8(output.stdout)?;
-        Ok(text.split_whitespace().next().map(ToOwned::to_owned))
+    fn refresh_remote(&self) -> Result<Option<String>> {
+        CarrierCache::lock(&self.remote)?.refresh(&self.remote)
     }
 
     fn head_at_commit(&self, commit: Option<&str>) -> Result<Option<String>> {
@@ -604,6 +582,8 @@ impl Storage for GitStorage {
     }
 
     fn read_head(&self) -> Result<Option<String>> {
+        // `open` refreshed the remote before constructing this checkout; CAS
+        // refreshes again before trusting this snapshot for a write.
         self.local_head()
     }
 
@@ -613,7 +593,7 @@ impl Storage for GitStorage {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("carrier state lock poisoned"))?;
-        let remote_tip = self.remote_tip()?;
+        let remote_tip = self.refresh_remote()?;
         if remote_tip != state.base_commit {
             return Err(CasConflict {
                 expected: expected.map(ToOwned::to_owned),
@@ -646,7 +626,7 @@ impl Storage for GitStorage {
             .arg(format!("HEAD:refs/heads/{CARRIER_BRANCH}"))
             .output()?;
         if !push.status.success() {
-            let latest = self.remote_tip()?;
+            let latest = self.refresh_remote()?;
             return Err(CasConflict {
                 expected: expected.map(ToOwned::to_owned),
                 actual: self.head_at_commit(latest.as_deref())?,
@@ -656,6 +636,296 @@ impl Storage for GitStorage {
         state.base_commit = Some(new_commit);
         Ok(())
     }
+}
+
+struct CarrierCache {
+    remote_dir: PathBuf,
+    path: PathBuf,
+    _lock: File,
+}
+
+impl CarrierCache {
+    fn lock(remote: &str) -> Result<Self> {
+        let normalized = normalize_carrier_remote(remote)?;
+        let hash = hex::encode(Sha256::digest(normalized.as_bytes()));
+        let root = carrier_cache_root()?;
+        fs::create_dir_all(&root)
+            .with_context(|| format!("create carrier cache directory {}", root.display()))?;
+        let root = fs::canonicalize(&root)?;
+        let lock_path = root.join(format!(".{hash}.lock"));
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("open carrier cache lock {}", lock_path.display()))?;
+        lock.lock_exclusive()
+            .with_context(|| format!("lock carrier cache {}", lock_path.display()))?;
+        let remote_dir = root.join(&hash);
+        Ok(Self {
+            remote_dir,
+            path: PathBuf::new(),
+            _lock: lock,
+        })
+    }
+
+    fn refresh(&mut self, remote: &str) -> Result<Option<String>> {
+        self.ensure_initialized()?;
+        match fetch_carrier_branch(&self.path, remote) {
+            Ok(tip) => Ok(tip),
+            Err(fetch_error) if self.is_corrupt()? => {
+                self.rebuild()?;
+                fetch_carrier_branch(&self.path, remote).with_context(|| {
+                    format!(
+                        "fetch carrier branch after rebuilding corrupt cache (initial fetch failed: {fetch_error:#})"
+                    )
+                })
+            }
+            Err(fetch_error) => Err(fetch_error),
+        }
+    }
+
+    fn ensure_initialized(&mut self) -> Result<()> {
+        fs::create_dir_all(&self.remote_dir).with_context(|| {
+            format!(
+                "create per-remote carrier cache {}",
+                self.remote_dir.display()
+            )
+        })?;
+        let current = self.remote_dir.join("current");
+        let generation = fs::read_to_string(&current)
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| valid_cache_generation(value));
+        if let Some(generation) = generation {
+            self.path = self.remote_dir.join(generation);
+        }
+        let usable = !self.path.as_os_str().is_empty()
+            && self.path.exists()
+            && cache_git_output(&self.path, &["rev-parse", "--is-bare-repository"]).is_ok_and(
+                |output| {
+                    output.status.success()
+                        && String::from_utf8_lossy(&output.stdout).trim() == "true"
+                },
+            );
+        if !usable {
+            self.initialize_generation()?;
+        }
+        if configure_cache(&self.path).is_err() {
+            self.rebuild()?;
+        }
+        Ok(())
+    }
+
+    fn initialize_generation(&mut self) -> Result<()> {
+        fs::create_dir_all(&self.remote_dir)?;
+        let mut random = [0_u8; 8];
+        OsRng.fill_bytes(&mut random);
+        let generation = format!("objects-{}-{}", std::process::id(), hex::encode(random));
+        self.path = self.remote_dir.join(generation);
+        let output = carrier_git_command()
+            .args(["init", "--bare", "--quiet"])
+            .arg(&self.path)
+            .output()?;
+        ensure_git_success(&output, "git init --bare carrier cache")?;
+        configure_cache(&self.path)?;
+        cache_git_command(
+            &self.path,
+            &["symbolic-ref", "HEAD", CARRIER_CACHE_FETCH_REF],
+        )?;
+        self.publish_current()
+    }
+
+    fn is_corrupt(&self) -> Result<bool> {
+        let output = cache_git_output(&self.path, &["fsck", "--full"])?;
+        Ok(!output.status.success())
+    }
+
+    fn rebuild(&mut self) -> Result<()> {
+        // Existing temporary checkouts may still borrow the previous object
+        // directory. Keep that generation intact and publish a fresh one.
+        self.initialize_generation()
+    }
+
+    fn publish_current(&self) -> Result<()> {
+        let generation = self
+            .path
+            .file_name()
+            .context("carrier cache generation has no name")?;
+        let generation = generation
+            .to_str()
+            .context("carrier cache generation name is not UTF-8")?;
+        let mut random = [0_u8; 8];
+        OsRng.fill_bytes(&mut random);
+        let temporary = self.remote_dir.join(format!(
+            ".current-{}-{}",
+            std::process::id(),
+            hex::encode(random)
+        ));
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        writeln!(file, "{generation}")?;
+        file.sync_all()?;
+        let current = self.remote_dir.join("current");
+        if current.exists() {
+            fs::remove_file(&current)?;
+        }
+        fs::rename(&temporary, &current)?;
+        Ok(())
+    }
+}
+
+fn valid_cache_generation(value: &str) -> bool {
+    value.starts_with("objects-")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+fn carrier_cache_root() -> Result<PathBuf> {
+    if let Some(override_dir) = std::env::var_os(CARRIER_CACHE_ENV) {
+        if override_dir.is_empty() {
+            bail!("{CARRIER_CACHE_ENV} must not be empty")
+        }
+        return Ok(PathBuf::from(override_dir));
+    }
+    let cache_home = match std::env::var_os("XDG_CACHE_HOME") {
+        Some(path) if !path.is_empty() => PathBuf::from(path),
+        _ => PathBuf::from(
+            std::env::var_os("HOME").context("HOME is unset and XDG_CACHE_HOME is unset")?,
+        )
+        .join(".cache"),
+    };
+    Ok(cache_home.join("git-remote-e2ee").join("carrier"))
+}
+
+fn normalize_carrier_remote(remote: &str) -> Result<String> {
+    if remote.trim().is_empty() {
+        bail!("empty carrier Git remote")
+    }
+    if remote.contains("://") {
+        return Ok(remote.trim().trim_end_matches('/').to_owned());
+    }
+    if remote == remote.trim()
+        && let Some((host, path)) = remote.split_once(':')
+        && !host.is_empty()
+        && !host.contains('/')
+        && !host.contains('\\')
+        && !(host.len() == 1 && host.as_bytes()[0].is_ascii_alphabetic())
+        && !remote.starts_with("./")
+        && !remote.starts_with("../")
+        && !remote.starts_with('/')
+    {
+        return Ok(format!("{host}:{}", path.trim_end_matches('/')));
+    }
+
+    let path = Path::new(remote);
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    match fs::canonicalize(&absolute) {
+        Ok(path) => Ok(path.to_string_lossy().into_owned()),
+        Err(_) => Ok(lexically_normalize(&absolute)
+            .to_string_lossy()
+            .into_owned()),
+    }
+}
+
+fn lexically_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn configure_cache(cache: &Path) -> Result<()> {
+    cache_git_command(cache, &["config", "gc.auto", "0"])?;
+    cache_git_command(cache, &["config", "maintenance.auto", "false"])?;
+    Ok(())
+}
+
+fn fetch_carrier_branch(cache: &Path, remote: &str) -> Result<Option<String>> {
+    let refspec = format!("+refs/heads/{CARRIER_BRANCH}:{CARRIER_CACHE_FETCH_REF}");
+    let fetch = cache_git_output(cache, &["fetch", "--quiet", "--no-tags", remote, &refspec])?;
+    if fetch.status.success() {
+        return git_rev_parse(cache, CARRIER_CACHE_FETCH_REF);
+    }
+
+    let ls_remote = cache_git_output(
+        cache,
+        &["ls-remote", "--heads", remote, CARRIER_CACHE_FETCH_REF],
+    )?;
+    ensure_git_success(&ls_remote, "git ls-remote carrier branch")?;
+    if String::from_utf8_lossy(&ls_remote.stdout).trim().is_empty() {
+        let delete = cache_git_output(cache, &["update-ref", "-d", CARRIER_CACHE_FETCH_REF])?;
+        ensure_git_success(&delete, "git update-ref delete missing carrier branch")?;
+        return Ok(None);
+    }
+    ensure_git_success(&fetch, "git fetch carrier branch")?;
+    unreachable!("failed git fetch must return an error")
+}
+
+fn create_carrier_checkout(
+    checkout: &Path,
+    cache: &Path,
+    remote: &str,
+    base_commit: &Option<String>,
+) -> Result<()> {
+    let output = carrier_git_command()
+        .arg("-C")
+        .arg(checkout)
+        .args(["init", "--quiet"])
+        .output()?;
+    ensure_git_success(&output, "git init carrier checkout")?;
+    let cache_objects = cache.join("objects");
+    let cache_objects = cache_objects
+        .to_str()
+        .context("carrier cache object path is not UTF-8")?;
+    if cache_objects.contains('\n') {
+        bail!("carrier cache object path contains a newline")
+    }
+    fs::write(
+        checkout.join(".git/objects/info/alternates"),
+        format!("{cache_objects}\n"),
+    )?;
+    git_command(checkout, &["config", "gc.auto", "0"])?;
+    git_command(checkout, &["config", "maintenance.auto", "false"])?;
+    git_command(checkout, &["config", "user.name", "git-remote-e2ee"])?;
+    git_command(
+        checkout,
+        &["config", "user.email", "git-remote-e2ee@invalid"],
+    )?;
+    git_command(checkout, &["remote", "add", "origin", remote])?;
+
+    let remote_ref = format!("refs/remotes/origin/{CARRIER_BRANCH}");
+    match base_commit {
+        Some(commit) => {
+            git_command(checkout, &["update-ref", &remote_ref, commit])?;
+            git_command(
+                checkout,
+                &["checkout", "--quiet", "-B", CARRIER_BRANCH, &remote_ref],
+            )?;
+        }
+        None => {
+            git_command(
+                checkout,
+                &["checkout", "--quiet", "--orphan", CARRIER_BRANCH],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn git_rev_parse(repo: &Path, reference: &str) -> Result<Option<String>> {
@@ -669,6 +939,29 @@ fn git_rev_parse(repo: &Path, reference: &str) -> Result<Option<String>> {
     } else {
         Ok(None)
     }
+}
+
+fn cache_git_command(cache: &Path, args: &[&str]) -> Result<()> {
+    let output = cache_git_output(cache, args)?;
+    ensure_git_success(&output, &format!("git {}", args.join(" ")))
+}
+
+fn cache_git_output(cache: &Path, args: &[&str]) -> Result<std::process::Output> {
+    Ok(carrier_git_command()
+        .arg("--git-dir")
+        .arg(cache)
+        .args(args)
+        .output()?)
+}
+
+fn ensure_git_success(output: &std::process::Output, action: &str) -> Result<()> {
+    if !output.status.success() {
+        bail!(
+            "{action} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }
+    Ok(())
 }
 
 fn git_command(repo: &Path, args: &[&str]) -> Result<()> {
