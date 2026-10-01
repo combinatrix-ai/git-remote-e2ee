@@ -414,6 +414,9 @@ impl<S: Storage> EncryptedRepository<S> {
         if let Some(remote_name) = remote_name {
             self.validate_remote_continuity(repo, remote_name, &chain)?;
         }
+        for reference in current.manifest.refs.keys() {
+            git::validate_inner_ref(repo, reference)?;
+        }
         let old_object = current.manifest.refs.get(destination_ref);
         let Some(source_ref) = source_ref else {
             if old_object.is_none() {

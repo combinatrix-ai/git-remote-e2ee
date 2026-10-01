@@ -341,8 +341,14 @@ fn resolve_tag_chain(repo: &Path, reference: &str, object: &str, label: &str) ->
         let mut target_kind = None;
         for line in body.lines().take_while(|line| !line.is_empty()) {
             if let Some(value) = line.strip_prefix("object ") {
+                if target.is_some() {
+                    bail!("annotated tag {reference} has duplicate target objects")
+                }
                 target = Some(value);
             } else if let Some(value) = line.strip_prefix("type ") {
+                if target_kind.is_some() {
+                    bail!("annotated tag {reference} has duplicate target types")
+                }
                 target_kind = Some(value);
             }
         }
