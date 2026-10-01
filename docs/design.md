@@ -122,7 +122,14 @@ administrative CAS is never automatically rebased.
 - Packs are decrypted segment by segment directly into `git index-pack`
   oldest-first.
 - After import, every advertised ref must resolve to a complete local Git
-  object graph before pins or remote-tracking refs move.
+  object graph before the continuity floor or remote-tracking refs move.
+- Listing authenticates and advertises the current manifest but does not
+  advance the continuity floor. The floor advances only after a successful
+  import and connectivity check, or after the client's own publication wins
+  compare-and-swap.
+- Per-repository/remote client-state updates hold an advisory file lock across
+  validation and read-modify-write. The state replacement remains durable and
+  atomic, and its manifest and policy generations never move backward.
 - The helper advertises `refs/heads/*` and `refs/tags/*`; every other ref
   namespace is rejected before publication.
 - Branch updates require fast-forward ancestry unless force is explicit. Tags
@@ -213,7 +220,23 @@ motivates future garbage collection.
 
 Returning clients pin repository root, manifest ID/generation, and policy
 generation. They reject rollback, non-descendant state, policy rollback, and
-root substitution.
+root substitution. A signed manifest seen by list is not yet a pin: helper
+state advances after all required packs are imported and every advertised ref
+passes the complete-object-graph check, or after the client's own publication
+successfully wins compare-and-swap. A missing or unusable pack therefore cannot
+raise the continuity floor.
+
+Each local repository/remote pair has one stable lock file beside its client
+state. Helpers hold the exclusive lock while checking the current floor and
+performing an import or publication update. State writes merge monotonically
+and use the existing flushed temporary-file, rename, and parent-directory
+sync path. Administrator pins use the same serialized, monotonic state update
+rules after initialization or a successful policy transition.
+
+State files written by earlier builds are not lowered automatically. Their
+head pin may have come from listing, but it is indistinguishable from a valid
+pin made after the client's own publication; lowering it could weaken rollback
+detection.
 
 Storage alone still cannot prevent:
 

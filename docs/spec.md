@@ -292,8 +292,10 @@ bytes, and verify SHA-256 of the complete stored stream against the descriptor
 ID. A malformed header, size mismatch, counter overflow, short read, reordered
 or duplicated segment, authentication failure, trailing byte, or hash mismatch
 is fatal. Plaintext may stream into `git index-pack` before the final object hash
-is known, but no ref or continuity pin may move until all cryptographic,
-content-address, process, and Git-connectivity checks succeed.
+is known, but no imported-state pin or remote ref may move until all
+cryptographic, content-address, process, and Git-connectivity checks succeed.
+Listing an authenticated manifest does not advance the continuity floor. A
+publisher advances its own floor only after its compare-and-swap succeeds.
 
 Immutable writes MUST be staged within the storage backend and become visible
 under their ciphertext ID only after the complete streamed hash matches that
@@ -402,6 +404,21 @@ refs, pinning the new head, or publishing a successor. A signed ref advance
 whose required pack delta is absent is invalid even when every cryptographic
 check succeeds.
 
+Authenticating and listing a manifest is only an observation; it MUST NOT
+advance the continuity floor. A helper client's head, generation, repository
+root, and policy-generation floor advances only after pack import and the
+complete-ref connectivity check succeed, or after that client successfully
+publishes its own successor with compare-and-swap. A failed or incomplete
+import leaves the previous floor intact, so an authenticated but unusable
+publication cannot make a later valid successor look like rollback.
+
+Client-state updates for one repository and remote MUST serialize their
+read-modify-write operation across helper processes. The merge MUST preserve
+the greatest recorded manifest and policy generations and MUST reject a
+same-generation head-ID conflict. The durable state-file replacement remains
+atomic; the lock is held while an import or publication checks and advances
+the floor.
+
 A client MAY satisfy that requirement incrementally. After a successful full
 or incremental connectivity check, it records the exact checked ref tips as a
 verified frontier. On a later fetch it first requires every frontier tip to
@@ -442,8 +459,11 @@ Unreachable losing objects require later GC.
 ## 11. Continuity and invitations
 
 Returning clients pin at least repository root, manifest ID and generation,
-and policy ID and generation. They reject rollback, a non-descendant manifest,
-policy rollback/sideways movement, root substitution, and generation gaps.
+and policy ID and generation. Helper continuity pins advance after a complete
+successful fetch/import or a successful own publication, never from listing
+alone. They reject rollback, a non-descendant manifest, policy
+rollback/sideways movement, root substitution, and generation gaps. Local
+client-state updates are serialized and monotonic across concurrent helpers.
 
 A fresh device should receive an administrator-authorized invitation checkpoint
 through an authenticated channel containing:
