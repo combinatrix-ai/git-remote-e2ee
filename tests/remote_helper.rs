@@ -1,7 +1,8 @@
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use git_remote_e2ee::crypto::KeyFile;
 use git_remote_e2ee::repository::EncryptedRepository;
@@ -128,6 +129,97 @@ fn native_git_push_and_fetch_use_the_remote_helper() {
         ),
         "through native Git"
     );
+}
+
+#[test]
+fn concurrent_helper_processes_preserve_the_client_state_floor() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let destination = temporary.path().join("destination");
+    let remote_path = temporary.path().join("remote");
+    let stale_remote = temporary.path().join("stale-remote");
+    let key_path = temporary.path().join("repository.key.json");
+    initialize_git(&source);
+    initialize_git(&destination);
+
+    let key = KeyFile::generate();
+    key.write_new(&key_path).unwrap();
+    let encrypted = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key);
+    encrypted.initialize().unwrap();
+    configure_remote(&source, &remote_path, &key_path);
+    configure_remote(&destination, &remote_path, &key_path);
+    encrypted.fetch_into(&destination, "private").unwrap();
+
+    fs::write(source.join("note.md"), "first\n").unwrap();
+    git(&source, &["add", "note.md"], false);
+    git(&source, &["commit", "-q", "-m", "first"], false);
+    git(&source, &["push", "private", "main"], true);
+    let stale_object = git(&source, &["rev-parse", "HEAD"], false);
+    copy_tree(&remote_path, &stale_remote);
+
+    fs::write(source.join("note.md"), "second\n").unwrap();
+    git(&source, &["add", "note.md"], false);
+    git(&source, &["commit", "-q", "-m", "second"], false);
+    let advertised_object = git(&source, &["rev-parse", "HEAD"], false);
+    git(&source, &["push", "private", "main"], true);
+    let (expected_head, expected_manifest) = encrypted.current_manifest().unwrap();
+
+    let current_url = format!("e2ee::{}", remote_path.display());
+    let stale_url = format!("e2ee::{}", stale_remote.display());
+    let helper = env!("CARGO_BIN_EXE_git-remote-e2ee");
+    let mut children = Vec::new();
+    for remote_url in [&stale_url, &stale_url, &current_url, &current_url] {
+        children.push(
+            Command::new(helper)
+                .arg("private")
+                .arg(remote_url)
+                .current_dir(&destination)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+    }
+    for (index, child) in children.iter_mut().enumerate() {
+        let object = if index < 2 {
+            &stale_object
+        } else {
+            &advertised_object
+        };
+        let protocol = format!("capabilities\nlist\n\nfetch {object} refs/heads/main\n\n");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(protocol.as_bytes())
+            .unwrap();
+    }
+    let mut current_successes = 0;
+    for (index, child) in children.into_iter().enumerate() {
+        let output = child.wait_with_output().unwrap();
+        if index >= 2 {
+            assert!(
+                output.status.success(),
+                "current helper failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            current_successes += 1;
+        } else if !output.status.success() {
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("rolled back"),
+                "stale helper failed unexpectedly: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+    assert_eq!(current_successes, 2);
+
+    let state_path = destination.join(".git/git-remote-e2ee/private/state.json");
+    let state: serde_json::Value = serde_json::from_slice(&fs::read(state_path).unwrap()).unwrap();
+    assert_eq!(state["generation"], expected_manifest.generation);
+    assert_eq!(state["imported_generation"], expected_manifest.generation);
+    assert_eq!(state["head_id"], expected_head);
 }
 
 #[test]

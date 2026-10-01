@@ -79,6 +79,14 @@ fn commit(repo: &Path, contents: &str, message: &str) -> String {
     git(repo, &["rev-parse", "HEAD"])
 }
 
+fn client_state(repo: &Path, remote_name: &str) -> serde_json::Value {
+    let path = repo
+        .join(".git/git-remote-e2ee")
+        .join(remote_name)
+        .join("state.json");
+    serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+}
+
 fn copy_tree(source: &Path, destination: &Path) {
     fs::create_dir_all(destination).unwrap();
     for entry in fs::read_dir(source).unwrap() {
@@ -135,6 +143,102 @@ fn pushes_incrementally_and_fetches_into_another_repository() {
         git(&destination, &["show", &format!("{second}:note.md")]),
         "second"
     );
+}
+
+#[test]
+fn missing_pack_observation_does_not_advance_the_floor() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let destination = temporary.path().join("destination");
+    let remote_path = temporary.path().join("remote");
+    initialize_git(&source);
+    initialize_git(&destination);
+
+    let key = KeyFile::generate();
+    let repository = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key);
+    repository.initialize().unwrap();
+    commit(&source, "first\n", "first");
+    repository
+        .push_update_for_remote(
+            &source,
+            "encrypted",
+            "refs/heads/main",
+            "refs/heads/main",
+            false,
+        )
+        .unwrap();
+    repository.fetch_into(&destination, "encrypted").unwrap();
+    assert_eq!(client_state(&destination, "encrypted")["generation"], 1);
+    assert_eq!(
+        client_state(&destination, "encrypted")["imported_generation"],
+        1
+    );
+
+    commit(&source, "second\n", "second");
+    repository
+        .push_update_for_remote(
+            &source,
+            "encrypted",
+            "refs/heads/main",
+            "refs/heads/main",
+            false,
+        )
+        .unwrap();
+    let (_, manifest) = repository.current_manifest().unwrap();
+    let pack_id = manifest.new_packs[0].id.clone();
+    let pack_path = remote_path
+        .join("objects")
+        .join(&pack_id[..2])
+        .join(&pack_id);
+    let saved_pack = fs::read(&pack_path).unwrap();
+    fs::remove_file(&pack_path).unwrap();
+
+    let listed = repository
+        .observe_manifest(&destination, "encrypted")
+        .unwrap();
+    assert_eq!(listed.generation, 2);
+    assert_eq!(client_state(&destination, "encrypted")["generation"], 1);
+    let error = repository
+        .fetch_into(&destination, "encrypted")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(&pack_id), "unexpected error: {error}");
+    assert_eq!(client_state(&destination, "encrypted")["generation"], 1);
+
+    write_stored_object(&remote_path, "objects", &pack_id, &saved_pack);
+    let fetched = repository.fetch_into(&destination, "encrypted").unwrap();
+    assert_eq!(fetched.generation, 2);
+    let state = client_state(&destination, "encrypted");
+    assert_eq!(state["generation"], 2);
+    assert_eq!(state["imported_generation"], 2);
+}
+
+#[test]
+fn successful_own_publication_advances_the_client_floor() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let remote_path = temporary.path().join("remote");
+    initialize_git(&source);
+
+    let key = KeyFile::generate();
+    let repository = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key);
+    repository.initialize().unwrap();
+    commit(&source, "published\n", "published");
+    let head = repository
+        .push_update_for_remote(
+            &source,
+            "encrypted",
+            "refs/heads/main",
+            "refs/heads/main",
+            false,
+        )
+        .unwrap();
+
+    let state_path = source.join(".git/git-remote-e2ee/encrypted/state.json");
+    let state: serde_json::Value = serde_json::from_slice(&fs::read(state_path).unwrap()).unwrap();
+    assert_eq!(state["head_id"], head);
+    assert_eq!(state["generation"], 1);
+    assert_eq!(state["imported_generation"], serde_json::Value::Null);
 }
 
 #[test]
@@ -246,6 +350,8 @@ fn returning_client_rejects_signed_ref_advance_without_its_pack() {
         error.contains("does not resolve") || error.contains("missing Git objects"),
         "unexpected connectivity error: {error}"
     );
+    assert_eq!(client_state(&destination, "e2ee")["generation"], 1);
+    assert_eq!(client_state(&destination, "e2ee")["imported_generation"], 1);
 }
 
 #[test]

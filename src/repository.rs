@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, HashSet};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use fs2::FileExt;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
@@ -21,14 +22,16 @@ use crate::manifest::{
 use crate::policy::{DeviceRecord, DeviceRoles, PolicyState};
 use crate::storage::{ObjectKind, Storage};
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct ClientState {
     #[serde(default)]
     format_version: u64,
     #[serde(default)]
     packs: Vec<String>,
+    // Continuity floor: imported and connectivity-verified, or our own CAS winner.
     head_id: Option<String>,
     generation: Option<u64>,
+    // The last generation whose pack deltas and advertised refs we imported and checked.
     #[serde(default)]
     imported_generation: Option<u64>,
     #[serde(default)]
@@ -46,6 +49,27 @@ struct OpenedState {
     header: ManifestHeader,
     policy: PolicyState,
     generation_key: SecretKey,
+}
+
+struct ClientStateLock {
+    _file: File,
+}
+
+impl ClientStateLock {
+    fn acquire(path: &Path) -> Result<Self> {
+        // Lock a stable sibling: persist_client_state atomically replaces the state file.
+        let lock_path = path.with_extension("json.lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("open client state lock {}", lock_path.display()))?;
+        FileExt::lock_exclusive(&file)
+            .with_context(|| format!("lock client state {}", path.display()))?;
+        Ok(Self { _file: file })
+    }
 }
 
 pub struct EncryptedRepository<S> {
@@ -81,6 +105,7 @@ impl<S: Storage> EncryptedRepository<S> {
         roles: DeviceRoles,
         pin_path: &Path,
     ) -> Result<(String, String)> {
+        let _pin_lock = ClientStateLock::acquire(pin_path)?;
         let chain = self.current_chain()?;
         let current = chain.first().context("manifest chain is empty")?.clone();
         self.validate_pinned_head(&chain, &read_client_state(pin_path)?)?;
@@ -100,7 +125,7 @@ impl<S: Storage> EncryptedRepository<S> {
         let next = transition_manifest(&current, &next_policy, policy_bytes, &next_key)?;
         let result =
             self.publish_policy_transition(&current, &next_policy, &next_key, next.clone())?;
-        write_client_state(
+        write_client_state_locked(
             pin_path,
             &HashSet::new(),
             &result.0,
@@ -111,6 +136,7 @@ impl<S: Storage> EncryptedRepository<S> {
     }
 
     pub fn revoke_device(&self, device_id: &str, pin_path: &Path) -> Result<(String, String)> {
+        let _pin_lock = ClientStateLock::acquire(pin_path)?;
         let chain = self.current_chain()?;
         let current = chain.first().context("manifest chain is empty")?.clone();
         self.validate_pinned_head(&chain, &read_client_state(pin_path)?)?;
@@ -139,7 +165,7 @@ impl<S: Storage> EncryptedRepository<S> {
         let next = transition_manifest(&current, &next_policy, policy_bytes, &next_key)?;
         let result =
             self.publish_policy_transition(&current, &next_policy, &next_key, next.clone())?;
-        write_client_state(
+        write_client_state_locked(
             pin_path,
             &HashSet::new(),
             &result.0,
@@ -150,11 +176,12 @@ impl<S: Storage> EncryptedRepository<S> {
     }
 
     pub fn pin_admin_state(&self, pin_path: &Path) -> Result<()> {
+        let _pin_lock = ClientStateLock::acquire(pin_path)?;
         let chain = self.current_chain()?;
         let current = chain.first().context("manifest chain is empty")?;
         let previous = read_client_state(pin_path)?;
         self.validate_pinned_head(&chain, &previous)?;
-        write_client_state(
+        write_client_state_locked(
             pin_path,
             &HashSet::new(),
             &current.id,
@@ -257,8 +284,21 @@ impl<S: Storage> EncryptedRepository<S> {
         destination_ref: &str,
         force: bool,
     ) -> Result<String> {
-        let (current, next_object, non_fast_forward) =
-            self.preflight_ref_change(repo, remote_name, source_ref, destination_ref, force)?;
+        let state_path = remote_name
+            .map(|name| client_state_path(repo, name))
+            .transpose()?;
+        let _state_lock = state_path
+            .as_deref()
+            .map(ClientStateLock::acquire)
+            .transpose()?;
+        let (current, next_object, non_fast_forward) = self.preflight_ref_change(
+            repo,
+            remote_name,
+            state_path.as_deref(),
+            source_ref,
+            destination_ref,
+            force,
+        )?;
         if next_object
             .as_ref()
             .is_some_and(|next| current.manifest.refs.get(destination_ref) == Some(next))
@@ -342,8 +382,8 @@ impl<S: Storage> EncryptedRepository<S> {
             ManifestAuthorization::Writer,
             next.clone(),
         )?;
-        if let Some(remote_name) = remote_name {
-            self.pin_manifest(repo, remote_name, &next_id, &next)?;
+        if let Some(state_path) = state_path.as_deref() {
+            self.pin_manifest_locked(state_path, &next_id, &next)?;
         }
         Ok(next_id)
     }
@@ -355,7 +395,7 @@ impl<S: Storage> EncryptedRepository<S> {
         destination_ref: &str,
         force: bool,
     ) -> Result<()> {
-        self.preflight_ref_change(repo, None, Some(source_ref), destination_ref, force)?;
+        self.preflight_ref_change(repo, None, None, Some(source_ref), destination_ref, force)?;
         Ok(())
     }
 
@@ -367,9 +407,12 @@ impl<S: Storage> EncryptedRepository<S> {
         destination_ref: &str,
         force: bool,
     ) -> Result<()> {
+        let state_path = client_state_path(repo, remote_name)?;
+        let _state_lock = ClientStateLock::acquire(&state_path)?;
         self.preflight_ref_change(
             repo,
             Some(remote_name),
+            Some(&state_path),
             Some(source_ref),
             destination_ref,
             force,
@@ -383,7 +426,16 @@ impl<S: Storage> EncryptedRepository<S> {
         remote_name: &str,
         destination_ref: &str,
     ) -> Result<()> {
-        self.preflight_ref_change(repo, Some(remote_name), None, destination_ref, false)?;
+        let state_path = client_state_path(repo, remote_name)?;
+        let _state_lock = ClientStateLock::acquire(&state_path)?;
+        self.preflight_ref_change(
+            repo,
+            Some(remote_name),
+            Some(&state_path),
+            None,
+            destination_ref,
+            false,
+        )?;
         Ok(())
     }
 
@@ -391,6 +443,7 @@ impl<S: Storage> EncryptedRepository<S> {
         &self,
         repo: &Path,
         remote_name: Option<&str>,
+        state_path: Option<&Path>,
         source_ref: Option<&str>,
         destination_ref: &str,
         force: bool,
@@ -411,8 +464,9 @@ impl<S: Storage> EncryptedRepository<S> {
             }
             bail!("device is not an active writer")
         }
-        if let Some(remote_name) = remote_name {
-            self.validate_remote_continuity(repo, remote_name, &chain)?;
+        if remote_name.is_some() {
+            let state_path = state_path.context("remote client state path is missing")?;
+            self.validate_remote_continuity(state_path, &chain)?;
         }
         for reference in current.manifest.refs.keys() {
             git::validate_inner_ref(repo, reference)?;
@@ -457,7 +511,11 @@ impl<S: Storage> EncryptedRepository<S> {
     }
 
     pub fn fetch_into(&self, repo: &Path, remote_name: &str) -> Result<Manifest> {
-        let manifest = self.import_packs(repo, remote_name)?;
+        git::ensure_repository(repo)?;
+        validate_remote_name(remote_name)?;
+        let state_path = client_state_path(repo, remote_name)?;
+        let _state_lock = ClientStateLock::acquire(&state_path)?;
+        let manifest = self.import_packs_locked(repo, &state_path)?;
         for (reference, object) in &manifest.refs {
             match git::validate_inner_ref(repo, reference)? {
                 git::InnerRefKind::Branch => {
@@ -473,28 +531,33 @@ impl<S: Storage> EncryptedRepository<S> {
     pub fn observe_manifest(&self, repo: &Path, remote_name: &str) -> Result<Manifest> {
         git::ensure_repository(repo)?;
         validate_remote_name(remote_name)?;
+        let state_path = client_state_path(repo, remote_name)?;
+        let _state_lock = ClientStateLock::acquire(&state_path)?;
         let chain = self.current_chain()?;
         let current = chain.first().context("manifest chain is empty")?.clone();
         for reference in current.manifest.refs.keys() {
             git::validate_inner_ref(repo, reference)?;
         }
-        let state_path = client_state_path(repo, remote_name)?;
         let state = read_client_state(&state_path)?;
         self.validate_pinned_head(&chain, &state)?;
-        write_observed_client_state(&state_path, state, &current.id, &current.manifest)?;
         Ok(current.manifest.clone())
     }
 
     pub fn import_packs(&self, repo: &Path, remote_name: &str) -> Result<Manifest> {
         git::ensure_repository(repo)?;
         validate_remote_name(remote_name)?;
+        let state_path = client_state_path(repo, remote_name)?;
+        let _state_lock = ClientStateLock::acquire(&state_path)?;
+        self.import_packs_locked(repo, &state_path)
+    }
+
+    fn import_packs_locked(&self, repo: &Path, state_path: &Path) -> Result<Manifest> {
         let chain = self.current_chain()?;
         let current = chain.first().context("manifest chain is empty")?.clone();
         for reference in current.manifest.refs.keys() {
             git::validate_inner_ref(repo, reference)?;
         }
-        let state_path = client_state_path(repo, remote_name)?;
-        let state = read_client_state(&state_path)?;
+        let state = read_client_state(state_path)?;
         self.validate_pinned_head(&chain, &state)?;
 
         let stop_generation = state.imported_generation;
@@ -536,8 +599,8 @@ impl<S: Storage> EncryptedRepository<S> {
             }
         }
         git::ensure_refs_connected_since(repo, &current.manifest.refs, &state.verified_refs)?;
-        write_client_state(
-            &state_path,
+        write_client_state_locked(
+            state_path,
             &imported,
             &current.id,
             &current.manifest,
@@ -546,26 +609,19 @@ impl<S: Storage> EncryptedRepository<S> {
         Ok(current.manifest)
     }
 
-    fn validate_remote_continuity(
-        &self,
-        repo: &Path,
-        remote_name: &str,
-        chain: &[OpenedState],
-    ) -> Result<()> {
-        let state = read_client_state(&client_state_path(repo, remote_name)?)?;
+    fn validate_remote_continuity(&self, state_path: &Path, chain: &[OpenedState]) -> Result<()> {
+        let state = read_client_state(state_path)?;
         self.validate_pinned_head(chain, &state)
     }
 
-    fn pin_manifest(
+    fn pin_manifest_locked(
         &self,
-        repo: &Path,
-        remote_name: &str,
+        state_path: &Path,
         head_id: &str,
         manifest: &Manifest,
     ) -> Result<()> {
-        let state_path = client_state_path(repo, remote_name)?;
-        let state = read_client_state(&state_path)?;
-        write_observed_client_state(&state_path, state, head_id, manifest)
+        let state = read_client_state(state_path)?;
+        write_published_client_state_locked(state_path, state, head_id, manifest)
     }
 
     fn validate_pinned_head(&self, chain: &[OpenedState], state: &ClientState) -> Result<()> {
@@ -862,7 +918,7 @@ fn read_client_state(path: &Path) -> Result<ClientState> {
     }
 }
 
-fn write_client_state(
+fn write_client_state_locked(
     path: &Path,
     values: &HashSet<String>,
     head_id: &str,
@@ -881,10 +937,10 @@ fn write_client_state(
         repository_root: Some(manifest.repository_root.clone()),
         verified_refs: verified_refs.clone(),
     };
-    persist_client_state(path, &state)
+    persist_client_state_locked(path, &state)
 }
 
-fn write_observed_client_state(
+fn write_published_client_state_locked(
     path: &Path,
     previous: ClientState,
     head_id: &str,
@@ -900,7 +956,83 @@ fn write_observed_client_state(
         repository_root: Some(manifest.repository_root.clone()),
         verified_refs: previous.verified_refs,
     };
+    persist_client_state_locked(path, &state)
+}
+
+fn persist_client_state_locked(path: &Path, state: &ClientState) -> Result<()> {
+    let previous = read_client_state(path)?;
+    let state = merge_client_state(previous, state.clone())?;
     persist_client_state(path, &state)
+}
+
+fn merge_client_state(previous: ClientState, mut next: ClientState) -> Result<ClientState> {
+    if previous.format_version != 5 {
+        return Ok(next);
+    }
+    if next.generation.is_some()
+        && (next.head_id.is_none()
+            || next.policy_generation.is_none()
+            || next.repository_root.is_none())
+    {
+        bail!("client state update is missing a continuity pin field")
+    }
+    if let (Some(old_root), Some(new_root)) = (&previous.repository_root, &next.repository_root)
+        && old_root != new_root
+    {
+        bail!("remote repository root changed")
+    }
+    if previous.generation.is_some() && next.generation.is_none() {
+        return Ok(previous);
+    }
+
+    if let (Some(old_generation), Some(new_generation)) = (previous.generation, next.generation) {
+        if old_generation > new_generation {
+            return Ok(previous);
+        }
+        if old_generation == new_generation {
+            if let (Some(old_id), Some(new_id)) = (&previous.head_id, &next.head_id)
+                && old_id != new_id
+            {
+                bail!("remote manifest history forked from the locally pinned head")
+            }
+            if let (Some(old_policy), Some(new_policy)) =
+                (previous.policy_generation, next.policy_generation)
+                && old_policy != new_policy
+            {
+                bail!("remote policy pin changed within the same manifest generation")
+            }
+        }
+    }
+    if let (Some(old_policy), Some(new_policy)) =
+        (previous.policy_generation, next.policy_generation)
+        && new_policy < old_policy
+    {
+        bail!("remote policy rolled back")
+    }
+
+    if previous.repository_root.is_some() {
+        next.repository_root = previous.repository_root.clone();
+    }
+    if next.head_id.is_none() {
+        next.head_id = previous.head_id.clone();
+    }
+    if previous.policy_generation.is_some() {
+        next.policy_generation = previous.policy_generation.max(next.policy_generation);
+    }
+    if previous
+        .imported_generation
+        .is_some_and(|old| next.imported_generation.is_none_or(|new| new < old))
+    {
+        next.imported_generation = previous.imported_generation;
+        next.verified_refs = previous.verified_refs;
+    }
+
+    let mut packs = previous.packs;
+    packs.extend(next.packs);
+    packs.sort();
+    packs.dedup();
+    next.packs = packs;
+    Ok(next)
 }
 
 fn persist_client_state(path: &Path, state: &ClientState) -> Result<()> {
@@ -947,7 +1079,8 @@ pub(crate) fn testing_write_client_state(
         repository_root: Some("durability-fixture".to_owned()),
         verified_refs: BTreeMap::new(),
     };
-    persist_client_state(path, &state)
+    let _state_lock = ClientStateLock::acquire(path)?;
+    persist_client_state_locked(path, &state)
 }
 
 fn validate_remote_name(name: &str) -> Result<()> {
@@ -963,7 +1096,99 @@ fn validate_remote_name(name: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::ClientState;
+    use std::env;
+    use std::fs;
+    use std::path::Path;
+    use std::process::{Child, Command};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use super::{ClientState, read_client_state, testing_write_client_state};
+
+    #[test]
+    fn concurrent_client_state_process_writes_never_lower_or_corrupt_the_floor() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state_path = temporary.path().join("state.json");
+        testing_write_client_state(&state_path, "head-10", 10).unwrap();
+        let release = temporary.path().join("release-old-writer");
+        let ready = temporary.path().join("old-writer-ready");
+        let executable = env::current_exe().unwrap();
+
+        let older = Command::new(&executable)
+            .args([
+                "--exact",
+                "repository::tests::client_state_process_write_worker",
+                "--nocapture",
+            ])
+            .env("E2EE_TEST_CLIENT_STATE_PATH", &state_path)
+            .env("E2EE_TEST_CLIENT_STATE_GENERATION", "11")
+            .env("E2EE_TEST_CLIENT_STATE_READY", &ready)
+            .env("E2EE_TEST_CLIENT_STATE_RELEASE", &release)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "older writer did not reach its wait point");
+
+        let newer = launch_client_state_writer(&executable, &state_path, 12);
+        let newer_output = newer.wait_with_output().unwrap();
+        assert!(
+            newer_output.status.success(),
+            "newer writer failed: {}",
+            String::from_utf8_lossy(&newer_output.stderr)
+        );
+        fs::write(&release, "continue").unwrap();
+
+        let older_output = older.wait_with_output().unwrap();
+        assert!(
+            older_output.status.success(),
+            "older writer failed: {}",
+            String::from_utf8_lossy(&older_output.stderr)
+        );
+        let state = read_client_state(&state_path).unwrap();
+        assert_eq!(state.generation, Some(12));
+        assert_eq!(state.head_id.as_deref(), Some("head-12"));
+    }
+
+    #[test]
+    fn client_state_process_write_worker() {
+        let Ok(path) = env::var("E2EE_TEST_CLIENT_STATE_PATH") else {
+            return;
+        };
+        let generation = env::var("E2EE_TEST_CLIENT_STATE_GENERATION")
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        if let (Ok(ready), Ok(release)) = (
+            env::var("E2EE_TEST_CLIENT_STATE_READY"),
+            env::var("E2EE_TEST_CLIENT_STATE_RELEASE"),
+        ) {
+            fs::write(&ready, "ready").unwrap();
+            let release = Path::new(&release);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !release.exists() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(release.exists(), "parent did not release the older writer");
+        }
+        testing_write_client_state(Path::new(&path), &format!("head-{generation}"), generation)
+            .unwrap();
+    }
+
+    fn launch_client_state_writer(executable: &Path, state_path: &Path, generation: u64) -> Child {
+        Command::new(executable)
+            .args([
+                "--exact",
+                "repository::tests::client_state_process_write_worker",
+                "--nocapture",
+            ])
+            .env("E2EE_TEST_CLIENT_STATE_PATH", state_path)
+            .env("E2EE_TEST_CLIENT_STATE_GENERATION", generation.to_string())
+            .spawn()
+            .unwrap()
+    }
 
     #[test]
     fn client_state_without_verified_frontier_requires_a_full_check() {
