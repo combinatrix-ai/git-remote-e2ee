@@ -310,6 +310,12 @@ was shown a stale state, could still publish to the old reader set; see
 Not on the host. Review happens on a machine that has a key: fetch the branch
 and diff locally, or give a CI runner its own read-only device key.
 
+**What if someone corrupts `HEAD`?**
+Clients refuse it and stop. A writer can then run `git-e2ee recover`, which
+shows what it found and continues from the last verified state, or from a newer
+legitimate state it discovers in the carrier history. See the
+[user guide](docs/guide.md).
+
 **Can the host roll my repository back?**
 It can serve old data. A clone that has synced before refuses anything older
 than, or diverging from, what it already accepted. A fresh clone, or a clone
@@ -320,8 +326,8 @@ that has not synced since a newer state was published, cannot tell yet.
 Working today: clone, fetch, pull, and push, including tags and remote branch
 deletion; the directory and Git-host backends; incremental pushes and fetches
 (the Git-host backend keeps a local cache of the carrier); per-device keys with
-read, write, and admin roles; adding and revoking devices; and rollback and
-race detection.
+read, write, and admin roles; adding and revoking devices; rollback and race
+detection; and explicit recovery from a corrupted `HEAD`.
 
 Planned: M-of-N administrator approval, key recovery and replacement, automatic
 retry after losing a push race, an S3 conditional-write backend, garbage

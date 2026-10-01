@@ -452,8 +452,8 @@ MUST be labelled as a claim, not as the signer.
 On carrier Git, discovery MUST inspect bounded outer history and MUST refuse
 to proceed if that history contains any merge commit: every legitimate
 publication is a single-parent fast-forward, and a merge can hide a legitimate
-state behind a non-first parent. Discovery MUST deduplicate manifest IDs, and validate candidates against the authenticated
-policy and predecessor chain. The byte, outer-commit, candidate, and
+state behind a non-first parent. Discovery MUST deduplicate manifest IDs and
+validate candidates against the authenticated policy and predecessor chain. The byte, outer-commit, candidate, and
 cryptographic-operation budgets MUST be fixed. Exhaustion MUST fail closed.
 Discovery MUST report authenticated descendants and replays. If authenticated
 descendants conflict, recovery MUST refuse to choose a fork. A replayed older
