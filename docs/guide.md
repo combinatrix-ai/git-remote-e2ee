@@ -129,10 +129,12 @@ git-e2ee device-add \
 
 Machine B can then clone with its own key, as shown above.
 
-By default an added device can read and write but cannot change membership.
-Pass `--admin` to grant administration too. For the directory backend, use
-`--storage <directory>` instead of `--remote <carrier-url>` with `device-add`,
-`device-list`, and `device-revoke`.
+`device-add --role` grants one of three roles: `read` can clone, fetch, and
+pull; `write` adds push access; and `admin` also allows device membership
+changes. The default is `write`. For example, add a read-only device with
+`--role read`. `device-list` prints the same role names. For the directory
+backend, use `--storage <directory>` instead of `--remote <carrier-url>` with
+`device-add`, `device-list`, and `device-revoke`.
 
 ## Revoke a device
 
