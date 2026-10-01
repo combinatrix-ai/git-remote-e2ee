@@ -123,10 +123,14 @@ administrative CAS is never automatically rebased.
   oldest-first.
 - After import, every advertised ref must resolve to a complete local Git
   object graph before pins or remote-tracking refs move.
-- Client-side `git merge-base --is-ancestor` enforces fast-forward updates.
-- Explicit force pushes append a normal encrypted delta.
-- Push destinations are limited to `refs/heads/*`; tags and deletion fail
-  before publication.
+- The helper advertises `refs/heads/*` and `refs/tags/*`; every other ref
+  namespace is rejected before publication.
+- Branch updates require fast-forward ancestry unless force is explicit. Tags
+  may be created freely, but an existing tag is moved only by a forced push.
+  Lightweight and annotated tag objects are included in the encrypted pack.
+- Branch and tag deletion publish a signed generation with the complete ref set
+  minus the deleted ref and no pack delta. `refs/heads/main` cannot be deleted
+  while it is advertised as the remote `HEAD`.
 
 A fresh clone traverses the manifest/key chain to genesis. A returning client
 traverses to its pinned manifest and imports only unseen pack IDs. The client

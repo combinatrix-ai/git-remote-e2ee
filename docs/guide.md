@@ -164,8 +164,13 @@ compare-and-swap race. Inspect the winning state and run the command again.
 
 ## Limits today
 
-- Pushes are limited to branches under `refs/heads/*`. Tag pushes and branch
-  deletion fail without publishing anything.
+- Pushes support branches under `refs/heads/*` and tags under `refs/tags/*`;
+  other namespaces are rejected. Branches keep fast-forward checks, while an
+  existing tag needs `--force` to move. Branch and tag deletion publish a new
+  encrypted generation without a pack. The helper advertises `main` as the
+  default branch while it exists, so it refuses to delete `refs/heads/main`.
+- After deleting a remote ref, use `git fetch --prune --prune-tags` on a
+  returning clone to remove its stale local remote-tracking branch or tag.
 - A push that loses a race with another writer fails. Fetch, integrate, and
   push again.
 - A new or deleted local carrier cache downloads the complete carrier branch.
