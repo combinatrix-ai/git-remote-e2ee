@@ -83,7 +83,9 @@ whole repository like gcrypt, and fixes what makes that painful to live with:
 
 Under the hood, Git runs on your machine as usual. The helper encrypts the
 packs and refs Git hands it, uploads them as opaque immutable objects, and then
-atomically moves one opaque `HEAD` pointer. Storage backends today: a **local
+atomically moves one opaque `HEAD` pointer. It ships as two Rust binaries with
+all cryptography built in, so there is no GnuPG or OpenSSL to install. Storage
+backends today: a **local
 or mounted directory**, and **any ordinary Git remote** (GitHub, GitLab, a bare
 repository) used as a ciphertext carrier.
 
@@ -138,30 +140,32 @@ of selected files inside an otherwise normal repository. **Encrypted remotes**,
 | Branch names and the commit graph | visible | visible | hidden | hidden |
 | Which files changed, their sizes, identical files | visible | visible¹ | hidden | hidden |
 | When you push, and roughly how much | visible | visible | visible | visible |
-| Collaborators | account list | key fingerprints² | count only³ | count only (padded)⁴ |
+| Collaborators | account list | key fingerprints² | count only³ | count only⁴ |
 
 ### What each tool can do
 
 | | `git-crypt` | `git-remote-gcrypt` | `git-remote-e2ee` |
 |---|:---:|:---:|:---:|
 | Normal `clone`, `pull`, and `push` | ○ | ○ | ○ |
-| GitHub or GitLab as storage | ○ | △⁵ | △⁶ |
+| GitHub or GitLab as storage | ○ | ○ | ○ |
 | Hosted diffs, review, and search for unencrypted parts | ○ | × | × |
 | Encrypt only selected files | ○ | × | × |
-| Push uploads only new data | △⁷ | △⁵ | ○ |
-| Concurrent pushes can't silently overwrite each other | ○ | ×⁸ | ○ |
-| Tampering detected | △⁹ | ○ | ○ |
-| No long-lived key shared by every collaborator | ×¹⁰ | ○ | ○ |
-| Only administrators can change membership | × | ×¹¹ | ○ |
-| Revoke one collaborator | ×¹² | ×¹³ | ○¹⁴ |
-| Separate reader and writer roles | × | × | △¹⁵ |
-| Detects a rolled-back or forked remote | × | × | △¹⁶ |
-| Works without GnuPG | ○¹⁰ | × | ○ |
-| Tags and remote branch deletion | ○ | ○ | ×¹⁷ |
+| Push uploads only new data | △⁵ | △⁶ | ○ |
+| Concurrent pushes can't silently overwrite each other | ○ | ×⁷ | ○ |
+| Tampering detected | △⁸ | ○ | ○ |
+| No master key | ×⁹ | ○ | ○ |
+| Revoke one collaborator | ×¹⁰ | ×¹¹ | ○¹² |
+| Roles (read / write / admin) | × | ×¹³ | △¹⁴ |
+| Detects a rolled-back or forked remote | × | × | △¹⁵ |
+| No external dependencies | △¹⁶ | ×¹⁷ | ○ |
+| Tags and remote branch deletion | ○ | ○ | ×¹⁸ |
 | Mature, stable format | ○ | ○ | × |
 | Cryptography | AES-256-CTR, HMAC-SHA1 SIV | OpenPGP (GnuPG) | XChaCha20-Poly1305, HPKE (X25519), Ed25519 |
 
 ○ supported · △ with caveats · × not supported
+
+<details>
+<summary>Notes</summary>
 
 1. git-crypt's README states that it does not hide when a file changes, its
    length, or whether two files are identical.
@@ -169,42 +173,46 @@ of selected files inside an otherwise normal repository. **Encrypted remotes**,
    committed under `.git-crypt/`, named by key fingerprint.
 3. gcrypt hides recipient key IDs by default (`gpg -R`); the number of
    encrypted-key packets is still observable.
-4. The envelope list is padded to the next power of two, with a minimum of
-   four. Public keys, roles, and membership changes are encrypted, though size
-   patterns may suggest a transition. Do not reuse device keys between
-   repositories.
-5. gcrypt is incremental with its local and rsync backends, but its
+4. The envelope count is padded to the next power of two, with a minimum of
+   four, so storage sees only an upper bound on the number of devices. Public
+   keys, roles, and membership changes are encrypted, though size patterns may
+   suggest a membership change. Do not reuse device keys between repositories.
+5. A changed encrypted file becomes a new, unrelated ciphertext blob, so Git
+   cannot delta-compress it against the previous version.
+6. gcrypt is incremental with its local and rsync backends, but its
    [documentation](https://manpages.debian.org/trixie/git-remote-gcrypt/git-remote-gcrypt.1.en.html)
    says a Git or SFTP backend uploads the entire history on every push, and it
    may repack the remote without warning.
-6. Pushes upload only new data, but the current implementation clones the whole
-   carrier repository for each operation, so every fetch and push also
-   downloads the full encrypted history until a persistent cache lands. With a
-   directory as storage, both directions are incremental.
-7. A changed encrypted file becomes a new, unrelated ciphertext blob, so Git
-   cannot delta-compress it against the previous version.
-8. Every gcrypt push is effectively a force push. Its explicit-force option
+7. Every gcrypt push is effectively a force push. Its explicit-force option
    prevents accidents but does not coordinate concurrent writers.
-9. git-crypt authenticates encrypted file contents; file names, history, and
+8. git-crypt authenticates encrypted file contents; file names, history, and
    which files are encrypted are ordinary Git data.
-10. git-crypt uses one symmetric repository key for the life of the
-    repository. GPG mode wraps that same key to each user's GPG key; without
-    GPG, everyone shares the same exported key file.
-11. gcrypt's recipient list is the local `gcrypt.participants` setting of
+9. A master key here means one long-lived key that every collaborator ends up
+   holding. git-crypt uses one symmetric repository key for the life of the
+   repository: GPG mode wraps that same key to each user's GPG key, and
+   without GPG everyone shares the same exported key file. gcrypt and
+   git-remote-e2ee encrypt each push under fresh keys delivered to each
+   recipient's own key.
+10. git-crypt's README states that it does not support revoking access.
+11. A participant can be dropped from `gcrypt.participants`, but gcrypt does
+    not document a revocation workflow.
+12. Revocation publishes a fresh key without rewriting history. It cannot take
+    back data the device already had.
+13. gcrypt's recipient list is the local `gcrypt.participants` setting of
     whoever pushes, so any participant who can push decides who can read the
     next state.
-12. git-crypt's README states that it does not support revoking access.
-13. A participant can be dropped from `gcrypt.participants`, but gcrypt does
-    not document a revocation workflow.
-14. Revocation publishes a fresh key without rewriting history. It cannot take
-    back data the device already had.
-15. The protocol separates reader, writer, and administrator, but the CLI
-    currently grants either read and write, or read, write, and administration.
-16. A clone that has synced before rejects rollback or a diverging history. A
+14. Only administrators can change membership, and that is enforced. The
+    protocol also has a read-only role, but the CLI cannot grant it yet.
+15. A clone that has synced before rejects rollback or a diverging history. A
     brand-new clone cannot tell without an external anchor; see
     [Security model](#security-model).
-17. Pushes are limited to `refs/heads/*` for now. Tag pushes and branch
+16. git-crypt is a C++ program linked against OpenSSL; GPG mode also needs
+    GnuPG.
+17. gcrypt is a shell script that requires GnuPG.
+18. Pushes are limited to `refs/heads/*` for now. Tag pushes and branch
     deletion fail without publishing anything.
+
+</details>
 
 ### When another tool is a better fit
 
@@ -263,8 +271,7 @@ packs per fetch, while encrypted remotes store and replay opaque packs. That is
 cheap on dumb storage, but it rules out server-side features such as partial
 clone. Each update stores only its new pack plus metadata: 3–4 KiB in total with one
 device, growing to roughly 30 KiB per update at 100 readers. Adding a reader
-rewrote zero existing pack bytes. These numbers are for the directory backend;
-the Git-carrier backend currently re-clones the carrier on each operation. See [docs/benchmarks.md](docs/benchmarks.md) for
+rewrote zero existing pack bytes. See [docs/benchmarks.md](docs/benchmarks.md) for
 the method, the remaining cases, and the limitations.
 
 ## FAQ
@@ -290,18 +297,14 @@ and diff locally, or give a CI runner its own device key.
 It can serve old data. A clone that has synced before detects this and refuses
 it. A fresh clone cannot tell yet.
 
-**Is this post-quantum?**
-No. An attacker who records ciphertext today and later breaks X25519 could read
-it.
-
 ## Status and roadmap
 
-Working today: clone, fetch, pull, and push; the directory and carrier-Git
-backends; per-device keys; adding and revoking devices; incremental uploads;
-and rollback and race detection.
+Working today: clone, fetch, pull, and push; the directory and Git-host
+backends; incremental pushes and fetches (the Git-host backend keeps a local
+cache of the carrier); per-device keys; adding and revoking devices; and
+rollback and race detection.
 
-Planned: a persistent local cache so fetches from a Git host download only new
-data, M-of-N administrator approval, key recovery and replacement, automatic
+Planned: M-of-N administrator approval, key recovery and replacement, automatic
 retry after losing a push race, an S3 conditional-write backend, garbage
 collection and compaction, tags and branch deletion, shallow and partial clone,
 optional transparency-log anchoring, and an optional file-level mode that
