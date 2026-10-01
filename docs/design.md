@@ -250,6 +250,106 @@ Old manifest headers retain device envelopes. Later compromise of a device
 private key can retroactively expose every generation addressed to that device.
 There is no forward secrecy for stored history.
 
+## Recovering from an unverifiable HEAD (planned)
+
+Anyone with storage write access can point `HEAD` at something conforming
+clients reject: bytes that fail to parse, a manifest signed by a reader-only
+device, or a manifest that fails any other check. Clients already refuse such
+a state. This section specifies how an honest writer continues afterwards
+without trusting anything the rejected state claims.
+
+### Principle: continue only from what this client verified
+
+Recovery never picks a base from storage. Its base is the client's own
+continuity floor: the newest state this clone fully verified and imported.
+Everything else storage offers, including the rejected manifest's `previous`
+pointer, is at most a hint for discovery and is validated independently.
+
+The danger is an update this client never saw. If a legitimate state `L`
+followed the floor and storage then replaced it with junk `J`, continuing from
+the floor would drop `L`, and if `L` revoked a device, would deliver new keys
+to that device again. Recovery is therefore automatic only when the client can
+show that nothing legitimate came between its floor and `J`.
+
+### Classifying the head
+
+The client classifies the storage head before doing anything:
+
+| Class | Meaning | Recovery allowed |
+|---|---|---|
+| valid | authenticated, authorized, continuous with the floor | not needed |
+| invalid | demonstrably bad: unparseable, bad signature, signer not authorized under the authenticated policy, broken audit, commitment, or predecessor link | yes, under the rule below |
+| unverifiable | this device cannot open any envelope | never: a valid revocation looks exactly like this to the revoked device |
+| unsupported | unknown format version or transition type | never: an old client must not erase a newer client's state |
+| unavailable | objects missing or storage error | never automatically |
+| discontinuous | authenticated but older than, or diverging from, the floor | never: this is detected rollback or equivocation and is reported as such |
+
+A signer ID read from a sealed header is reported as the claimed signer until
+its signature verifies against a device record in the authenticated policy.
+
+### Automatic recovery on the carrier backend
+
+The carrier keeps every publication as an outer commit. Automatic recovery
+requires all of:
+
+1. the head is classified invalid;
+2. the outer commit that introduced `J` has exactly one parent;
+3. that parent's `HEAD` value is exactly this client's floor manifest ID;
+4. this device is an active writer under the floor's policy.
+
+Condition 3 shows that `J` replaced the state this client already has, so no
+legitimate update is being dropped. The writer then publishes `R` with
+`R.previous = floor`, `R.generation = floor.generation + 1`, the predecessor
+link to the floor's key, refs and policy taken from the floor and the user's
+push, and compare-and-swaps from the outer commit of `J` (the observed storage
+token), which is still a fast-forward. Nothing is derived from `J`. A lost
+compare-and-swap restarts classification from scratch.
+
+The guarantee depends on the outer history being append-only. On GitHub, branch
+protection that forbids force pushes to the carrier branch provides this
+against storage-level writers who are not the host itself. A malicious host can
+still rewrite or withhold history; that stays outside the guarantees.
+
+A plain push of an unchanged ref must still publish `R` in this situation;
+otherwise the no-op shortcut would leave `J` in place.
+
+### Everything else: `git-e2ee recover`
+
+When automatic recovery does not apply, fetch and push stop and say why, naming
+the rejected head, its class, the claimed signer, and what the client's floor
+is. `git-e2ee recover` then:
+
+1. lists candidate states, read-only: the floor, and on the carrier every
+   authenticated manifest found in outer history that descends from the floor,
+   with generation, timestamp, claimed and verified signer, and whether
+   candidates conflict;
+2. refuses to choose between conflicting authenticated descendants and reports
+   them as a fork;
+3. publishes from a base the user selects explicitly, which must be the floor
+   or a verified descendant of it, using the same construction as above;
+4. on the directory backend, which has no `HEAD` history, can only offer the
+   floor and requires an explicit confirmation that updates published after the
+   floor may be lost.
+
+Fresh clones have no floor. Unless they were given an authenticated invitation
+checkpoint, they cannot recover automatically, and `recover` must state that
+freshness and fork identity are unverified.
+
+### Implementation requirements
+
+- Keep the verified base and the storage compare-and-swap token as separate
+  values throughout publication.
+- Validate every accepted ancestor under the policy in force at that point of
+  the chain; never import policy authority from a rejected manifest.
+- Bound discovery: a maximum number of outer commits and candidates, total
+  bytes read, and cryptographic operations, with deduplication of repeated
+  IDs. Exhausting the budget is an explicit error, never a silent choice of an
+  older state.
+- Record rejected heads as bounded diagnostic evidence next to the client
+  state, separate from the floor. Do not blacklist unverifiable or unavailable
+  states.
+- Never lower the floor.
+
 ## Anonymous recipients (v5)
 
 v4 let storage see each device's per-repository public keys, its roles, and
