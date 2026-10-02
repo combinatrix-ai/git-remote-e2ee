@@ -3,10 +3,10 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::time::Instant;
 
+use aead_stream::{DecryptorBE32, EncryptorBE32, Nonce, StreamBE32};
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use chacha20poly1305::aead::stream::{DecryptorBE32, EncryptorBE32, Nonce, StreamBE32};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -343,9 +343,13 @@ pub fn seal_with_key(key: &[u8; 32], plaintext: &[u8], associated_data: &[u8]) -
     let cipher = XChaCha20Poly1305::new(key.into());
     let mut nonce = [0_u8; 24];
     OsRng.fill_bytes(&mut nonce);
+    let nonce: &XNonce = nonce
+        .as_slice()
+        .try_into()
+        .expect("XChaCha20-Poly1305 nonce has the fixed expected size");
     let ciphertext = cipher
         .encrypt(
-            XNonce::from_slice(&nonce),
+            nonce,
             Payload {
                 msg: plaintext,
                 aad: associated_data,
@@ -354,7 +358,7 @@ pub fn seal_with_key(key: &[u8; 32], plaintext: &[u8], associated_data: &[u8]) -
         .map_err(|_| anyhow::anyhow!("encryption failed"))?;
     let mut envelope = Vec::with_capacity(SYMMETRIC_MAGIC.len() + nonce.len() + ciphertext.len());
     envelope.extend_from_slice(SYMMETRIC_MAGIC);
-    envelope.extend_from_slice(&nonce);
+    envelope.extend_from_slice(nonce);
     envelope.extend_from_slice(&ciphertext);
     Ok(envelope)
 }
@@ -368,9 +372,12 @@ pub fn open_with_key(key: &[u8; 32], envelope: &[u8], associated_data: &[u8]) ->
     let nonce_start = SYMMETRIC_MAGIC.len();
     let nonce_end = nonce_start + 24;
     let cipher = XChaCha20Poly1305::new(key.into());
+    let nonce: &XNonce = envelope[nonce_start..nonce_end]
+        .try_into()
+        .expect("validated encrypted object has the fixed nonce size");
     cipher
         .decrypt(
-            XNonce::from_slice(&envelope[nonce_start..nonce_end]),
+            nonce,
             Payload {
                 msg: &envelope[nonce_end..],
                 aad: associated_data,
@@ -467,6 +474,7 @@ pub fn seal_pack_stream(
     ciphertext: impl Write,
     base_aad: &[u8],
 ) -> Result<StreamSealResult> {
+    trace::report_chacha20_backend();
     let mut nonce = [0_u8; PACK_STREAM_NONCE_SIZE];
     OsRng.fill_bytes(&mut nonce);
     let mut header = Vec::with_capacity(PACK_STREAM_HEADER_SIZE);
@@ -475,8 +483,9 @@ pub fn seal_pack_stream(
     header.extend_from_slice(&nonce);
     let aad = pack_stream_aad(base_aad, &header);
     let stream_nonce =
-        Nonce::<XChaCha20Poly1305, StreamBE32<XChaCha20Poly1305>>::from_slice(&nonce);
-    let mut encryptor = EncryptorBE32::<XChaCha20Poly1305>::new(key.into(), stream_nonce);
+        Nonce::<XChaCha20Poly1305, StreamBE32<XChaCha20Poly1305>>::try_from(nonce.as_slice())
+            .expect("pack stream nonce has the fixed expected size");
+    let mut encryptor = EncryptorBE32::<XChaCha20Poly1305>::new(key.into(), &stream_nonce);
     let mut output = DigestWriter::new(ciphertext);
     let mut input = trace::Io::new("pack_plaintext_pipe_read");
     let mut encryption = trace::Io::new("pack_stream_chacha20poly1305");
@@ -535,6 +544,7 @@ pub fn open_pack_stream(
     plaintext_size: u64,
     expected_id: &str,
 ) -> Result<u64> {
+    trace::report_chacha20_backend();
     if plaintext_size == 0 {
         bail!("pack plaintext size must be nonzero")
     }
@@ -570,12 +580,12 @@ pub fn open_pack_stream(
     hasher.update(header);
     let aad = pack_stream_aad(base_aad, &header);
     let nonce_start = chunk_size_start + 4;
-    let stream_nonce = Nonce::<XChaCha20Poly1305, StreamBE32<XChaCha20Poly1305>>::from_slice(
-        &header[nonce_start..],
-    );
+    let stream_nonce =
+        Nonce::<XChaCha20Poly1305, StreamBE32<XChaCha20Poly1305>>::try_from(&header[nonce_start..])
+            .expect("validated pack stream header has the fixed nonce size");
     let mut decryptor = Some(DecryptorBE32::<XChaCha20Poly1305>::new(
         key.into(),
-        stream_nonce,
+        &stream_nonce,
     ));
     let mut remaining = plaintext_size;
     let mut ciphertext_count = PACK_STREAM_HEADER_SIZE as u64;
@@ -789,6 +799,42 @@ mod tests {
                 plaintext
             );
         }
+    }
+
+    #[test]
+    fn pack_stream_be32_wire_format_matches_previous_release() {
+        let key = [0x42_u8; 32];
+        let nonce = [0x24_u8; PACK_STREAM_NONCE_SIZE];
+        let aad = b"git-remote-e2ee stream compatibility";
+        let mut first = b"first old-format STREAM segment".to_vec();
+        let mut last = b"last old-format STREAM segment".to_vec();
+        let stream_nonce =
+            Nonce::<XChaCha20Poly1305, StreamBE32<XChaCha20Poly1305>>::try_from(nonce.as_slice())
+                .unwrap();
+        let mut encryptor = EncryptorBE32::<XChaCha20Poly1305>::new((&key).into(), &stream_nonce);
+        encryptor.encrypt_next_in_place(aad, &mut first).unwrap();
+        encryptor.encrypt_last_in_place(aad, &mut last).unwrap();
+
+        let expected = "4bcfaa062cd22c76da334339c5ba90a0fd2a8f369e18458da2cde4848d0a662e656fddd69b2937ea72d3da289c7fb79c1afdeeff4cc3e234f31ac5454a7592e96c4dc99aa1a5473eb4dfe4dd821365b48c4738512eaf6264ee9e373823";
+        assert_eq!(
+            format!("{}{}", hex::encode(&first), hex::encode(&last)),
+            expected
+        );
+
+        let ciphertext = hex::decode(expected).unwrap();
+        let first_ciphertext_size = b"first old-format STREAM segment".len() + PACK_STREAM_TAG_SIZE;
+        let (first_ciphertext, last_ciphertext) = ciphertext.split_at(first_ciphertext_size);
+        let mut first_ciphertext = first_ciphertext.to_vec();
+        let mut last_ciphertext = last_ciphertext.to_vec();
+        let mut decryptor = DecryptorBE32::<XChaCha20Poly1305>::new((&key).into(), &stream_nonce);
+        decryptor
+            .decrypt_next_in_place(aad, &mut first_ciphertext)
+            .unwrap();
+        decryptor
+            .decrypt_last_in_place(aad, &mut last_ciphertext)
+            .unwrap();
+        assert_eq!(first_ciphertext, b"first old-format STREAM segment");
+        assert_eq!(last_ciphertext, b"last old-format STREAM segment");
     }
 
     #[test]

@@ -17,6 +17,10 @@ cargo install --git https://github.com/combinatrix-ai/git-remote-e2ee
 git-e2ee --help
 ```
 
+On AArch64 (Apple Silicon or 64-bit Arm Linux), the ChaCha20 dependency selects
+its NEON backend automatically, including for `cargo install --git` builds.
+Other architectures use the backend selected for their target.
+
 From a checkout, use `cargo install --path .` instead. Both binaries must be on
 `PATH` for Git to find the helper.
 

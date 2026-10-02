@@ -6,6 +6,35 @@ fn enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("GIT_REMOTE_E2EE_TRACE").is_ok_and(|value| value == "1"))
 }
 
+pub(crate) fn report_chacha20_backend() {
+    if !enabled() {
+        return;
+    }
+
+    static REPORTED: OnceLock<()> = OnceLock::new();
+    REPORTED.get_or_init(|| {
+        eprintln!(
+            "git-remote-e2ee trace chacha20_backend={}",
+            chacha20_backend()
+        );
+    });
+}
+
+#[allow(unexpected_cfgs)]
+fn chacha20_backend() -> &'static str {
+    if cfg!(chacha20_backend = "soft") {
+        "portable"
+    } else if cfg!(all(target_arch = "aarch64", target_feature = "neon")) {
+        "aarch64-neon"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64-portable"
+    } else if cfg!(any(target_arch = "x86", target_arch = "x86_64")) {
+        "x86-runtime-dispatch"
+    } else {
+        "portable"
+    }
+}
+
 pub(crate) struct Span {
     name: &'static str,
     started: Option<Instant>,
