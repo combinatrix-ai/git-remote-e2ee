@@ -192,13 +192,35 @@ and membership changes are encrypted; object-size patterns can still suggest
 that a membership transition occurred. Inner Git metadata remains encrypted.
 
 Each helper process fetches the carrier branch into a persistent bare object
-cache, then creates a disposable checkout that borrows the cache's objects.
-Fetches transfer only objects missing from the cache. The cache is keyed by the
-SHA-256 of a normalized remote URL; a file lock serializes updates across helper
-processes, and automatic garbage collection is disabled so borrowed objects
-remain available. The carrier branch is fetched again immediately before each
-CAS, and the CAS remains a normal fast-forward push. A stale cache therefore
-cannot authorize a write against an outdated branch tip.
+cache, then creates a disposable Git directory with an alternate pointing at
+the cache. It seeds a process-local index from the base commit with `git
+read-tree`, without checking out or copying the historical `e2ee/` files.
+Carrier object reads stream blobs through `git cat-file --batch`; publication
+stages only the new chunk paths and `HEAD` with a NUL-delimited path list, so
+Git does not scan the complete carrier tree. The temporary index keeps
+concurrent helper processes from sharing mutable checkout state.
+
+The cache is keyed by the SHA-256 of a normalized remote URL; a file lock
+serializes cache updates and publications across helper processes. Automatic
+garbage collection is disabled so borrowed objects remain available. During a
+publication, Git writes new objects and the commit into the locked cache object
+database. Only after the normal fast-forward push wins does the cache's carrier
+ref advance to the new commit. A lost CAS can leave unreachable ciphertext in
+the cache, but it does not move the ref. The carrier branch is fetched again
+immediately before each CAS, so a stale cache cannot authorize a write against
+an outdated branch tip.
+
+Carrier Git repositories touched by the helper set `core.compression=0`,
+`core.looseCompression=0`, `pack.compression=0`, `pack.window=0`,
+`pack.depth=0`, and `core.bigFileThreshold=1m`. The committed root
+`.gitattributes` marks `e2ee/**` as `-delta`. These settings avoid spending CPU
+compressing or deltifying ciphertext, which is already encrypted and
+incompressible. They are performance settings, not integrity assumptions;
+normal object IDs and the signed manifest checks remain in force. A Git server
+must consult that attribute tree for its own `upload-pack` delta search to
+avoid server-side deltification. The benchmark's local bare receiver sets
+`attr.tree=refs/heads/git-remote-e2ee`; hosted servers control this setting and
+may have different server-side pack behavior.
 
 Recovery publishes a fresh cache generation instead of replacing objects that
 an in-flight temporary checkout may still borrow. Obsolete generations are
