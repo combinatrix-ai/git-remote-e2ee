@@ -583,43 +583,41 @@ impl Read for GitChunkReader {
             return Ok(0);
         }
         let started = self.trace.is_active().then(std::time::Instant::now);
-        loop {
-            if self.remaining == 0 {
-                if self.next == self.chunks.len() {
-                    self.finish()?;
-                    self.trace
-                        .record(0, started.map_or(0, |started| started.elapsed().as_nanos()));
-                    return Ok(0);
-                }
-                if !self.start_next_chunk()? {
-                    return Ok(0);
-                }
+        if self.remaining == 0 {
+            if self.next == self.chunks.len() {
+                self.finish()?;
+                self.trace
+                    .record(0, started.map_or(0, |started| started.elapsed().as_nanos()));
+                return Ok(0);
             }
-            let amount = output.len().min(self.remaining as usize);
-            let read = self.output.read(&mut output[..amount])?;
-            if read == 0 {
+            if !self.start_next_chunk()? {
+                return Ok(0);
+            }
+        }
+        let amount = output.len().min(self.remaining as usize);
+        let read = self.output.read(&mut output[..amount])?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "git cat-file truncated a carrier chunk",
+            ));
+        }
+        self.remaining -= read as u64;
+        if self.remaining == 0 {
+            let mut trailer = [0_u8; 1];
+            self.output.read_exact(&mut trailer)?;
+            if trailer[0] != b'\n' {
                 return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "git cat-file truncated a carrier chunk",
+                    std::io::ErrorKind::InvalidData,
+                    "git cat-file returned a malformed chunk trailer",
                 ));
             }
-            self.remaining -= read as u64;
-            if self.remaining == 0 {
-                let mut trailer = [0_u8; 1];
-                self.output.read_exact(&mut trailer)?;
-                if trailer[0] != b'\n' {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "git cat-file returned a malformed chunk trailer",
-                    ));
-                }
-            }
-            self.trace.record(
-                read,
-                started.map_or(0, |started| started.elapsed().as_nanos()),
-            );
-            return Ok(read);
         }
+        self.trace.record(
+            read,
+            started.map_or(0, |started| started.elapsed().as_nanos()),
+        );
+        Ok(read)
     }
 }
 
