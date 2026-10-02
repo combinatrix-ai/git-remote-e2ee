@@ -270,24 +270,31 @@ for the full threat model, and [SECURITY.md](SECURITY.md) to report an issue.
 
 ## Performance
 
-Full transfers take about as long as plain Git, and small updates stay fast.
-On a local-filesystem backend with the 867 MiB Godot history, measured in a
-single run:
+Committing is ordinary Git: encryption happens only when you push or fetch.
+Small pushes and fetches upload or download only the change, even when GitHub
+or another Git host is the storage.
 
-| Operation | Plain Git | `git-remote-gcrypt` | `git-remote-e2ee` |
+Measured on the Godot repository (867 MiB of history), with a local bare
+repository standing in for the Git host, on an Apple M1 Max. Median of three
+runs; tiny rows are a one-line change.
+
+| | Plain Git | `git-remote-gcrypt` | `git-remote-e2ee` |
 |---|---:|---:|---:|
-| Initial push | 30.51 s | 12.26 s | 13.78 s |
-| Fresh fetch | 30.26 s | 30.78 s | 31.75 s |
-| Tiny push | 0.17 s | 0.54 s | 0.08 s |
-| Fetch tiny update | 0.12 s | 0.50 s | 0.09 s |
+| Initial encryption (to a local directory) | 30.2 s | 11.8 s | 14.2 s |
+| Initial push | 30.2 s | 38.0 s | 29.5 s |
+| Fresh fetch | 28.9 s | 55.7 s | 40.4 s |
+| Tiny commit | 0.16 s | 0.16 s | 0.16 s |
+| Tiny push | 0.08 s | 6.8 s | 1.2 s |
+| Data sent per tiny push | 4.8 KB | 921 MB | 9.5 KB |
+| Tiny update (fetch) | 0.06 s | 24.1 s | 0.9 s |
 
-Plain Git is not directly comparable. A Git server indexes objects and builds
-packs per fetch, while encrypted remotes store and replay opaque packs. That is
-cheap on dumb storage, but it rules out server-side features such as partial
-clone. Each update stores only its new pack plus metadata: 3–4 KiB in total with one
-device, growing to roughly 30 KiB per update at 100 readers. Adding a reader
-rewrote zero existing pack bytes. See [docs/benchmarks.md](docs/benchmarks.md) for
-the method, the remaining cases, and the limitations.
+With a Git backend, gcrypt sends the whole encrypted history again on every
+push. `git-remote-e2ee` sends the new pack plus a few KB of metadata. Plain Git
+stays faster on small operations because a Git server understands the
+repository; an encrypted remote has to verify and decrypt on the client. These
+are local measurements without network latency. See
+[docs/benchmarks.md](docs/benchmarks.md) for the method, per-push series,
+phase breakdown, and caveats.
 
 ## FAQ
 
