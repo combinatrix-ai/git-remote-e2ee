@@ -67,8 +67,9 @@ whole repository like gcrypt, and fixes what makes that painful to live with:
 
 - **Fast: pushes upload only what changed.** A push uploads the new Git pack
   plus a few KB of metadata on every backend: about 9.5 KB for a one-line
-  change in the benchmark below, against 921 MB for gcrypt. gcrypt re-uploads the entire history on every push to a Git
-  or SFTP backend such as GitHub, and can repack without warning.
+  change in the [benchmark](#performance). With a Git or SFTP backend such as
+  GitHub, gcrypt re-uploads the entire encrypted history on every push: 921 MB
+  for the same change.
 - **Safe: no silent force pushes.** Fast-forward checks run on the client, and
   the storage moves `HEAD` only by compare-and-swap. When two people push at
   once, one wins and the other gets an ordinary rejection. With gcrypt every
