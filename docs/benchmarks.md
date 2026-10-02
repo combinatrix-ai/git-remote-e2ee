@@ -136,6 +136,26 @@ The retained change accelerates the existing SHA-256 and ChaCha20 operations;
 the wire format, AAD, segment counters, durability steps, and Git pack
 generation command are unchanged.
 
+#### End-user `cargo install` verification (2026-10-03)
+
+I built the pushed `64ae6e4` revision using `cargo install --git
+https://github.com/combinatrix-ai/git-remote-e2ee --branch readme-rewrite`
+from outside the checkout, with an isolated temporary `CARGO_HOME` and no
+`RUSTFLAGS`. The exact invocation also used `--root <temporary-root> --force
+git-remote-e2ee` to isolate the installation. Cargo resolved
+`chacha20poly1305 0.11.0`, `chacha20 0.10.2`, and `aead-stream 0.6.0`. A
+one-round E2EE-only run of the benchmark harness measured these
+initial-encryption values; the other phases from that round are omitted here.
+
+| Build | Phase | Time | Peak RSS | Stored logical bytes | Stored allocated size |
+|---|---|---:|---:|---:|---:|
+| `cargo install --git`, no build flags | Initial encryption | 10.080 s | 1304.61 MiB | 920,636,512 B (877.99 MiB) | 880.02 MiB |
+
+The row is a single run, not a median. Peak RSS is 1,367,982,080 bytes. Stored
+allocated size is 922,767,360 bytes. The no-flags AArch64 build selected the
+NEON backend; a stream test with tracing reported
+`chacha20_backend=aarch64-neon`.
+
 ### Carrier receiver attribute sensitivity probe (2026-10-02)
 
 I repeated the E2EE phases once with `BENCH_ROUNDS=1 BENCH_E2EE_ONLY=1
