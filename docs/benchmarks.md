@@ -71,6 +71,14 @@ allocated). The byte column remains exact bytes.
 | Tiny update (median) | gcrypt | 25.41 s | 886.67 MiB | 921,315,032 | 3514.54 / 3548.37 | 1779.73 / 1784.28 | 0.00 / 0.00 | 9,472 |
 | Tiny update (median) | E2EE | 1.04 s | 39.03 MiB | 9,462 | 878.18 / 880.36 | 901.10 / 903.74 | 878.16 / 878.51 | 4,499 |
 
+The size pairs are rounded to 0.01 MiB. Gcrypt's auxiliary state was 78 B
+logical / 4,096 B allocated after fresh fetch and 312 B / 4,096 B after tiny
+update; both display as `0.00 / 0.00 MiB` above. Compared with the prior
+published run, E2EE's warm tiny-push and tiny-update medians moved from 1.23 s
+/ 0.89 s to 1.47 s / 1.04 s. This is an observed difference across separate
+three-round runs; the independent helper activity described above overlapped
+the latest run, so its cause is unmeasured.
+
 The per-push medians below include wall time, peak RSS, and logical bytes
 added to the bare remote (for fetches, remote bytes associated with that
 update followed by client object-store growth). RSS is MiB.
