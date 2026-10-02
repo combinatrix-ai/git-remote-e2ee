@@ -638,6 +638,7 @@ struct CarrierObjectStage {
     current: Option<File>,
     chunk_index: usize,
     chunk_len: usize,
+    trace: trace::Io,
 }
 
 impl CarrierObjectStage {
@@ -668,6 +669,7 @@ impl CarrierObjectStage {
 impl Write for CarrierObjectStage {
     fn write(&mut self, mut data: &[u8]) -> std::io::Result<usize> {
         let original = data.len();
+        let started = self.trace.is_active().then(std::time::Instant::now);
         while !data.is_empty() {
             self.open_chunk()?;
             let available = CARRIER_CHUNK_SIZE - self.chunk_len;
@@ -682,6 +684,10 @@ impl Write for CarrierObjectStage {
                 self.finish_chunk()?;
             }
         }
+        self.trace.record(
+            original,
+            started.map_or(0, |started| started.elapsed().as_nanos()),
+        );
         Ok(original)
     }
 
@@ -1072,6 +1078,7 @@ impl Storage for GitStorage {
             current: None,
             chunk_index: 0,
             chunk_len: 0,
+            trace: trace::Io::new("carrier_stage_write"),
         }))
     }
 
