@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::crypto::object_id;
+use crate::trace;
 
 #[derive(Debug, Error)]
 #[error("head changed concurrently (expected {expected:?}, actual {actual:?})")]
@@ -458,19 +459,27 @@ struct ChunkReader {
     paths: Vec<PathBuf>,
     next: usize,
     current: Option<File>,
+    trace: trace::Io,
 }
 
 impl Read for ChunkReader {
     fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        let started = self.trace.is_active().then(std::time::Instant::now);
         loop {
             if let Some(file) = &mut self.current {
                 let read = file.read(output)?;
                 if read != 0 {
+                    self.trace.record(
+                        read,
+                        started.map_or(0, |started| started.elapsed().as_nanos()),
+                    );
                     return Ok(read);
                 }
                 self.current = None;
             }
             if self.next == self.paths.len() {
+                self.trace
+                    .record(0, started.map_or(0, |started| started.elapsed().as_nanos()));
                 return Ok(0);
             }
             self.current = Some(File::open(&self.paths[self.next])?);
@@ -559,6 +568,7 @@ impl ObjectStageSink for CarrierObjectStage {
                 paths,
                 next: 0,
                 current: None,
+                trace: trace::Io::new("carrier_object_read"),
             })? != id
             {
                 bail!("object id collision for {id}")
@@ -613,11 +623,16 @@ impl GitStorage {
             bail!("empty carrier Git remote")
         }
 
+        let lock_timer = trace::Span::new("carrier_cache_lock");
         let mut cache = CarrierCache::lock(remote)?;
+        drop(lock_timer);
+        let fetch_timer = trace::Span::new("carrier_cache_fetch");
         let mut base_commit = cache.refresh(remote)?;
+        drop(fetch_timer);
         let mut checkout = tempfile::Builder::new()
             .prefix("git-remote-e2ee-carrier-")
             .tempdir()?;
+        let checkout_timer = trace::Span::new("carrier_checkout_create");
         if let Err(error) =
             create_carrier_checkout(checkout.path(), &cache.path, remote, &base_commit)
         {
@@ -633,6 +648,7 @@ impl GitStorage {
             create_carrier_checkout(checkout.path(), &cache.path, remote, &base_commit)
                 .context("create carrier checkout after rebuilding corrupt cache")?;
         }
+        drop(checkout_timer);
         drop(cache);
 
         Ok(Self {
@@ -893,11 +909,16 @@ impl GitStorage {
     fn publish_checkout_head(&self, next: &str, expected: Option<String>) -> Result<()> {
         fs::create_dir_all(self.root().join("e2ee"))?;
         fs::write(self.root().join("e2ee/HEAD"), format!("{next}\n"))?;
+        let add_timer = trace::Span::new("carrier_git_add");
         git_command(self.root(), &["add", "e2ee"])?;
+        drop(add_timer);
+        let commit_timer = trace::Span::new("carrier_git_commit");
         git_command(
             self.root(),
             &["commit", "--quiet", "-m", "git-remote-e2ee storage update"],
         )?;
+        drop(commit_timer);
+        let push_timer = trace::Span::new("carrier_git_push");
         let push = carrier_git_command()
             .arg("-C")
             .arg(self.root())
@@ -912,6 +933,7 @@ impl GitStorage {
             }
             .into());
         }
+        drop(push_timer);
         Ok(())
     }
 }
@@ -938,6 +960,7 @@ impl Storage for GitStorage {
             paths,
             next: 0,
             current: None,
+            trace: trace::Io::new("carrier_object_read"),
         }))
     }
 
@@ -953,7 +976,9 @@ impl Storage for GitStorage {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("carrier state lock poisoned"))?;
+        let refresh_timer = trace::Span::new("carrier_cas_refresh");
         let remote_tip = self.refresh_remote()?;
+        drop(refresh_timer);
         if remote_tip != state.base_commit {
             return Err(CasConflict {
                 expected: expected.map(ToOwned::to_owned),
@@ -972,13 +997,18 @@ impl Storage for GitStorage {
 
         fs::create_dir_all(self.root().join("e2ee"))?;
         fs::write(self.root().join("e2ee/HEAD"), format!("{next}\n"))?;
+        let add_timer = trace::Span::new("carrier_git_add");
         git_command(self.root(), &["add", "e2ee"])?;
+        drop(add_timer);
+        let commit_timer = trace::Span::new("carrier_git_commit");
         git_command(
             self.root(),
             &["commit", "--quiet", "-m", "git-remote-e2ee storage update"],
         )?;
+        drop(commit_timer);
         let new_commit =
             git_rev_parse(self.root(), "HEAD")?.context("carrier commit was not created")?;
+        let push_timer = trace::Span::new("carrier_git_push");
         let push = carrier_git_command()
             .arg("-C")
             .arg(self.root())
@@ -993,6 +1023,7 @@ impl Storage for GitStorage {
             }
             .into());
         }
+        drop(push_timer);
         state.base_commit = Some(new_commit);
         Ok(())
     }
@@ -1181,8 +1212,10 @@ impl CarrierCache {
             .write(true)
             .open(&lock_path)
             .with_context(|| format!("open carrier cache lock {}", lock_path.display()))?;
+        let wait_timer = trace::Span::new("carrier_cache_lock_wait");
         lock.lock_exclusive()
             .with_context(|| format!("lock carrier cache {}", lock_path.display()))?;
+        drop(wait_timer);
         let remote_dir = root.join(&hash);
         Ok(Self {
             remote_dir,
@@ -1192,18 +1225,29 @@ impl CarrierCache {
     }
 
     fn refresh(&mut self, remote: &str) -> Result<Option<String>> {
+        let initialize_timer = trace::Span::new("carrier_cache_initialize");
         self.ensure_initialized()?;
+        drop(initialize_timer);
+        let fetch_timer = trace::Span::new("carrier_cache_fetch_remote");
         match fetch_carrier_branch(&self.path, remote) {
-            Ok(tip) => Ok(tip),
+            Ok(tip) => {
+                drop(fetch_timer);
+                Ok(tip)
+            }
             Err(fetch_error) if self.is_corrupt()? => {
                 self.rebuild()?;
-                fetch_carrier_branch(&self.path, remote).with_context(|| {
+                let result = fetch_carrier_branch(&self.path, remote).with_context(|| {
                     format!(
                         "fetch carrier branch after rebuilding corrupt cache (initial fetch failed: {fetch_error:#})"
                     )
-                })
+                });
+                drop(fetch_timer);
+                result
             }
-            Err(fetch_error) => Err(fetch_error),
+            Err(fetch_error) => {
+                drop(fetch_timer);
+                Err(fetch_error)
+            }
         }
     }
 
@@ -1404,6 +1448,7 @@ fn create_carrier_checkout(
     remote: &str,
     base_commit: &Option<String>,
 ) -> Result<()> {
+    let _timer = trace::Span::new("carrier_checkout_git_setup");
     let output = carrier_git_command()
         .arg("-C")
         .arg(checkout)
@@ -1657,7 +1702,8 @@ mod tests {
             reader_id(ChunkReader {
                 paths,
                 next: 0,
-                current: None
+                current: None,
+                trace: trace::Io::new("carrier_object_read"),
             })
             .unwrap(),
             object_id(b"only")

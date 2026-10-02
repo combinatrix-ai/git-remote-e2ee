@@ -6,6 +6,8 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 
+use crate::trace;
+
 pub fn ensure_repository(repo: &Path) -> Result<()> {
     let output = Command::new("git")
         .arg("-C")
@@ -88,6 +90,7 @@ pub struct PackSource {
     stdout: Option<ChildStdout>,
     stderr: File,
     finished: bool,
+    _timer: trace::Span,
 }
 
 impl Read for PackSource {
@@ -128,6 +131,7 @@ pub fn start_incremental_pack(
     new_refs: &BTreeMap<String, String>,
     old_refs: &BTreeMap<String, String>,
 ) -> Result<PackSource> {
+    let timer = trace::Span::new("git_pack_objects");
     let stderr = tempfile::tempfile().context("create pack-objects stderr file")?;
     let mut child = Command::new("git")
         .arg("-C")
@@ -159,6 +163,7 @@ pub fn start_incremental_pack(
         stdout: Some(stdout),
         stderr,
         finished: false,
+        _timer: timer,
     })
 }
 
@@ -167,6 +172,7 @@ pub struct PackImporter {
     stdin: Option<ChildStdin>,
     stderr: File,
     finished: bool,
+    _timer: trace::Span,
 }
 
 impl Write for PackImporter {
@@ -211,6 +217,7 @@ impl Drop for PackImporter {
 }
 
 pub fn start_pack_import(repo: &Path) -> Result<PackImporter> {
+    let timer = trace::Span::new("git_index_pack");
     let stderr = tempfile::tempfile().context("create index-pack stderr file")?;
     let mut child = Command::new("git")
         .arg("-C")
@@ -226,6 +233,7 @@ pub fn start_pack_import(repo: &Path) -> Result<PackImporter> {
         stdin: Some(stdin),
         stderr,
         finished: false,
+        _timer: timer,
     })
 }
 
@@ -243,6 +251,7 @@ pub fn ensure_refs_connected_since(
     refs: &BTreeMap<String, String>,
     verified_refs: &BTreeMap<String, String>,
 ) -> Result<()> {
+    let _timer = trace::Span::new("git_ref_connectivity_walk");
     if refs.is_empty() {
         return Ok(());
     }
