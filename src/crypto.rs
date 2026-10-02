@@ -1,6 +1,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -22,6 +23,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+
+use crate::trace;
 
 const SYMMETRIC_MAGIC: &[u8; 8] = b"E2EES05\0";
 const PACK_STREAM_MAGIC: &[u8; 8] = b"E2EEPK5\0";
@@ -387,6 +390,8 @@ struct DigestWriter<W> {
     inner: W,
     hasher: Sha256,
     count: u64,
+    stage_write: trace::Io,
+    sha256: trace::Io,
 }
 
 impl<W: Write> DigestWriter<W> {
@@ -395,6 +400,8 @@ impl<W: Write> DigestWriter<W> {
             inner,
             hasher: Sha256::new(),
             count: 0,
+            stage_write: trace::Io::new("pack_ciphertext_stage_write"),
+            sha256: trace::Io::new("pack_ciphertext_sha256"),
         }
     }
 
@@ -405,8 +412,17 @@ impl<W: Write> DigestWriter<W> {
 
 impl<W: Write> Write for DigestWriter<W> {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let write_started = self.stage_write.is_active().then(Instant::now);
         let written = self.inner.write(data)?;
+        if let Some(started) = write_started {
+            self.stage_write
+                .record(written, started.elapsed().as_nanos());
+        }
+        let hash_started = self.sha256.is_active().then(Instant::now);
         self.hasher.update(&data[..written]);
+        if let Some(started) = hash_started {
+            self.sha256.record(written, started.elapsed().as_nanos());
+        }
         self.count += written as u64;
         Ok(written)
     }
@@ -425,11 +441,16 @@ fn pack_stream_aad(base_aad: &[u8], header: &[u8]) -> Vec<u8> {
     aad
 }
 
-fn read_chunk(reader: &mut impl Read) -> Result<Vec<u8>> {
+fn read_chunk(reader: &mut impl Read, input: &mut trace::Io) -> Result<Vec<u8>> {
     let mut chunk = vec![0_u8; PACK_STREAM_CHUNK_SIZE];
     let mut filled = 0;
     while filled < chunk.len() {
-        match reader.read(&mut chunk[filled..]) {
+        let read_started = input.is_active().then(Instant::now);
+        let read_result = reader.read(&mut chunk[filled..]);
+        if let (Some(started), Ok(read)) = (read_started, &read_result) {
+            input.record(*read, started.elapsed().as_nanos());
+        }
+        match read_result {
             Ok(0) => break,
             Ok(read) => filled += read,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
@@ -457,16 +478,18 @@ pub fn seal_pack_stream(
         Nonce::<XChaCha20Poly1305, StreamBE32<XChaCha20Poly1305>>::from_slice(&nonce);
     let mut encryptor = EncryptorBE32::<XChaCha20Poly1305>::new(key.into(), stream_nonce);
     let mut output = DigestWriter::new(ciphertext);
+    let mut input = trace::Io::new("pack_plaintext_pipe_read");
+    let mut encryption = trace::Io::new("pack_stream_chacha20poly1305");
     output.write_all(&header)?;
 
-    let mut current = read_chunk(&mut plaintext)?;
+    let mut current = read_chunk(&mut plaintext, &mut input)?;
     if current.is_empty() {
         bail!("cannot encrypt an empty pack stream")
     }
     let mut plaintext_size = 0_u64;
     let mut segments = 0_u64;
     loop {
-        let next = read_chunk(&mut plaintext)?;
+        let next = read_chunk(&mut plaintext, &mut input)?;
         plaintext_size = plaintext_size
             .checked_add(current.len() as u64)
             .context("pack plaintext size overflow")?;
@@ -475,15 +498,23 @@ pub fn seal_pack_stream(
             bail!("pack stream exceeds segment counter limit")
         }
         if next.is_empty() {
+            let encrypt_started = encryption.is_active().then(Instant::now);
             encryptor
                 .encrypt_last_in_place(&aad, &mut current)
                 .map_err(|_| anyhow::anyhow!("pack stream encryption failed"))?;
+            if let Some(started) = encrypt_started {
+                encryption.record(current.len(), started.elapsed().as_nanos());
+            }
             output.write_all(&current)?;
             break;
         }
+        let encrypt_started = encryption.is_active().then(Instant::now);
         encryptor
             .encrypt_next_in_place(&aad, &mut current)
             .map_err(|_| anyhow::anyhow!("pack stream encryption failed"))?;
+        if let Some(started) = encrypt_started {
+            encryption.record(current.len(), started.elapsed().as_nanos());
+        }
         output.write_all(&current)?;
         current = next;
     }

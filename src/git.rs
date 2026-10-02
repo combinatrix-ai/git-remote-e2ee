@@ -131,7 +131,7 @@ pub fn start_incremental_pack(
     new_refs: &BTreeMap<String, String>,
     old_refs: &BTreeMap<String, String>,
 ) -> Result<PackSource> {
-    let timer = trace::Span::new("git_pack_objects");
+    let timer = trace::Span::new("git_pack_objects_stream_lifetime");
     let stderr = tempfile::tempfile().context("create pack-objects stderr file")?;
     let mut child = Command::new("git")
         .arg("-C")

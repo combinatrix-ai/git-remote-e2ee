@@ -447,7 +447,9 @@ impl<S: Storage> EncryptedRepository<S> {
                 &pack_aad(&current.manifest.repository_root, generation, ordinal),
             )?;
             pack_source.finish()?;
+            let stage_finish_timer = trace::Span::new("inner_pack_stage_finish");
             pack_stage.finish(&sealed.object_id)?;
+            drop(stage_finish_timer);
             drop(pack_timer);
             new_packs.push(PackDescriptor {
                 id: sealed.object_id,
