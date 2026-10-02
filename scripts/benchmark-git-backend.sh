@@ -12,7 +12,8 @@ and git-remote-e2ee's carrier-Git backend. Inputs default to the checkouts at
 have benchmark-00932449 at 00932449c9f372b30301d8b5fdc1be70ec12b5c0; the
 gcrypt checkout must be at a5ff704d071f14b95b6b1fa0caa8cdbf0c6cdadb.
 
-Set BENCH_WORK_PARENT to override the default /private/tmp location. Set
+Set BENCH_WORK_PARENT to override the default /private/tmp location; the
+resolved path must remain under /private/tmp or $TMPDIR. Set
 BENCH_KEEP_WORK=1 to retain temporary repositories, raw logs, and the
 throwaway GPG home for local debugging. Results are printed as TSV; keys and
 raw logs are never written into the project. BENCH_TINY_COMMITS defaults to 5
@@ -96,6 +97,20 @@ esac
 work_parent=${BENCH_WORK_PARENT:-/private/tmp}
 mkdir -p "$work_parent"
 work_parent=$(cd "$work_parent" && pwd -P)
+allowed_work_parent=false
+for allowed_root in /private/tmp "${TMPDIR:-}"; do
+  [[ -n $allowed_root ]] || continue
+  [[ -d $allowed_root ]] || continue
+  allowed_root=$(cd "$allowed_root" && pwd -P)
+  if [[ $work_parent == "$allowed_root" || $work_parent == "$allowed_root"/* ]]; then
+    allowed_work_parent=true
+    break
+  fi
+done
+if [[ $allowed_work_parent != true ]]; then
+  echo "benchmark work parent must resolve under /private/tmp or TMPDIR: $work_parent" >&2
+  exit 2
+fi
 source_git_kib=$(du -sk "$source_repo/.git" | awk '{print $1}')
 available_kib=$(df -Pk "$work_parent" |
   awk 'NR == 2 {print $4}')
@@ -519,4 +534,8 @@ done
 
 printf '\nraw per-round metrics (not command logs)\n'
 cat "$raw_tsv"
-echo "raw command logs, repositories, and GPG homes were kept only under $work until cleanup" >&2
+if [[ ${BENCH_KEEP_WORK:-0} == 1 ]]; then
+  echo "raw command logs, repositories, and GPG homes retained under $work" >&2
+else
+  echo "raw command logs, repositories, and GPG homes were removed from $work" >&2
+fi
