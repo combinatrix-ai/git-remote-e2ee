@@ -690,10 +690,6 @@ impl GitStorage {
         read_bounded_head_file(&self.root().join("e2ee/HEAD"))
     }
 
-    fn refresh_remote(&self) -> Result<Option<String>> {
-        CarrierCache::lock(&self.remote)?.refresh(&self.remote)
-    }
-
     fn head_at_commit(&self, commit: Option<&str>) -> Result<Option<String>> {
         let Some(commit) = commit else {
             return Ok(None);
@@ -907,17 +903,29 @@ impl GitStorage {
         Ok(true)
     }
 
-    fn publish_checkout_head(&self, next: &str, expected: Option<String>) -> Result<()> {
+    fn publish_checkout_head(
+        &self,
+        next: &str,
+        expected: Option<String>,
+        cache: &mut CarrierCache,
+    ) -> Result<()> {
         fs::create_dir_all(self.root().join("e2ee"))?;
         fs::write(self.root().join("e2ee/HEAD"), format!("{next}\n"))?;
         let add_timer = trace::Span::new("carrier_git_add");
-        git_command(self.root(), &["add", ".gitattributes", "e2ee"])?;
+        git_command_with_object_directory(
+            self.root(),
+            &cache.path.join("objects"),
+            &["add", ".gitattributes", "e2ee"],
+        )?;
         drop(add_timer);
         let commit_timer = trace::Span::new("carrier_git_commit");
-        git_command(
+        git_command_with_object_directory(
             self.root(),
+            &cache.path.join("objects"),
             &["commit", "--quiet", "-m", "git-remote-e2ee storage update"],
         )?;
+        let new_commit =
+            git_rev_parse(self.root(), "HEAD")?.context("carrier commit was not created")?;
         drop(commit_timer);
         let push_timer = trace::Span::new("carrier_git_push");
         let push = carrier_git_command()
@@ -927,7 +935,7 @@ impl GitStorage {
             .arg(format!("HEAD:refs/heads/{CARRIER_BRANCH}"))
             .output()?;
         if !push.status.success() {
-            let latest = self.refresh_remote()?;
+            let latest = cache.refresh(&self.remote)?;
             return Err(CasConflict {
                 expected,
                 actual: self.head_at_commit(latest.as_deref())?,
@@ -935,6 +943,7 @@ impl GitStorage {
             .into());
         }
         drop(push_timer);
+        cache.update_published_tip(&new_commit)?;
         Ok(())
     }
 }
@@ -977,8 +986,9 @@ impl Storage for GitStorage {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("carrier state lock poisoned"))?;
+        let mut cache = CarrierCache::lock(&self.remote)?;
         let refresh_timer = trace::Span::new("carrier_cas_refresh");
-        let remote_tip = self.refresh_remote()?;
+        let remote_tip = cache.refresh(&self.remote)?;
         drop(refresh_timer);
         if remote_tip != state.base_commit {
             return Err(CasConflict {
@@ -999,11 +1009,16 @@ impl Storage for GitStorage {
         fs::create_dir_all(self.root().join("e2ee"))?;
         fs::write(self.root().join("e2ee/HEAD"), format!("{next}\n"))?;
         let add_timer = trace::Span::new("carrier_git_add");
-        git_command(self.root(), &["add", ".gitattributes", "e2ee"])?;
+        git_command_with_object_directory(
+            self.root(),
+            &cache.path.join("objects"),
+            &["add", ".gitattributes", "e2ee"],
+        )?;
         drop(add_timer);
         let commit_timer = trace::Span::new("carrier_git_commit");
-        git_command(
+        git_command_with_object_directory(
             self.root(),
+            &cache.path.join("objects"),
             &["commit", "--quiet", "-m", "git-remote-e2ee storage update"],
         )?;
         drop(commit_timer);
@@ -1017,7 +1032,7 @@ impl Storage for GitStorage {
             .arg(format!("HEAD:refs/heads/{CARRIER_BRANCH}"))
             .output()?;
         if !push.status.success() {
-            let latest = self.refresh_remote()?;
+            let latest = cache.refresh(&self.remote)?;
             return Err(CasConflict {
                 expected: expected.map(ToOwned::to_owned),
                 actual: self.head_at_commit(latest.as_deref())?,
@@ -1025,6 +1040,7 @@ impl Storage for GitStorage {
             .into());
         }
         drop(push_timer);
+        cache.update_published_tip(&new_commit)?;
         state.base_commit = Some(new_commit);
         Ok(())
     }
@@ -1064,7 +1080,8 @@ impl Storage for GitStorage {
         if observed.token != expected_tip.as_deref().unwrap_or_default().as_bytes() {
             bail!("recovery storage token does not match the opened carrier tip")
         }
-        let remote_tip = self.refresh_remote()?;
+        let mut cache = CarrierCache::lock(&self.remote)?;
+        let remote_tip = cache.refresh(&self.remote)?;
         if remote_tip != expected_tip {
             return Err(CasConflict {
                 expected: observed.head_id.clone(),
@@ -1086,7 +1103,7 @@ impl Storage for GitStorage {
             }
             .into());
         }
-        self.publish_checkout_head(next, observed.head_id.clone())?;
+        self.publish_checkout_head(next, observed.head_id.clone(), &mut cache)?;
         let new_commit =
             git_rev_parse(self.root(), "HEAD")?.context("carrier commit was not created")?;
         state.base_commit = Some(new_commit);
@@ -1342,6 +1359,10 @@ impl CarrierCache {
         fs::rename(&temporary, &current)?;
         Ok(())
     }
+
+    fn update_published_tip(&self, commit: &str) -> Result<()> {
+        cache_git_command(&self.path, &["update-ref", CARRIER_CACHE_FETCH_REF, commit])
+    }
 }
 
 fn valid_cache_generation(value: &str) -> bool {
@@ -1552,6 +1573,27 @@ fn git_command(repo: &Path, args: &[&str]) -> Result<()> {
     let output = carrier_git_command()
         .arg("-C")
         .arg(repo)
+        .args(args)
+        .output()?;
+    if !output.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }
+    Ok(())
+}
+
+fn git_command_with_object_directory(
+    repo: &Path,
+    object_directory: &Path,
+    args: &[&str],
+) -> Result<()> {
+    let output = carrier_git_command()
+        .arg("-C")
+        .arg(repo)
+        .env("GIT_OBJECT_DIRECTORY", object_directory)
         .args(args)
         .output()?;
     if !output.status.success() {
