@@ -441,6 +441,7 @@ fn verify_file_id(path: &Path, id: &str) -> Result<()> {
 
 const CARRIER_BRANCH: &str = "git-remote-e2ee";
 const CARRIER_CHUNK_SIZE: usize = 32 * 1024 * 1024;
+const CARRIER_ATTRIBUTES: &[u8] = b"e2ee/** -delta\n";
 const CARRIER_CACHE_ENV: &str = "GIT_REMOTE_E2EE_CACHE_DIR";
 const CARRIER_CACHE_FETCH_REF: &str = "refs/heads/git-remote-e2ee";
 const MAX_RECOVERY_OUTER_COMMITS: usize = 2048;
@@ -910,7 +911,7 @@ impl GitStorage {
         fs::create_dir_all(self.root().join("e2ee"))?;
         fs::write(self.root().join("e2ee/HEAD"), format!("{next}\n"))?;
         let add_timer = trace::Span::new("carrier_git_add");
-        git_command(self.root(), &["add", "e2ee"])?;
+        git_command(self.root(), &["add", ".gitattributes", "e2ee"])?;
         drop(add_timer);
         let commit_timer = trace::Span::new("carrier_git_commit");
         git_command(
@@ -998,7 +999,7 @@ impl Storage for GitStorage {
         fs::create_dir_all(self.root().join("e2ee"))?;
         fs::write(self.root().join("e2ee/HEAD"), format!("{next}\n"))?;
         let add_timer = trace::Span::new("carrier_git_add");
-        git_command(self.root(), &["add", "e2ee"])?;
+        git_command(self.root(), &["add", ".gitattributes", "e2ee"])?;
         drop(add_timer);
         let commit_timer = trace::Span::new("carrier_git_commit");
         git_command(
@@ -1418,6 +1419,21 @@ fn lexically_normalize(path: &Path) -> PathBuf {
 fn configure_cache(cache: &Path) -> Result<()> {
     cache_git_command(cache, &["config", "gc.auto", "0"])?;
     cache_git_command(cache, &["config", "maintenance.auto", "false"])?;
+    configure_git_pack_settings(|key, value| cache_git_command(cache, &["config", key, value]))?;
+    Ok(())
+}
+
+fn configure_git_pack_settings(mut configure: impl FnMut(&str, &str) -> Result<()>) -> Result<()> {
+    for (key, value) in [
+        ("core.compression", "0"),
+        ("core.looseCompression", "0"),
+        ("pack.compression", "0"),
+        ("pack.window", "0"),
+        ("pack.depth", "0"),
+        ("core.bigFileThreshold", "1m"),
+    ] {
+        configure(key, value)?;
+    }
     Ok(())
 }
 
@@ -1468,6 +1484,7 @@ fn create_carrier_checkout(
     )?;
     git_command(checkout, &["config", "gc.auto", "0"])?;
     git_command(checkout, &["config", "maintenance.auto", "false"])?;
+    configure_git_pack_settings(|key, value| git_command(checkout, &["config", key, value]))?;
     git_command(checkout, &["config", "user.name", "git-remote-e2ee"])?;
     git_command(
         checkout,
@@ -1491,6 +1508,7 @@ fn create_carrier_checkout(
             )?;
         }
     }
+    fs::write(checkout.join(".gitattributes"), CARRIER_ATTRIBUTES)?;
     Ok(())
 }
 

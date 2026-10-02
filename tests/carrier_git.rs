@@ -238,6 +238,14 @@ fn carrier_git_supports_native_push_and_clone_without_plaintext() {
         false,
     );
     git(&source, &["push", "private", "main"], true);
+    assert_eq!(
+        git(
+            &carrier,
+            &["show", "refs/heads/git-remote-e2ee:.gitattributes"],
+            false,
+        ),
+        "e2ee/** -delta"
+    );
 
     let mut clone_command = Command::new("git");
     clone_command
