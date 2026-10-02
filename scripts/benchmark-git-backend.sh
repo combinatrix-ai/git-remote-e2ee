@@ -23,6 +23,8 @@ for a smoke run. BENCH_SKIP_BUILD=1 uses existing release binaries instead of
 building them. Byte values are logical object-store file sizes, not packet
 captures. For fetches they use the matching newly published remote objects;
 client object-store growth is reported separately where measurable.
+Set BENCH_TRACE=1 to enable E2EE phase timing and print trace lines for each
+measured E2EE operation to stderr.
 EOF
 }
 
@@ -129,6 +131,9 @@ git_e2ee="$project_root/target/release/git-e2ee"
 }
 
 export PATH="$gcrypt_checkout:$project_root/target/release:$(dirname "$gpg_bin"):$PATH"
+if [[ ${BENCH_TRACE:-0} == 1 ]]; then
+  export GIT_REMOTE_E2EE_TRACE=1
+fi
 work=$(mktemp -d "$work_parent/git-remote-e2ee-git-backend.XXXXXX")
 chmod 700 "$work"
 cleanup() {
@@ -216,6 +221,11 @@ measure() {
       if (n == 3) printf "%.3f\n", a[1] * 3600 + a[2] * 60 + a[3]
       else printf "%.3f\n", a[1] * 60 + a[2]
     }' "$timing"
+  fi
+  if [[ ${BENCH_TRACE:-0} == 1 && $label == *e2ee* ]]; then
+    awk -v phase="$label" '/^git-remote-e2ee trace / {
+      printf "benchmark_trace phase=%s %s\n", phase, $0
+    }' "$error" >&2
   fi
 }
 
