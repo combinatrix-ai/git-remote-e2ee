@@ -225,7 +225,7 @@ fn revoked_reader_cannot_reach_later_history_but_keeps_prior_snapshot() {
 }
 
 #[test]
-fn membership_observation_pins_head_without_skipping_later_pack_import() {
+fn connected_membership_observation_pins_and_rejects_replay() {
     let temp = tempfile::tempdir().unwrap();
     let remote = temp.path().join("remote");
     let source = temp.path().join("source");
@@ -246,6 +246,9 @@ fn membership_observation_pins_head_without_skipping_later_pack_import() {
     repository.fetch_into(&client, "e2ee").unwrap();
     let before_membership = fs::read_to_string(remote.join("HEAD")).unwrap();
 
+    // The membership change keeps every ref, so the client already holds a
+    // fully connected copy of the advertised state. Native Git would not send
+    // a fetch command here, so observation itself must raise the floor.
     repository
         .add_device(
             key_b.public_device().unwrap(),
@@ -253,15 +256,19 @@ fn membership_observation_pins_head_without_skipping_later_pack_import() {
             &admin_pin,
         )
         .unwrap();
-    repository.observe_manifest(&client, "e2ee").unwrap();
+    let observed = repository.observe_manifest(&client, "e2ee").unwrap();
+    assert_eq!(observed.generation, 2);
+    let state_path = client.join(".git/git-remote-e2ee/e2ee/state.json");
+    let state: serde_json::Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(state["generation"], 2);
+    assert_eq!(state["policy_generation"], 1);
     let after_membership = fs::read_to_string(remote.join("HEAD")).unwrap();
 
     fs::write(remote.join("HEAD"), &before_membership).unwrap();
-    let error = repository
-        .observe_manifest(&client, "e2ee")
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("rolled back"), "unexpected error: {error}");
+    let error = repository.observe_manifest(&client, "e2ee").unwrap_err();
+    assert!(format!("{error:#}").contains("rolled back"), "{error:#}");
+    let state: serde_json::Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(state["generation"], 2);
 
     fs::write(remote.join("HEAD"), after_membership).unwrap();
     commit(&source, "two\n", "two");
@@ -339,6 +346,49 @@ fn non_admin_device_cannot_change_policy() {
             .to_string()
             .contains("not an active administrator")
     );
+}
+
+#[test]
+fn read_only_device_cannot_add_or_revoke_devices() {
+    let temp = tempfile::tempdir().unwrap();
+    let remote = temp.path().join("remote");
+    let owner_key = KeyFile::generate();
+    let reader_key = KeyFile::generate_for_repository(owner_key.repository_root.clone()).unwrap();
+    let candidate_key =
+        KeyFile::generate_for_repository(owner_key.repository_root.clone()).unwrap();
+    let admin_pin = temp.path().join("owner-admin-state.json");
+    let owner = EncryptedRepository::new(FilesystemStorage::new(&remote), owner_key);
+    owner.initialize().unwrap();
+    owner.pin_admin_state(&admin_pin).unwrap();
+    owner
+        .add_device(
+            reader_key.public_device().unwrap(),
+            DeviceRoles::reader(),
+            &admin_pin,
+        )
+        .unwrap();
+
+    let reader = EncryptedRepository::new(FilesystemStorage::new(&remote), reader_key.clone());
+    let before = snapshot_files(&remote);
+    assert!(
+        reader
+            .add_device(
+                candidate_key.public_device().unwrap(),
+                DeviceRoles::collaborator(),
+                &admin_pin,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("not an active administrator")
+    );
+    assert!(
+        reader
+            .revoke_device(&reader_key.device_id().unwrap(), &admin_pin)
+            .unwrap_err()
+            .to_string()
+            .contains("not an active administrator")
+    );
+    assert_eq!(snapshot_files(&remote), before);
 }
 
 fn copy_directory(source: &Path, destination: &Path) {

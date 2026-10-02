@@ -21,18 +21,20 @@ path = "src/bin/git-remote-e2ee.rs"
 [dependencies]
 anyhow = "1.0"
 base64 = "0.22"
-chacha20poly1305 = { version = "0.10", features = ["stream"] }
+aead-stream = "0.6"
+chacha20poly1305 = "0.11"
 clap = { version = "4.5", features = ["derive"] }
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 fs2 = "0.4"
 hex = "0.4"
-hpke = { version = "0.13", features = ["x25519"] }
+hpke = { version = "0.13", default-features = false, features = ["alloc", "x25519"] }
 hkdf = "0.12"
 rand = "0.8"
 rand_09 = { package = "rand", version = "0.9", features = ["os_rng", "std_rng"], default-features = false }
+rand_chacha = "0.9"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha2 = "0.10"
+sha2 = { version = "0.10", features = ["asm"] }
 subtle = "2.6"
 thiserror = "2.0"
 tempfile = "3.14"

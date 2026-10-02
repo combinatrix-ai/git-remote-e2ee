@@ -1,11 +1,12 @@
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
+use std::time::Instant;
 
+use aead_stream::{DecryptorBE32, EncryptorBE32, Nonce, StreamBE32};
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use chacha20poly1305::aead::stream::{DecryptorBE32, EncryptorBE32, Nonce, StreamBE32};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -17,16 +18,21 @@ use hpke::{Deserializable, Kem, OpModeR, OpModeS, Serializable};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use rand_09::{SeedableRng, rngs::StdRng};
+use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-const SYMMETRIC_MAGIC: &[u8; 8] = b"E2EES04\0";
-const PACK_STREAM_MAGIC: &[u8; 8] = b"E2EEPK4\0";
-const HPKE_INFO: &[u8] = b"git-remote-e2ee generation key v4";
-const KEY_COMMITMENT_DOMAIN: &[u8] = b"git-remote-e2ee generation key commitment v4\0";
-const SUBKEY_SALT: &[u8] = b"git-remote-e2ee subkey derivation v4\0";
+use crate::trace;
+
+const SYMMETRIC_MAGIC: &[u8; 8] = b"E2EES05\0";
+const PACK_STREAM_MAGIC: &[u8; 8] = b"E2EEPK5\0";
+const HPKE_INFO: &[u8] = b"git-remote-e2ee generation key v5";
+const KEY_COMMITMENT_DOMAIN: &[u8] = b"git-remote-e2ee generation key commitment v5\0";
+const SUBKEY_SALT: &[u8] = b"git-remote-e2ee subkey derivation v5\0";
+pub const HPKE_ENCAPSULATED_KEY_SIZE: usize = 32;
+pub const HPKE_CIPHERTEXT_SIZE: usize = 32 + 16;
 pub const PACK_STREAM_CHUNK_SIZE: usize = 1024 * 1024;
 const PACK_STREAM_NONCE_SIZE: usize = 19;
 const PACK_STREAM_TAG_SIZE: usize = 16;
@@ -44,6 +50,7 @@ pub enum SubkeyKind {
     ManifestBody = 1,
     Pack = 2,
     PredecessorLink = 3,
+    SealedHeader = 4,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,13 +134,9 @@ impl KeyFile {
         let signing_public = self.signing_key()?.verifying_key().to_bytes();
         let wrapping_private = self.wrapping_private_key()?;
         let wrapping_public = HpkeKem::sk_to_pk(&wrapping_private).to_bytes();
-        let mut identity = Vec::with_capacity(96);
-        identity.extend_from_slice(b"git-remote-e2ee device id v3\0");
-        identity.extend_from_slice(&signing_public);
-        identity.extend_from_slice(&wrapping_public);
         Ok(PublicDevice {
             repository_root: self.repository_root.clone(),
-            device_id: hex::encode(Sha256::digest(&identity)),
+            device_id: device_id_for_public_keys(&signing_public, wrapping_public.as_slice()),
             signing_public_key: BASE64.encode(signing_public),
             wrapping_public_key: BASE64.encode(wrapping_public),
         })
@@ -241,10 +244,25 @@ pub fn wrap_generation_key(
     generation_key: &[u8; 32],
     aad: &[u8],
 ) -> Result<(Vec<u8>, Vec<u8>)> {
+    wrap_generation_key_with_seed(public_key, generation_key, aad, &random_seed())
+}
+
+pub fn random_seed() -> [u8; 32] {
+    let mut seed = [0_u8; 32];
+    OsRng.fill_bytes(&mut seed);
+    seed
+}
+
+pub fn wrap_generation_key_with_seed(
+    public_key: &str,
+    generation_key: &[u8; 32],
+    aad: &[u8],
+    seed: &[u8; 32],
+) -> Result<(Vec<u8>, Vec<u8>)> {
     let public_bytes = BASE64.decode(public_key)?;
     let public = <HpkeKem as Kem>::PublicKey::from_bytes(&public_bytes)
         .map_err(|_| anyhow::anyhow!("invalid HPKE public key"))?;
-    let mut rng = StdRng::from_os_rng();
+    let mut rng = ChaCha20Rng::from_seed(*seed);
     let (encapsulated, ciphertext) = hpke::single_shot_seal::<HpkeAead, HpkeKdf, HpkeKem, _>(
         &OpModeS::Base,
         &public,
@@ -254,6 +272,25 @@ pub fn wrap_generation_key(
         &mut rng,
     )
     .map_err(|_| anyhow::anyhow!("HPKE generation-key wrapping failed"))?;
+    Ok((encapsulated.to_bytes().to_vec(), ciphertext))
+}
+
+/// Builds a padding envelope that is a genuine HPKE seal of a random key to a
+/// throwaway recipient, so its encapsulated key is a real X25519 public key and
+/// storage cannot tell it apart from an envelope addressed to a device.
+pub fn dummy_generation_envelope() -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut rng = ChaCha20Rng::from_seed(random_seed());
+    let (_, public) = HpkeKem::gen_keypair(&mut rng);
+    let key = random_key();
+    let (encapsulated, ciphertext) = hpke::single_shot_seal::<HpkeAead, HpkeKdf, HpkeKem, _>(
+        &OpModeS::Base,
+        &public,
+        HPKE_INFO,
+        key.as_slice(),
+        &random_seed(),
+        &mut rng,
+    )
+    .map_err(|_| anyhow::anyhow!("HPKE dummy envelope sealing failed"))?;
     Ok((encapsulated.to_bytes().to_vec(), ciphertext))
 }
 
@@ -306,9 +343,13 @@ pub fn seal_with_key(key: &[u8; 32], plaintext: &[u8], associated_data: &[u8]) -
     let cipher = XChaCha20Poly1305::new(key.into());
     let mut nonce = [0_u8; 24];
     OsRng.fill_bytes(&mut nonce);
+    let nonce: &XNonce = nonce
+        .as_slice()
+        .try_into()
+        .expect("XChaCha20-Poly1305 nonce has the fixed expected size");
     let ciphertext = cipher
         .encrypt(
-            XNonce::from_slice(&nonce),
+            nonce,
             Payload {
                 msg: plaintext,
                 aad: associated_data,
@@ -317,7 +358,7 @@ pub fn seal_with_key(key: &[u8; 32], plaintext: &[u8], associated_data: &[u8]) -
         .map_err(|_| anyhow::anyhow!("encryption failed"))?;
     let mut envelope = Vec::with_capacity(SYMMETRIC_MAGIC.len() + nonce.len() + ciphertext.len());
     envelope.extend_from_slice(SYMMETRIC_MAGIC);
-    envelope.extend_from_slice(&nonce);
+    envelope.extend_from_slice(nonce);
     envelope.extend_from_slice(&ciphertext);
     Ok(envelope)
 }
@@ -331,9 +372,12 @@ pub fn open_with_key(key: &[u8; 32], envelope: &[u8], associated_data: &[u8]) ->
     let nonce_start = SYMMETRIC_MAGIC.len();
     let nonce_end = nonce_start + 24;
     let cipher = XChaCha20Poly1305::new(key.into());
+    let nonce: &XNonce = envelope[nonce_start..nonce_end]
+        .try_into()
+        .expect("validated encrypted object has the fixed nonce size");
     cipher
         .decrypt(
-            XNonce::from_slice(&envelope[nonce_start..nonce_end]),
+            nonce,
             Payload {
                 msg: &envelope[nonce_end..],
                 aad: associated_data,
@@ -353,6 +397,8 @@ struct DigestWriter<W> {
     inner: W,
     hasher: Sha256,
     count: u64,
+    stage_write: trace::Io,
+    sha256: trace::Io,
 }
 
 impl<W: Write> DigestWriter<W> {
@@ -361,6 +407,8 @@ impl<W: Write> DigestWriter<W> {
             inner,
             hasher: Sha256::new(),
             count: 0,
+            stage_write: trace::Io::new("pack_ciphertext_stage_write"),
+            sha256: trace::Io::new("pack_ciphertext_sha256"),
         }
     }
 
@@ -371,8 +419,17 @@ impl<W: Write> DigestWriter<W> {
 
 impl<W: Write> Write for DigestWriter<W> {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let write_started = self.stage_write.is_active().then(Instant::now);
         let written = self.inner.write(data)?;
+        if let Some(started) = write_started {
+            self.stage_write
+                .record(written, started.elapsed().as_nanos());
+        }
+        let hash_started = self.sha256.is_active().then(Instant::now);
         self.hasher.update(&data[..written]);
+        if let Some(started) = hash_started {
+            self.sha256.record(written, started.elapsed().as_nanos());
+        }
         self.count += written as u64;
         Ok(written)
     }
@@ -383,7 +440,7 @@ impl<W: Write> Write for DigestWriter<W> {
 }
 
 fn pack_stream_aad(base_aad: &[u8], header: &[u8]) -> Vec<u8> {
-    let mut aad = b"git-remote-e2ee pack stream v4\0".to_vec();
+    let mut aad = b"git-remote-e2ee pack stream v5\0".to_vec();
     aad.extend_from_slice(&(base_aad.len() as u32).to_le_bytes());
     aad.extend_from_slice(base_aad);
     aad.extend_from_slice(&(header.len() as u32).to_le_bytes());
@@ -391,11 +448,16 @@ fn pack_stream_aad(base_aad: &[u8], header: &[u8]) -> Vec<u8> {
     aad
 }
 
-fn read_chunk(reader: &mut impl Read) -> Result<Vec<u8>> {
+fn read_chunk(reader: &mut impl Read, input: &mut trace::Io) -> Result<Vec<u8>> {
     let mut chunk = vec![0_u8; PACK_STREAM_CHUNK_SIZE];
     let mut filled = 0;
     while filled < chunk.len() {
-        match reader.read(&mut chunk[filled..]) {
+        let read_started = input.is_active().then(Instant::now);
+        let read_result = reader.read(&mut chunk[filled..]);
+        if let (Some(started), Ok(read)) = (read_started, &read_result) {
+            input.record(*read, started.elapsed().as_nanos());
+        }
+        match read_result {
             Ok(0) => break,
             Ok(read) => filled += read,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
@@ -412,6 +474,7 @@ pub fn seal_pack_stream(
     ciphertext: impl Write,
     base_aad: &[u8],
 ) -> Result<StreamSealResult> {
+    trace::report_chacha20_backend();
     let mut nonce = [0_u8; PACK_STREAM_NONCE_SIZE];
     OsRng.fill_bytes(&mut nonce);
     let mut header = Vec::with_capacity(PACK_STREAM_HEADER_SIZE);
@@ -420,19 +483,22 @@ pub fn seal_pack_stream(
     header.extend_from_slice(&nonce);
     let aad = pack_stream_aad(base_aad, &header);
     let stream_nonce =
-        Nonce::<XChaCha20Poly1305, StreamBE32<XChaCha20Poly1305>>::from_slice(&nonce);
-    let mut encryptor = EncryptorBE32::<XChaCha20Poly1305>::new(key.into(), stream_nonce);
+        Nonce::<XChaCha20Poly1305, StreamBE32<XChaCha20Poly1305>>::try_from(nonce.as_slice())
+            .expect("pack stream nonce has the fixed expected size");
+    let mut encryptor = EncryptorBE32::<XChaCha20Poly1305>::new(key.into(), &stream_nonce);
     let mut output = DigestWriter::new(ciphertext);
+    let mut input = trace::Io::new("pack_plaintext_pipe_read");
+    let mut encryption = trace::Io::new("pack_stream_chacha20poly1305");
     output.write_all(&header)?;
 
-    let mut current = read_chunk(&mut plaintext)?;
+    let mut current = read_chunk(&mut plaintext, &mut input)?;
     if current.is_empty() {
         bail!("cannot encrypt an empty pack stream")
     }
     let mut plaintext_size = 0_u64;
     let mut segments = 0_u64;
     loop {
-        let next = read_chunk(&mut plaintext)?;
+        let next = read_chunk(&mut plaintext, &mut input)?;
         plaintext_size = plaintext_size
             .checked_add(current.len() as u64)
             .context("pack plaintext size overflow")?;
@@ -441,15 +507,23 @@ pub fn seal_pack_stream(
             bail!("pack stream exceeds segment counter limit")
         }
         if next.is_empty() {
+            let encrypt_started = encryption.is_active().then(Instant::now);
             encryptor
                 .encrypt_last_in_place(&aad, &mut current)
                 .map_err(|_| anyhow::anyhow!("pack stream encryption failed"))?;
+            if let Some(started) = encrypt_started {
+                encryption.record(current.len(), started.elapsed().as_nanos());
+            }
             output.write_all(&current)?;
             break;
         }
+        let encrypt_started = encryption.is_active().then(Instant::now);
         encryptor
             .encrypt_next_in_place(&aad, &mut current)
             .map_err(|_| anyhow::anyhow!("pack stream encryption failed"))?;
+        if let Some(started) = encrypt_started {
+            encryption.record(current.len(), started.elapsed().as_nanos());
+        }
         output.write_all(&current)?;
         current = next;
     }
@@ -470,6 +544,7 @@ pub fn open_pack_stream(
     plaintext_size: u64,
     expected_id: &str,
 ) -> Result<u64> {
+    trace::report_chacha20_backend();
     if plaintext_size == 0 {
         bail!("pack plaintext size must be nonzero")
     }
@@ -505,12 +580,12 @@ pub fn open_pack_stream(
     hasher.update(header);
     let aad = pack_stream_aad(base_aad, &header);
     let nonce_start = chunk_size_start + 4;
-    let stream_nonce = Nonce::<XChaCha20Poly1305, StreamBE32<XChaCha20Poly1305>>::from_slice(
-        &header[nonce_start..],
-    );
+    let stream_nonce =
+        Nonce::<XChaCha20Poly1305, StreamBE32<XChaCha20Poly1305>>::try_from(&header[nonce_start..])
+            .expect("validated pack stream header has the fixed nonce size");
     let mut decryptor = Some(DecryptorBE32::<XChaCha20Poly1305>::new(
         key.into(),
-        stream_nonce,
+        &stream_nonce,
     ));
     let mut remaining = plaintext_size;
     let mut ciphertext_count = PACK_STREAM_HEADER_SIZE as u64;
@@ -577,11 +652,7 @@ pub fn validate_public_device(device: &PublicDevice) -> Result<()> {
     validate_root(&device.repository_root)?;
     let signing = decode_public_key(&device.signing_public_key)?;
     let wrapping = decode_public_key(&device.wrapping_public_key)?;
-    let mut identity = Vec::with_capacity(96);
-    identity.extend_from_slice(b"git-remote-e2ee device id v3\0");
-    identity.extend_from_slice(&signing);
-    identity.extend_from_slice(&wrapping);
-    if device.device_id != hex::encode(Sha256::digest(&identity)) {
+    if device.device_id != device_id_for_public_keys(&signing, &wrapping) {
         bail!("device id does not match its public keys")
     }
     Ok(())
@@ -602,6 +673,14 @@ fn repository_root_for_public_keys(signing: &[u8], wrapping: &[u8]) -> String {
     hex::encode(Sha256::digest(identity))
 }
 
+fn device_id_for_public_keys(signing: &[u8], wrapping: &[u8]) -> String {
+    let mut identity = Vec::with_capacity(32 + signing.len() + wrapping.len());
+    identity.extend_from_slice(b"git-remote-e2ee device id v3\0");
+    identity.extend_from_slice(signing);
+    identity.extend_from_slice(wrapping);
+    hex::encode(Sha256::digest(identity))
+}
+
 fn validate_root(root: &str) -> Result<()> {
     if root.len() != 64 || !root.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("repository root must be a 32-byte lowercase hexadecimal value")
@@ -611,6 +690,19 @@ fn validate_root(root: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn dummy_envelopes_look_like_real_x25519_encapsulations() {
+        // A real X25519 public key never sets the top bit of its last byte.
+        // Uniformly random padding would set it about half the time, letting
+        // storage count real readers.
+        for _ in 0..256 {
+            let (encapsulated, ciphertext) = dummy_generation_envelope().unwrap();
+            assert_eq!(encapsulated.len(), HPKE_ENCAPSULATED_KEY_SIZE);
+            assert_eq!(ciphertext.len(), HPKE_CIPHERTEXT_SIZE);
+            assert_eq!(encapsulated[31] & 0x80, 0);
+        }
+    }
     use super::*;
 
     fn pack_bytes(size: usize) -> Vec<u8> {
@@ -707,6 +799,42 @@ mod tests {
                 plaintext
             );
         }
+    }
+
+    #[test]
+    fn pack_stream_be32_wire_format_matches_previous_release() {
+        let key = [0x42_u8; 32];
+        let nonce = [0x24_u8; PACK_STREAM_NONCE_SIZE];
+        let aad = b"git-remote-e2ee stream compatibility";
+        let mut first = b"first old-format STREAM segment".to_vec();
+        let mut last = b"last old-format STREAM segment".to_vec();
+        let stream_nonce =
+            Nonce::<XChaCha20Poly1305, StreamBE32<XChaCha20Poly1305>>::try_from(nonce.as_slice())
+                .unwrap();
+        let mut encryptor = EncryptorBE32::<XChaCha20Poly1305>::new((&key).into(), &stream_nonce);
+        encryptor.encrypt_next_in_place(aad, &mut first).unwrap();
+        encryptor.encrypt_last_in_place(aad, &mut last).unwrap();
+
+        let expected = "4bcfaa062cd22c76da334339c5ba90a0fd2a8f369e18458da2cde4848d0a662e656fddd69b2937ea72d3da289c7fb79c1afdeeff4cc3e234f31ac5454a7592e96c4dc99aa1a5473eb4dfe4dd821365b48c4738512eaf6264ee9e373823";
+        assert_eq!(
+            format!("{}{}", hex::encode(&first), hex::encode(&last)),
+            expected
+        );
+
+        let ciphertext = hex::decode(expected).unwrap();
+        let first_ciphertext_size = b"first old-format STREAM segment".len() + PACK_STREAM_TAG_SIZE;
+        let (first_ciphertext, last_ciphertext) = ciphertext.split_at(first_ciphertext_size);
+        let mut first_ciphertext = first_ciphertext.to_vec();
+        let mut last_ciphertext = last_ciphertext.to_vec();
+        let mut decryptor = DecryptorBE32::<XChaCha20Poly1305>::new((&key).into(), &stream_nonce);
+        decryptor
+            .decrypt_next_in_place(aad, &mut first_ciphertext)
+            .unwrap();
+        decryptor
+            .decrypt_last_in_place(aad, &mut last_ciphertext)
+            .unwrap();
+        assert_eq!(first_ciphertext, b"first old-format STREAM segment");
+        assert_eq!(last_ciphertext, b"last old-format STREAM segment");
     }
 
     #[test]
@@ -816,7 +944,7 @@ mod tests {
         );
 
         let mut legacy = ciphertext;
-        legacy[..PACK_STREAM_MAGIC.len()].copy_from_slice(b"E2EEPK3\0");
+        legacy[..PACK_STREAM_MAGIC.len()].copy_from_slice(b"E2EEPK4\0");
         assert!(open_test_pack(&key, &legacy, sealed.plaintext_size, &sealed.object_id).is_err());
     }
 

@@ -1,7 +1,8 @@
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
@@ -11,6 +12,9 @@ use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::crypto::object_id;
+use crate::trace;
+
 #[derive(Debug, Error)]
 #[error("head changed concurrently (expected {expected:?}, actual {actual:?})")]
 pub struct CasConflict {
@@ -19,9 +23,51 @@ pub struct CasConflict {
 }
 
 const MAX_BUFFERED_OBJECT_SIZE: u64 = 16 * 1024 * 1024;
+const MAX_STORAGE_HEAD_BYTES: u64 = 4096;
 
 pub trait ObjectStage: Write + Send {
     fn finish(self: Box<Self>, id: &str) -> Result<()>;
+}
+
+trait ObjectStageSink: Write + Send + Sized {
+    fn publish(self, id: &str) -> Result<()>;
+}
+
+struct ValidatingObjectStage<S> {
+    sink: S,
+    hasher: Sha256,
+}
+
+impl<S: ObjectStageSink + 'static> ValidatingObjectStage<S> {
+    fn wrap(sink: S) -> Box<dyn ObjectStage> {
+        Box::new(Self {
+            sink,
+            hasher: Sha256::new(),
+        })
+    }
+}
+
+impl<S: ObjectStageSink> Write for ValidatingObjectStage<S> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let written = self.sink.write(data)?;
+        self.hasher.update(&data[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.sink.flush()
+    }
+}
+
+impl<S: ObjectStageSink> ObjectStage for ValidatingObjectStage<S> {
+    fn finish(self: Box<Self>, id: &str) -> Result<()> {
+        validate_id(id)?;
+        let Self { sink, hasher } = *self;
+        if hex::encode(hasher.finalize()) != id {
+            bail!("staged object hash does not match id")
+        }
+        sink.publish(id)
+    }
 }
 
 pub trait Storage {
@@ -48,13 +94,61 @@ pub trait Storage {
 
     fn read_head(&self) -> Result<Option<String>>;
     fn compare_and_swap_head(&self, expected: Option<&str>, next: &str) -> Result<()>;
+
+    fn observe_head(&self) -> Result<HeadObservation> {
+        let head_id = self.read_head()?;
+        let bytes = head_id.as_deref().unwrap_or_default().as_bytes().to_vec();
+        Ok(HeadObservation {
+            head_id,
+            token: bytes.clone(),
+            head_bytes: Some(bytes),
+        })
+    }
+
+    fn compare_and_swap_observed_head(&self, observed: &HeadObservation, next: &str) -> Result<()> {
+        self.compare_and_swap_head(observed.head_id.as_deref(), next)
+    }
+
+    fn recovery_history(
+        &self,
+        _max_commits: usize,
+        _max_manifest_bytes: u64,
+    ) -> Result<Option<RecoveryHistory>> {
+        Ok(None)
+    }
+
+    fn restore_historical_object(&self, _kind: ObjectKind, _id: &str) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn prepare_recovery(&self, _manifest_ids: &[String], _pack_ids: &[String]) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct HeadObservation {
+    pub head_id: Option<String>,
+    pub token: Vec<u8>,
+    pub head_bytes: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RecoveryCommit {
+    pub commit_id: String,
+    pub head_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RecoveryHistory {
+    pub commits: Vec<RecoveryCommit>,
+    pub manifests: std::collections::BTreeMap<String, Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub enum ObjectKind {
     Pack,
     Manifest,
-    Policy,
 }
 
 impl ObjectKind {
@@ -62,7 +156,6 @@ impl ObjectKind {
         match self {
             Self::Pack => "objects",
             Self::Manifest => "manifests",
-            Self::Policy => "policies",
         }
     }
 }
@@ -78,7 +171,7 @@ impl FilesystemStorage {
     }
 
     pub fn initialize(&self) -> Result<()> {
-        for name in ["objects", "manifests", "policies"] {
+        for name in ["objects", "manifests"] {
             let directory = self.root.join(name);
             crate::persist::create_dir_all_durable(&directory)
                 .with_context(|| format!("create {}", directory.display()))?;
@@ -108,14 +201,11 @@ struct FilesystemObjectStage {
     temporary: PathBuf,
     root: PathBuf,
     kind: ObjectKind,
-    hasher: Sha256,
 }
 
 impl Write for FilesystemObjectStage {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        let written = self.file.write(data)?;
-        self.hasher.update(&data[..written]);
-        Ok(written)
+        self.file.write(data)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -123,12 +213,8 @@ impl Write for FilesystemObjectStage {
     }
 }
 
-impl ObjectStage for FilesystemObjectStage {
-    fn finish(mut self: Box<Self>, id: &str) -> Result<()> {
-        validate_id(id)?;
-        if hex::encode(self.hasher.clone().finalize()) != id {
-            bail!("staged object hash does not match id")
-        }
+impl ObjectStageSink for FilesystemObjectStage {
+    fn publish(mut self, id: &str) -> Result<()> {
         self.file.flush()?;
         self.file.sync_all()?;
         crate::persist::durability_checkpoint(crate::persist::STAGE_AFTER_FILE_FLUSH);
@@ -184,12 +270,11 @@ impl Storage for FilesystemStorage {
             .write(true)
             .create_new(true)
             .open(&temporary)?;
-        Ok(Box::new(FilesystemObjectStage {
+        Ok(ValidatingObjectStage::wrap(FilesystemObjectStage {
             file,
             temporary,
             root: self.root.clone(),
             kind,
-            hasher: Sha256::new(),
         }))
     }
 
@@ -244,6 +329,87 @@ impl Storage for FilesystemStorage {
         fs2::FileExt::unlock(&lock)?;
         Ok(())
     }
+
+    fn observe_head(&self) -> Result<HeadObservation> {
+        let head_bytes = read_bounded_head_file(&self.root.join("HEAD"))?;
+        let head_id = head_bytes.as_deref().and_then(|bytes| {
+            std::str::from_utf8(bytes)
+                .ok()
+                .map(str::trim)
+                .filter(|value| validate_id(value).is_ok())
+                .map(ToOwned::to_owned)
+        });
+        Ok(HeadObservation {
+            head_id,
+            token: head_bytes.clone().unwrap_or_default(),
+            head_bytes,
+        })
+    }
+
+    fn compare_and_swap_observed_head(&self, observed: &HeadObservation, next: &str) -> Result<()> {
+        validate_id(next)?;
+        let lock = self.lock_file()?;
+        lock.lock_exclusive()?;
+        let actual = match fs::read(self.root.join("HEAD")) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                fs2::FileExt::unlock(&lock)?;
+                return Err(error.into());
+            }
+        };
+        if actual != observed.head_bytes {
+            let actual_id = actual.as_deref().and_then(|bytes| {
+                std::str::from_utf8(bytes)
+                    .ok()
+                    .map(str::trim)
+                    .filter(|value| validate_id(value).is_ok())
+                    .map(ToOwned::to_owned)
+            });
+            fs2::FileExt::unlock(&lock)?;
+            return Err(CasConflict {
+                expected: observed.head_id.clone(),
+                actual: actual_id,
+            }
+            .into());
+        }
+
+        write_filesystem_head_locked(&self.root, next)?;
+        fs2::FileExt::unlock(&lock)?;
+        Ok(())
+    }
+}
+
+fn write_filesystem_head_locked(root: &Path, next: &str) -> Result<()> {
+    let mut random = [0_u8; 8];
+    OsRng.fill_bytes(&mut random);
+    let temporary = root.join(format!(".HEAD-{}", hex::encode(random)));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    writeln!(file, "{next}")?;
+    file.sync_all()?;
+    crate::persist::durability_checkpoint(crate::persist::STAGE_AFTER_FILE_FLUSH);
+    fs::rename(&temporary, root.join("HEAD"))?;
+    crate::persist::durability_checkpoint(crate::persist::STAGE_AFTER_NAME_PUBLISH);
+    crate::persist::sync_directory(root)
+        .with_context(|| format!("sync directory {}", root.display()))?;
+    Ok(())
+}
+
+fn read_bounded_head_file(path: &Path) -> Result<Option<Vec<u8>>> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if file.metadata()?.len() > MAX_STORAGE_HEAD_BYTES {
+        bail!("recovery outer-head byte budget exhausted")
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
 }
 
 fn validate_id(id: &str) -> Result<()> {
@@ -275,9 +441,14 @@ fn verify_file_id(path: &Path, id: &str) -> Result<()> {
 
 const CARRIER_BRANCH: &str = "git-remote-e2ee";
 const CARRIER_CHUNK_SIZE: usize = 32 * 1024 * 1024;
+const CARRIER_ATTRIBUTES: &[u8] = b"e2ee/** -delta\n";
+const CARRIER_CACHE_ENV: &str = "GIT_REMOTE_E2EE_CACHE_DIR";
+const CARRIER_CACHE_FETCH_REF: &str = "refs/heads/git-remote-e2ee";
+const MAX_RECOVERY_OUTER_COMMITS: usize = 2048;
 
 pub struct GitStorage {
     checkout: tempfile::TempDir,
+    remote: String,
     state: Mutex<GitStorageState>,
 }
 
@@ -289,23 +460,173 @@ struct ChunkReader {
     paths: Vec<PathBuf>,
     next: usize,
     current: Option<File>,
+    trace: trace::Io,
 }
 
 impl Read for ChunkReader {
     fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        let started = self.trace.is_active().then(std::time::Instant::now);
         loop {
             if let Some(file) = &mut self.current {
                 let read = file.read(output)?;
                 if read != 0 {
+                    self.trace.record(
+                        read,
+                        started.map_or(0, |started| started.elapsed().as_nanos()),
+                    );
                     return Ok(read);
                 }
                 self.current = None;
             }
             if self.next == self.paths.len() {
+                self.trace
+                    .record(0, started.map_or(0, |started| started.elapsed().as_nanos()));
                 return Ok(0);
             }
             self.current = Some(File::open(&self.paths[self.next])?);
             self.next += 1;
+        }
+    }
+}
+
+struct GitChunkReader {
+    child: Child,
+    input: Option<ChildStdin>,
+    output: BufReader<std::process::ChildStdout>,
+    chunks: Vec<(String, String)>,
+    next: usize,
+    remaining: u64,
+    finished: bool,
+    trace: trace::Io,
+}
+
+impl GitChunkReader {
+    fn new(repo: &Path, chunks: Vec<(String, String)>) -> Result<Self> {
+        let mut child = carrier_git_command()
+            .arg("-C")
+            .arg(repo)
+            .args(["cat-file", "--batch"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let input = child.stdin.take().context("open git cat-file stdin")?;
+        let output = child.stdout.take().context("open git cat-file stdout")?;
+        Ok(Self {
+            child,
+            input: Some(input),
+            output: BufReader::new(output),
+            chunks,
+            next: 0,
+            remaining: 0,
+            finished: false,
+            trace: trace::Io::new("carrier_object_read"),
+        })
+    }
+
+    fn start_next_chunk(&mut self) -> std::io::Result<bool> {
+        if self.next == self.chunks.len() {
+            return Ok(false);
+        }
+        let expected = &self.chunks[self.next].1;
+        let input = self
+            .input
+            .as_mut()
+            .expect("git cat-file input is open until all chunks are read");
+        writeln!(input, "{expected}")?;
+        input.flush()?;
+        let mut header = String::new();
+        if self.output.read_line(&mut header)? == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "git cat-file ended before returning a carrier chunk",
+            ));
+        }
+        let fields: Vec<_> = header.split_ascii_whitespace().collect();
+        if fields.len() != 3 || fields[0] != expected || fields[1] != "blob" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "git cat-file returned an invalid carrier chunk header",
+            ));
+        }
+        let size = fields[2]
+            .parse::<u64>()
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let last = self.next + 1 == self.chunks.len();
+        if (!last && size != CARRIER_CHUNK_SIZE as u64)
+            || (last && (size == 0 || size > CARRIER_CHUNK_SIZE as u64))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "carrier object chunk has invalid size",
+            ));
+        }
+        self.next += 1;
+        self.remaining = size;
+        Ok(true)
+    }
+
+    fn finish(&mut self) -> std::io::Result<()> {
+        self.input.take();
+        let status = self.child.wait()?;
+        self.finished = true;
+        if !status.success() {
+            return Err(std::io::Error::other("git cat-file failed"));
+        }
+        Ok(())
+    }
+}
+
+impl Read for GitChunkReader {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        let started = self.trace.is_active().then(std::time::Instant::now);
+        if self.remaining == 0 {
+            if self.next == self.chunks.len() {
+                self.finish()?;
+                self.trace
+                    .record(0, started.map_or(0, |started| started.elapsed().as_nanos()));
+                return Ok(0);
+            }
+            if !self.start_next_chunk()? {
+                return Ok(0);
+            }
+        }
+        let amount = output.len().min(self.remaining as usize);
+        let read = self.output.read(&mut output[..amount])?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "git cat-file truncated a carrier chunk",
+            ));
+        }
+        self.remaining -= read as u64;
+        if self.remaining == 0 {
+            let mut trailer = [0_u8; 1];
+            self.output.read_exact(&mut trailer)?;
+            if trailer[0] != b'\n' {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "git cat-file returned a malformed chunk trailer",
+                ));
+            }
+        }
+        self.trace.record(
+            read,
+            started.map_or(0, |started| started.elapsed().as_nanos()),
+        );
+        Ok(read)
+    }
+}
+
+impl Drop for GitChunkReader {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.input.take();
+            let _ = self.child.kill();
+            let _ = self.child.wait();
         }
     }
 }
@@ -317,7 +638,7 @@ struct CarrierObjectStage {
     current: Option<File>,
     chunk_index: usize,
     chunk_len: usize,
-    hasher: Sha256,
+    trace: trace::Io,
 }
 
 impl CarrierObjectStage {
@@ -348,6 +669,7 @@ impl CarrierObjectStage {
 impl Write for CarrierObjectStage {
     fn write(&mut self, mut data: &[u8]) -> std::io::Result<usize> {
         let original = data.len();
+        let started = self.trace.is_active().then(std::time::Instant::now);
         while !data.is_empty() {
             self.open_chunk()?;
             let available = CARRIER_CHUNK_SIZE - self.chunk_len;
@@ -356,13 +678,16 @@ impl Write for CarrierObjectStage {
                 .as_mut()
                 .expect("carrier chunk opened")
                 .write_all(&data[..take])?;
-            self.hasher.update(&data[..take]);
             self.chunk_len += take;
             data = &data[take..];
             if self.chunk_len == CARRIER_CHUNK_SIZE {
                 self.finish_chunk()?;
             }
         }
+        self.trace.record(
+            original,
+            started.map_or(0, |started| started.elapsed().as_nanos()),
+        );
         Ok(original)
     }
 
@@ -374,12 +699,8 @@ impl Write for CarrierObjectStage {
     }
 }
 
-impl ObjectStage for CarrierObjectStage {
-    fn finish(mut self: Box<Self>, id: &str) -> Result<()> {
-        validate_id(id)?;
-        if hex::encode(self.hasher.clone().finalize()) != id {
-            bail!("staged object hash does not match id")
-        }
+impl ObjectStageSink for CarrierObjectStage {
+    fn publish(mut self, id: &str) -> Result<()> {
         self.finish_chunk()?;
         if self.chunk_index == 0 {
             bail!("cannot store an empty carrier object")
@@ -396,6 +717,7 @@ impl ObjectStage for CarrierObjectStage {
                 paths,
                 next: 0,
                 current: None,
+                trace: trace::Io::new("carrier_object_read"),
             })? != id
             {
                 bail!("object id collision for {id}")
@@ -449,46 +771,38 @@ impl GitStorage {
         if remote.is_empty() {
             bail!("empty carrier Git remote")
         }
-        let checkout = tempfile::Builder::new()
+
+        let lock_timer = trace::Span::new("carrier_cache_lock");
+        let mut cache = CarrierCache::lock(remote)?;
+        drop(lock_timer);
+        let fetch_timer = trace::Span::new("carrier_cache_fetch");
+        let mut base_commit = cache.refresh(remote)?;
+        drop(fetch_timer);
+        let mut checkout = tempfile::Builder::new()
             .prefix("git-remote-e2ee-carrier-")
             .tempdir()?;
-        git_command(
-            checkout
-                .path()
-                .parent()
-                .context("carrier tempdir has no parent")?,
-            &[
-                "clone",
-                "--quiet",
-                "--no-checkout",
-                remote,
-                checkout.path_str()?,
-            ],
-        )?;
-        git_command(checkout.path(), &["config", "user.name", "git-remote-e2ee"])?;
-        git_command(
-            checkout.path(),
-            &["config", "user.email", "git-remote-e2ee@invalid"],
-        )?;
-
-        let remote_ref = format!("refs/remotes/origin/{CARRIER_BRANCH}");
-        let base_commit = git_rev_parse(checkout.path(), &remote_ref)?;
-        match &base_commit {
-            Some(_) => {
-                git_command(
-                    checkout.path(),
-                    &["checkout", "--quiet", "-B", CARRIER_BRANCH, &remote_ref],
-                )?;
+        let checkout_timer = trace::Span::new("carrier_checkout_create");
+        if let Err(error) =
+            create_carrier_checkout(checkout.path(), &cache.path, remote, &base_commit)
+        {
+            if !cache.is_corrupt()? {
+                return Err(error).context("create carrier checkout");
             }
-            None => {
-                git_command(
-                    checkout.path(),
-                    &["checkout", "--quiet", "--orphan", CARRIER_BRANCH],
-                )?;
-            }
+            drop(checkout);
+            cache.rebuild()?;
+            base_commit = cache.refresh(remote)?;
+            checkout = tempfile::Builder::new()
+                .prefix("git-remote-e2ee-carrier-")
+                .tempdir()?;
+            create_carrier_checkout(checkout.path(), &cache.path, remote, &base_commit)
+                .context("create carrier checkout after rebuilding corrupt cache")?;
         }
+        drop(checkout_timer);
+        drop(cache);
+
         Ok(Self {
             checkout,
+            remote: remote.to_owned(),
             state: Mutex::new(GitStorageState { base_commit }),
         })
     }
@@ -515,26 +829,33 @@ impl GitStorage {
                 validate_id(&value)?;
                 Ok(Some(value))
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(commit) = git_rev_parse(self.root(), "HEAD")? else {
+                    return Ok(None);
+                };
+                let Some(bytes) = self.head_bytes_at_commit(&commit)? else {
+                    return Ok(None);
+                };
+                let value = String::from_utf8(bytes)?.trim().to_owned();
+                validate_id(&value)?;
+                Ok(Some(value))
+            }
             Err(error) => Err(error.into()),
         }
     }
 
-    fn remote_tip(&self) -> Result<Option<String>> {
-        let output = carrier_git_command()
-            .arg("-C")
-            .arg(self.root())
-            .args(["ls-remote", "--heads", "origin"])
-            .arg(format!("refs/heads/{CARRIER_BRANCH}"))
-            .output()?;
-        if !output.status.success() {
-            bail!(
-                "git ls-remote failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )
+    fn local_head_bytes(&self) -> Result<Option<Vec<u8>>> {
+        let path = self.root().join("e2ee/HEAD");
+        match read_bounded_head_file(&path) {
+            Ok(Some(bytes)) => Ok(Some(bytes)),
+            Ok(None) => {
+                let Some(commit) = git_rev_parse(self.root(), "HEAD")? else {
+                    return Ok(None);
+                };
+                self.head_bytes_at_commit(&commit)
+            }
+            Err(error) => Err(error),
         }
-        let text = String::from_utf8(output.stdout)?;
-        Ok(text.split_whitespace().next().map(ToOwned::to_owned))
     }
 
     fn head_at_commit(&self, commit: Option<&str>) -> Result<Option<String>> {
@@ -553,17 +874,194 @@ impl GitStorage {
         validate_id(&value)?;
         Ok(Some(value))
     }
-}
 
-trait TempDirPath {
-    fn path_str(&self) -> Result<&str>;
-}
+    fn head_bytes_at_commit(&self, commit: &str) -> Result<Option<Vec<u8>>> {
+        let object = format!("{commit}:e2ee/HEAD");
+        let size = carrier_git_command()
+            .arg("-C")
+            .arg(self.root())
+            .args(["cat-file", "-s", &object])
+            .output()?;
+        if !size.status.success() {
+            return Ok(None);
+        }
+        let size = String::from_utf8(size.stdout)?.trim().parse::<u64>()?;
+        if size > MAX_STORAGE_HEAD_BYTES {
+            bail!("recovery outer-head byte budget exhausted")
+        }
+        let output = carrier_git_command()
+            .arg("-C")
+            .arg(self.root())
+            .args(["show", &object])
+            .output()?;
+        if output.status.success() {
+            Ok(Some(output.stdout))
+        } else {
+            Ok(None)
+        }
+    }
 
-impl TempDirPath for tempfile::TempDir {
-    fn path_str(&self) -> Result<&str> {
-        self.path()
-            .to_str()
-            .context("carrier checkout path is not UTF-8")
+    fn commit_history(&self, limit: usize) -> Result<Vec<String>> {
+        let maximum = limit.saturating_add(1).to_string();
+        let output = carrier_git_command()
+            .arg("-C")
+            .arg(self.root())
+            .args([
+                "rev-list",
+                "--parents",
+                &format!("--max-count={maximum}"),
+                "HEAD",
+            ])
+            .output()?;
+        ensure_git_success(&output, "git rev-list carrier history")?;
+        // Every publication is a single-parent fast-forward commit, so
+        // legitimate carrier history is linear. A merge can only come from a
+        // storage-level writer and can hide a legitimate state behind a
+        // non-first parent, so recovery refuses to interpret such history.
+        let mut commits = Vec::new();
+        for line in String::from_utf8(output.stdout)?.lines() {
+            let mut fields = line.split_ascii_whitespace();
+            let commit = fields.next().context("parse carrier history entry")?;
+            if fields.count() > 1 {
+                bail!(
+                    "carrier history contains merge commit {commit}; recovery requires linear carrier history and cannot rule out a hidden legitimate state"
+                )
+            }
+            commits.push(commit.to_owned());
+        }
+        Ok(commits)
+    }
+
+    fn chunk_entries_at(
+        &self,
+        commit: &str,
+        kind: ObjectKind,
+        id: &str,
+    ) -> Result<Option<Vec<(String, String)>>> {
+        carrier_chunk_entries(self.root(), commit, kind, id)
+    }
+
+    fn object_at_commit(
+        &self,
+        commit: &str,
+        kind: ObjectKind,
+        id: &str,
+        max_bytes: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(chunks) = self.chunk_entries_at(commit, kind, id)? else {
+            return Ok(None);
+        };
+        let mut bytes = Vec::new();
+        for (index, (path, _)) in chunks.iter().enumerate() {
+            let output = carrier_git_command()
+                .arg("-C")
+                .arg(self.root())
+                .args(["show", &format!("{commit}:{path}")])
+                .output()?;
+            ensure_git_success(&output, "git show historical carrier object")?;
+            let length = output.stdout.len();
+            if (index + 1 < chunks.len() && length != CARRIER_CHUNK_SIZE)
+                || (index + 1 == chunks.len() && (length == 0 || length > CARRIER_CHUNK_SIZE))
+            {
+                bail!("historical carrier object chunk has invalid size")
+            }
+            let next_length = (bytes.len() as u64)
+                .checked_add(length as u64)
+                .context("historical carrier object size overflow")?;
+            if next_length > max_bytes {
+                bail!("carrier recovery manifest byte budget exhausted")
+            }
+            bytes.extend_from_slice(&output.stdout);
+        }
+        if object_id(&bytes) != id {
+            bail!("historical carrier object content id mismatch")
+        }
+        Ok(Some(bytes))
+    }
+
+    fn restore_object_at(&self, commit: &str, kind: ObjectKind, id: &str) -> Result<bool> {
+        let Some(chunks) = self.chunk_entries_at(commit, kind, id)? else {
+            return Ok(false);
+        };
+        let staging = tempfile::Builder::new()
+            .prefix("git-remote-e2ee-restore-")
+            .tempdir_in(self.root())?;
+        let object_dir = staging.path().join("object");
+        fs::create_dir(&object_dir)?;
+        let mut hasher = Sha256::new();
+        for (index, (path, _)) in chunks.iter().enumerate() {
+            let output = carrier_git_command()
+                .arg("-C")
+                .arg(self.root())
+                .args(["show", &format!("{commit}:{path}")])
+                .output()?;
+            ensure_git_success(&output, "git show historical carrier object")?;
+            let length = output.stdout.len();
+            if (index + 1 < chunks.len() && length != CARRIER_CHUNK_SIZE)
+                || (index + 1 == chunks.len() && (length == 0 || length > CARRIER_CHUNK_SIZE))
+            {
+                bail!("historical carrier object chunk has invalid size")
+            }
+            hasher.update(&output.stdout);
+            let chunk_path = object_dir.join(format!("{index:08}"));
+            let mut file = File::create(chunk_path)?;
+            file.write_all(&output.stdout)?;
+            file.sync_all()?;
+        }
+        if hex::encode(hasher.finalize()) != id {
+            bail!("historical carrier object content id mismatch")
+        }
+        let target = self.object_directory(kind, id)?;
+        if target.exists() {
+            fs::remove_dir_all(&target)?;
+        }
+        fs::create_dir_all(
+            target
+                .parent()
+                .context("carrier object path has no parent")?,
+        )?;
+        fs::rename(object_dir, target)?;
+        Ok(true)
+    }
+
+    fn publish_checkout_head(
+        &self,
+        next: &str,
+        expected: Option<String>,
+        cache: &mut CarrierCache,
+    ) -> Result<()> {
+        fs::create_dir_all(self.root().join("e2ee"))?;
+        fs::write(self.root().join("e2ee/HEAD"), format!("{next}\n"))?;
+        let add_timer = trace::Span::new("carrier_git_add");
+        stage_carrier_checkout(self.root(), &cache.path.join("objects"))?;
+        drop(add_timer);
+        let commit_timer = trace::Span::new("carrier_git_commit");
+        git_command_with_object_directory(
+            self.root(),
+            &cache.path.join("objects"),
+            &["commit", "--quiet", "-m", "git-remote-e2ee storage update"],
+        )?;
+        let new_commit =
+            git_rev_parse(self.root(), "HEAD")?.context("carrier commit was not created")?;
+        drop(commit_timer);
+        let push_timer = trace::Span::new("carrier_git_push");
+        let push = carrier_git_command()
+            .arg("-C")
+            .arg(self.root())
+            .args(["push", "--quiet", "origin"])
+            .arg(format!("HEAD:refs/heads/{CARRIER_BRANCH}"))
+            .output()?;
+        if !push.status.success() {
+            let latest = cache.refresh(&self.remote)?;
+            return Err(CasConflict {
+                expected,
+                actual: self.head_at_commit(latest.as_deref())?,
+            }
+            .into());
+        }
+        drop(push_timer);
+        cache.update_published_tip(&new_commit)?;
+        Ok(())
     }
 }
 
@@ -573,27 +1071,40 @@ impl Storage for GitStorage {
         OsRng.fill_bytes(&mut random);
         let staging = self.root().join(format!(".stage-{}", hex::encode(random)));
         fs::create_dir(&staging)?;
-        Ok(Box::new(CarrierObjectStage {
+        Ok(ValidatingObjectStage::wrap(CarrierObjectStage {
             staging,
             root: self.root().to_path_buf(),
             kind,
             current: None,
             chunk_index: 0,
             chunk_len: 0,
-            hasher: Sha256::new(),
+            trace: trace::Io::new("carrier_stage_write"),
         }))
     }
 
     fn open_object(&self, kind: ObjectKind, id: &str) -> Result<Box<dyn Read + Send>> {
-        let paths = validated_chunk_paths(&self.object_directory(kind, id)?)?;
-        Ok(Box::new(ChunkReader {
-            paths,
-            next: 0,
-            current: None,
-        }))
+        let directory = self.object_directory(kind, id)?;
+        if directory.exists() {
+            let paths = validated_chunk_paths(&directory)?;
+            return Ok(Box::new(ChunkReader {
+                paths,
+                next: 0,
+                current: None,
+                trace: trace::Io::new("carrier_object_read"),
+            }));
+        }
+        let Some(commit) = git_rev_parse(self.root(), "HEAD")? else {
+            bail!("carrier object {id} is unavailable")
+        };
+        let chunks = self
+            .chunk_entries_at(&commit, kind, id)?
+            .with_context(|| format!("carrier object {id} is unavailable"))?;
+        Ok(Box::new(GitChunkReader::new(self.root(), chunks)?))
     }
 
     fn read_head(&self) -> Result<Option<String>> {
+        // `open` refreshed the remote before constructing this checkout; CAS
+        // refreshes again before trusting this snapshot for a write.
         self.local_head()
     }
 
@@ -603,7 +1114,10 @@ impl Storage for GitStorage {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("carrier state lock poisoned"))?;
-        let remote_tip = self.remote_tip()?;
+        let mut cache = CarrierCache::lock(&self.remote)?;
+        let refresh_timer = trace::Span::new("carrier_cas_refresh");
+        let remote_tip = cache.refresh(&self.remote)?;
+        drop(refresh_timer);
         if remote_tip != state.base_commit {
             return Err(CasConflict {
                 expected: expected.map(ToOwned::to_owned),
@@ -622,13 +1136,19 @@ impl Storage for GitStorage {
 
         fs::create_dir_all(self.root().join("e2ee"))?;
         fs::write(self.root().join("e2ee/HEAD"), format!("{next}\n"))?;
-        git_command(self.root(), &["add", "e2ee"])?;
-        git_command(
+        let add_timer = trace::Span::new("carrier_git_add");
+        stage_carrier_checkout(self.root(), &cache.path.join("objects"))?;
+        drop(add_timer);
+        let commit_timer = trace::Span::new("carrier_git_commit");
+        git_command_with_object_directory(
             self.root(),
+            &cache.path.join("objects"),
             &["commit", "--quiet", "-m", "git-remote-e2ee storage update"],
         )?;
+        drop(commit_timer);
         let new_commit =
             git_rev_parse(self.root(), "HEAD")?.context("carrier commit was not created")?;
+        let push_timer = trace::Span::new("carrier_git_push");
         let push = carrier_git_command()
             .arg("-C")
             .arg(self.root())
@@ -636,16 +1156,605 @@ impl Storage for GitStorage {
             .arg(format!("HEAD:refs/heads/{CARRIER_BRANCH}"))
             .output()?;
         if !push.status.success() {
-            let latest = self.remote_tip()?;
+            let latest = cache.refresh(&self.remote)?;
             return Err(CasConflict {
                 expected: expected.map(ToOwned::to_owned),
                 actual: self.head_at_commit(latest.as_deref())?,
             }
             .into());
         }
+        drop(push_timer);
+        cache.update_published_tip(&new_commit)?;
         state.base_commit = Some(new_commit);
         Ok(())
     }
+
+    fn observe_head(&self) -> Result<HeadObservation> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("carrier state lock poisoned"))?;
+        let head_bytes = self.local_head_bytes()?;
+        let head_id = head_bytes.as_deref().and_then(|bytes| {
+            std::str::from_utf8(bytes)
+                .ok()
+                .map(str::trim)
+                .filter(|value| validate_id(value).is_ok())
+                .map(ToOwned::to_owned)
+        });
+        Ok(HeadObservation {
+            head_id,
+            token: state
+                .base_commit
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes()
+                .to_vec(),
+            head_bytes,
+        })
+    }
+
+    fn compare_and_swap_observed_head(&self, observed: &HeadObservation, next: &str) -> Result<()> {
+        validate_id(next)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("carrier state lock poisoned"))?;
+        let expected_tip = state.base_commit.clone();
+        if observed.token != expected_tip.as_deref().unwrap_or_default().as_bytes() {
+            bail!("recovery storage token does not match the opened carrier tip")
+        }
+        let mut cache = CarrierCache::lock(&self.remote)?;
+        let remote_tip = cache.refresh(&self.remote)?;
+        if remote_tip != expected_tip {
+            return Err(CasConflict {
+                expected: observed.head_id.clone(),
+                actual: self.head_at_commit(remote_tip.as_deref())?,
+            }
+            .into());
+        }
+        let actual_bytes = self.local_head_bytes()?;
+        if actual_bytes != observed.head_bytes {
+            return Err(CasConflict {
+                expected: observed.head_id.clone(),
+                actual: actual_bytes.as_deref().and_then(|bytes| {
+                    std::str::from_utf8(bytes)
+                        .ok()
+                        .map(str::trim)
+                        .filter(|value| validate_id(value).is_ok())
+                        .map(ToOwned::to_owned)
+                }),
+            }
+            .into());
+        }
+        self.publish_checkout_head(next, observed.head_id.clone(), &mut cache)?;
+        let new_commit =
+            git_rev_parse(self.root(), "HEAD")?.context("carrier commit was not created")?;
+        state.base_commit = Some(new_commit);
+        Ok(())
+    }
+
+    fn recovery_history(
+        &self,
+        max_commits: usize,
+        max_manifest_bytes: u64,
+    ) -> Result<Option<RecoveryHistory>> {
+        let commits = self.commit_history(max_commits)?;
+        if commits.len() > max_commits {
+            bail!("carrier recovery outer-commit budget exhausted")
+        }
+        let mut history = RecoveryHistory::default();
+        let mut total_bytes = 0_u64;
+        for commit_id in commits {
+            let head_id = self
+                .head_bytes_at_commit(&commit_id)?
+                .as_deref()
+                .and_then(|bytes| {
+                    std::str::from_utf8(bytes)
+                        .ok()
+                        .map(str::trim)
+                        .filter(|value| validate_id(value).is_ok())
+                        .map(ToOwned::to_owned)
+                });
+            if let Some(id) = &head_id
+                && !history.manifests.contains_key(id)
+            {
+                let remaining = max_manifest_bytes.saturating_sub(total_bytes);
+                if let Some(bytes) =
+                    self.object_at_commit(&commit_id, ObjectKind::Manifest, id, remaining)?
+                {
+                    total_bytes = total_bytes
+                        .checked_add(bytes.len() as u64)
+                        .context("carrier recovery manifest byte count overflow")?;
+                    if total_bytes > max_manifest_bytes {
+                        bail!("carrier recovery manifest byte budget exhausted")
+                    }
+                    history.manifests.insert(id.clone(), bytes);
+                }
+            }
+            history.commits.push(RecoveryCommit { commit_id, head_id });
+        }
+        Ok(Some(history))
+    }
+
+    fn restore_historical_object(&self, kind: ObjectKind, id: &str) -> Result<bool> {
+        let commits = self.commit_history(MAX_RECOVERY_OUTER_COMMITS)?;
+        if commits.len() > MAX_RECOVERY_OUTER_COMMITS {
+            bail!("carrier recovery outer-commit budget exhausted")
+        }
+        for commit in commits {
+            if self.restore_object_at(&commit, kind, id)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn prepare_recovery(&self, manifest_ids: &[String], pack_ids: &[String]) -> Result<()> {
+        let manifests: HashSet<&str> = manifest_ids.iter().map(String::as_str).collect();
+        let packs: HashSet<&str> = pack_ids.iter().map(String::as_str).collect();
+        retain_carrier_objects(&self.root().join("e2ee/manifests"), &manifests)?;
+        retain_carrier_objects(&self.root().join("e2ee/objects"), &packs)?;
+        remove_unretained_index_objects(self.root(), ObjectKind::Manifest, &manifests)?;
+        remove_unretained_index_objects(self.root(), ObjectKind::Pack, &packs)?;
+        Ok(())
+    }
+}
+
+fn remove_unretained_index_objects(
+    repo: &Path,
+    kind: ObjectKind,
+    keep: &HashSet<&str>,
+) -> Result<()> {
+    let tree = format!("e2ee/{}", kind.directory());
+    let output = carrier_git_command()
+        .arg("-C")
+        .arg(repo)
+        .args(["ls-files", "-z", "--", &tree])
+        .output()?;
+    ensure_git_success(&output, "git ls-files carrier recovery objects")?;
+    let mut remove = Vec::new();
+    for path in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        let path = std::str::from_utf8(path)?;
+        let mut fields = path.split('/');
+        if fields.next() != Some("e2ee") || fields.next() != Some(kind.directory()) {
+            bail!("unexpected carrier index path during recovery")
+        }
+        let _prefix = fields.next().context("carrier index path has no prefix")?;
+        let id = fields
+            .next()
+            .context("carrier index path has no object id")?;
+        let _chunk = fields.next().context("carrier index path has no chunk")?;
+        if fields.next().is_some() {
+            bail!("unexpected carrier index path depth during recovery")
+        }
+        if !keep.contains(id) {
+            remove.extend_from_slice(path.as_bytes());
+            remove.push(0);
+        }
+    }
+    if !remove.is_empty() {
+        git_command_with_input(
+            repo,
+            &["update-index", "--force-remove", "-z", "--stdin"],
+            &remove,
+        )?;
+    }
+    Ok(())
+}
+
+fn retain_carrier_objects(root: &Path, keep: &HashSet<&str>) -> Result<()> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries.collect::<std::io::Result<Vec<_>>>()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for prefix in entries {
+        if !prefix.file_type()?.is_dir() {
+            fs::remove_file(prefix.path())?;
+            continue;
+        }
+        let objects = fs::read_dir(prefix.path())?.collect::<std::io::Result<Vec<_>>>()?;
+        for object in objects {
+            let id = object.file_name();
+            if id.to_str().is_none_or(|id| !keep.contains(id)) {
+                if object.file_type()?.is_dir() {
+                    fs::remove_dir_all(object.path())?;
+                } else {
+                    fs::remove_file(object.path())?;
+                }
+            }
+        }
+        if fs::read_dir(prefix.path())?.next().is_none() {
+            fs::remove_dir(prefix.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn carrier_chunk_entries(
+    repo: &Path,
+    commit: &str,
+    kind: ObjectKind,
+    id: &str,
+) -> Result<Option<Vec<(String, String)>>> {
+    validate_id(id)?;
+    let directory = format!("e2ee/{}/{}/{id}", kind.directory(), &id[..2]);
+    let output = carrier_git_command()
+        .arg("-C")
+        .arg(repo)
+        .args(["ls-tree", "-r", "-z", commit, "--", &directory])
+        .output()?;
+    ensure_git_success(&output, "git ls-tree carrier object")?;
+    if output.stdout.is_empty() {
+        return Ok(None);
+    }
+    if output.stdout.len() > 8 * 1024 * 1024 {
+        bail!("carrier object listing exceeds its size budget")
+    }
+    let mut chunks = Vec::new();
+    for entry in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let tab = entry
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .context("parse carrier tree entry")?;
+        let (metadata, path) = (&entry[..tab], &entry[tab + 1..]);
+        let metadata = std::str::from_utf8(metadata)?;
+        let path = std::str::from_utf8(path)?.to_owned();
+        let mut fields = metadata.split_ascii_whitespace();
+        if fields.next() != Some("100644") || fields.next() != Some("blob") {
+            bail!("carrier object contains a non-regular blob")
+        }
+        let blob_id = fields.next().context("carrier blob has no id")?;
+        if fields.next().is_some() || !path.starts_with(&format!("{directory}/")) {
+            bail!("unexpected carrier object path")
+        }
+        chunks.push((path, blob_id.to_owned()));
+    }
+    chunks.sort_by(|left, right| left.0.cmp(&right.0));
+    if chunks.is_empty() || chunks.len() > 4096 {
+        bail!("carrier object has an invalid chunk count")
+    }
+    for (index, (path, _)) in chunks.iter().enumerate() {
+        let expected = format!("{directory}/{index:08}");
+        if path != &expected {
+            bail!("carrier object chunks are not a dense canonical sequence")
+        }
+    }
+    Ok(Some(chunks))
+}
+
+struct CarrierCache {
+    remote_dir: PathBuf,
+    path: PathBuf,
+    _lock: File,
+}
+
+impl CarrierCache {
+    fn lock(remote: &str) -> Result<Self> {
+        let normalized = normalize_carrier_remote(remote)?;
+        let hash = hex::encode(Sha256::digest(normalized.as_bytes()));
+        let root = carrier_cache_root()?;
+        fs::create_dir_all(&root)
+            .with_context(|| format!("create carrier cache directory {}", root.display()))?;
+        let root = fs::canonicalize(&root)?;
+        let lock_path = root.join(format!(".{hash}.lock"));
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("open carrier cache lock {}", lock_path.display()))?;
+        let wait_timer = trace::Span::new("carrier_cache_lock_wait");
+        lock.lock_exclusive()
+            .with_context(|| format!("lock carrier cache {}", lock_path.display()))?;
+        drop(wait_timer);
+        let remote_dir = root.join(&hash);
+        Ok(Self {
+            remote_dir,
+            path: PathBuf::new(),
+            _lock: lock,
+        })
+    }
+
+    fn refresh(&mut self, remote: &str) -> Result<Option<String>> {
+        let initialize_timer = trace::Span::new("carrier_cache_initialize");
+        self.ensure_initialized()?;
+        drop(initialize_timer);
+        let fetch_timer = trace::Span::new("carrier_cache_fetch_remote");
+        match fetch_carrier_branch(&self.path, remote) {
+            Ok(tip) => {
+                drop(fetch_timer);
+                Ok(tip)
+            }
+            Err(fetch_error) if self.is_corrupt()? => {
+                self.rebuild()?;
+                let result = fetch_carrier_branch(&self.path, remote).with_context(|| {
+                    format!(
+                        "fetch carrier branch after rebuilding corrupt cache (initial fetch failed: {fetch_error:#})"
+                    )
+                });
+                drop(fetch_timer);
+                result
+            }
+            Err(fetch_error) => {
+                drop(fetch_timer);
+                Err(fetch_error)
+            }
+        }
+    }
+
+    fn ensure_initialized(&mut self) -> Result<()> {
+        fs::create_dir_all(&self.remote_dir).with_context(|| {
+            format!(
+                "create per-remote carrier cache {}",
+                self.remote_dir.display()
+            )
+        })?;
+        let current = self.remote_dir.join("current");
+        let generation = fs::read_to_string(&current)
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| valid_cache_generation(value));
+        if let Some(generation) = generation {
+            self.path = self.remote_dir.join(generation);
+        }
+        let usable = !self.path.as_os_str().is_empty()
+            && self.path.exists()
+            && cache_git_output(&self.path, &["rev-parse", "--is-bare-repository"]).is_ok_and(
+                |output| {
+                    output.status.success()
+                        && String::from_utf8_lossy(&output.stdout).trim() == "true"
+                },
+            );
+        if !usable {
+            self.initialize_generation()?;
+        }
+        if configure_cache(&self.path).is_err() {
+            self.rebuild()?;
+        }
+        Ok(())
+    }
+
+    fn initialize_generation(&mut self) -> Result<()> {
+        fs::create_dir_all(&self.remote_dir)?;
+        let mut random = [0_u8; 8];
+        OsRng.fill_bytes(&mut random);
+        let generation = format!("objects-{}-{}", std::process::id(), hex::encode(random));
+        self.path = self.remote_dir.join(generation);
+        let output = carrier_git_command()
+            .args(["init", "--bare", "--quiet"])
+            .arg(&self.path)
+            .output()?;
+        ensure_git_success(&output, "git init --bare carrier cache")?;
+        configure_cache(&self.path)?;
+        cache_git_command(
+            &self.path,
+            &["symbolic-ref", "HEAD", CARRIER_CACHE_FETCH_REF],
+        )?;
+        self.publish_current()
+    }
+
+    fn is_corrupt(&self) -> Result<bool> {
+        let output = cache_git_output(&self.path, &["fsck", "--full"])?;
+        Ok(!output.status.success())
+    }
+
+    fn rebuild(&mut self) -> Result<()> {
+        // Existing temporary checkouts may still borrow the previous object
+        // directory. Keep that generation intact and publish a fresh one.
+        self.initialize_generation()
+    }
+
+    fn publish_current(&self) -> Result<()> {
+        let generation = self
+            .path
+            .file_name()
+            .context("carrier cache generation has no name")?;
+        let generation = generation
+            .to_str()
+            .context("carrier cache generation name is not UTF-8")?;
+        let mut random = [0_u8; 8];
+        OsRng.fill_bytes(&mut random);
+        let temporary = self.remote_dir.join(format!(
+            ".current-{}-{}",
+            std::process::id(),
+            hex::encode(random)
+        ));
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        writeln!(file, "{generation}")?;
+        file.sync_all()?;
+        let current = self.remote_dir.join("current");
+        if current.exists() {
+            fs::remove_file(&current)?;
+        }
+        fs::rename(&temporary, &current)?;
+        Ok(())
+    }
+
+    fn update_published_tip(&self, commit: &str) -> Result<()> {
+        cache_git_command(&self.path, &["update-ref", CARRIER_CACHE_FETCH_REF, commit])
+    }
+}
+
+fn valid_cache_generation(value: &str) -> bool {
+    value.starts_with("objects-")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+fn carrier_cache_root() -> Result<PathBuf> {
+    if let Some(override_dir) = std::env::var_os(CARRIER_CACHE_ENV) {
+        if override_dir.is_empty() {
+            bail!("{CARRIER_CACHE_ENV} must not be empty")
+        }
+        return Ok(PathBuf::from(override_dir));
+    }
+    let cache_home = match std::env::var_os("XDG_CACHE_HOME") {
+        Some(path) if !path.is_empty() => PathBuf::from(path),
+        _ => PathBuf::from(
+            std::env::var_os("HOME").context("HOME is unset and XDG_CACHE_HOME is unset")?,
+        )
+        .join(".cache"),
+    };
+    Ok(cache_home.join("git-remote-e2ee").join("carrier"))
+}
+
+fn normalize_carrier_remote(remote: &str) -> Result<String> {
+    if remote.trim().is_empty() {
+        bail!("empty carrier Git remote")
+    }
+    if remote.contains("://") {
+        return Ok(remote.trim().trim_end_matches('/').to_owned());
+    }
+    if remote == remote.trim()
+        && let Some((host, path)) = remote.split_once(':')
+        && !host.is_empty()
+        && !host.contains('/')
+        && !host.contains('\\')
+        && !(host.len() == 1 && host.as_bytes()[0].is_ascii_alphabetic())
+        && !remote.starts_with("./")
+        && !remote.starts_with("../")
+        && !remote.starts_with('/')
+    {
+        return Ok(format!("{host}:{}", path.trim_end_matches('/')));
+    }
+
+    let path = Path::new(remote);
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    match fs::canonicalize(&absolute) {
+        Ok(path) => Ok(path.to_string_lossy().into_owned()),
+        Err(_) => Ok(lexically_normalize(&absolute)
+            .to_string_lossy()
+            .into_owned()),
+    }
+}
+
+fn lexically_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn configure_cache(cache: &Path) -> Result<()> {
+    cache_git_command(cache, &["config", "gc.auto", "0"])?;
+    cache_git_command(cache, &["config", "maintenance.auto", "false"])?;
+    configure_git_pack_settings(|key, value| cache_git_command(cache, &["config", key, value]))?;
+    Ok(())
+}
+
+fn configure_git_pack_settings(mut configure: impl FnMut(&str, &str) -> Result<()>) -> Result<()> {
+    for (key, value) in [
+        ("core.compression", "0"),
+        ("core.looseCompression", "0"),
+        ("pack.compression", "0"),
+        ("pack.window", "0"),
+        ("pack.depth", "0"),
+        ("core.bigFileThreshold", "1m"),
+    ] {
+        configure(key, value)?;
+    }
+    Ok(())
+}
+
+fn fetch_carrier_branch(cache: &Path, remote: &str) -> Result<Option<String>> {
+    let refspec = format!("+refs/heads/{CARRIER_BRANCH}:{CARRIER_CACHE_FETCH_REF}");
+    let fetch = cache_git_output(cache, &["fetch", "--quiet", "--no-tags", remote, &refspec])?;
+    if fetch.status.success() {
+        return git_rev_parse(cache, CARRIER_CACHE_FETCH_REF);
+    }
+
+    let ls_remote = cache_git_output(
+        cache,
+        &["ls-remote", "--heads", remote, CARRIER_CACHE_FETCH_REF],
+    )?;
+    ensure_git_success(&ls_remote, "git ls-remote carrier branch")?;
+    if String::from_utf8_lossy(&ls_remote.stdout).trim().is_empty() {
+        let delete = cache_git_output(cache, &["update-ref", "-d", CARRIER_CACHE_FETCH_REF])?;
+        ensure_git_success(&delete, "git update-ref delete missing carrier branch")?;
+        return Ok(None);
+    }
+    ensure_git_success(&fetch, "git fetch carrier branch")?;
+    unreachable!("failed git fetch must return an error")
+}
+
+fn create_carrier_checkout(
+    checkout: &Path,
+    cache: &Path,
+    remote: &str,
+    base_commit: &Option<String>,
+) -> Result<()> {
+    let _timer = trace::Span::new("carrier_checkout_git_setup");
+    let output = carrier_git_command()
+        .arg("-C")
+        .arg(checkout)
+        .args(["init", "--quiet"])
+        .output()?;
+    ensure_git_success(&output, "git init carrier checkout")?;
+    let cache_objects = cache.join("objects");
+    let cache_objects = cache_objects
+        .to_str()
+        .context("carrier cache object path is not UTF-8")?;
+    if cache_objects.contains('\n') {
+        bail!("carrier cache object path contains a newline")
+    }
+    fs::write(
+        checkout.join(".git/objects/info/alternates"),
+        format!("{cache_objects}\n"),
+    )?;
+    git_command(checkout, &["config", "gc.auto", "0"])?;
+    git_command(checkout, &["config", "maintenance.auto", "false"])?;
+    configure_git_pack_settings(|key, value| git_command(checkout, &["config", key, value]))?;
+    git_command(checkout, &["config", "user.name", "git-remote-e2ee"])?;
+    git_command(
+        checkout,
+        &["config", "user.email", "git-remote-e2ee@invalid"],
+    )?;
+    git_command(checkout, &["remote", "add", "origin", remote])?;
+
+    let remote_ref = format!("refs/remotes/origin/{CARRIER_BRANCH}");
+    match base_commit {
+        Some(commit) => {
+            git_command(checkout, &["update-ref", &remote_ref, commit])?;
+            let local_ref = format!("refs/heads/{CARRIER_BRANCH}");
+            git_command(checkout, &["update-ref", &local_ref, commit])?;
+            git_command(checkout, &["symbolic-ref", "HEAD", &local_ref])?;
+            git_command(checkout, &["read-tree", commit])?;
+        }
+        None => {
+            git_command(
+                checkout,
+                &["checkout", "--quiet", "--orphan", CARRIER_BRANCH],
+            )?;
+        }
+    }
+    fs::write(checkout.join(".gitattributes"), CARRIER_ATTRIBUTES)?;
+    Ok(())
 }
 
 fn git_rev_parse(repo: &Path, reference: &str) -> Result<Option<String>> {
@@ -661,12 +1770,155 @@ fn git_rev_parse(repo: &Path, reference: &str) -> Result<Option<String>> {
     }
 }
 
+fn cache_git_command(cache: &Path, args: &[&str]) -> Result<()> {
+    let output = cache_git_output(cache, args)?;
+    ensure_git_success(&output, &format!("git {}", args.join(" ")))
+}
+
+fn cache_git_output(cache: &Path, args: &[&str]) -> Result<std::process::Output> {
+    Ok(carrier_git_command()
+        .arg("--git-dir")
+        .arg(cache)
+        .args(args)
+        .output()?)
+}
+
+fn ensure_git_success(output: &std::process::Output, action: &str) -> Result<()> {
+    if !output.status.success() {
+        bail!(
+            "{action} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }
+    Ok(())
+}
+
 fn git_command(repo: &Path, args: &[&str]) -> Result<()> {
     let output = carrier_git_command()
         .arg("-C")
         .arg(repo)
         .args(args)
         .output()?;
+    if !output.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }
+    Ok(())
+}
+
+fn git_command_with_input(repo: &Path, args: &[&str], input: &[u8]) -> Result<()> {
+    let mut child = carrier_git_command()
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .context("open git stdin")?
+        .write_all(input)?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }
+    Ok(())
+}
+
+fn stage_carrier_checkout(repo: &Path, object_directory: &Path) -> Result<()> {
+    fn collect(root: &Path, path: &Path, output: &mut Vec<u8>) -> Result<()> {
+        let entry = fs::symlink_metadata(path)?;
+        if entry.file_type().is_dir() {
+            for child in fs::read_dir(path)? {
+                collect(root, &child?.path(), output)?;
+            }
+        } else if entry.file_type().is_file() {
+            let relative = path
+                .strip_prefix(root)?
+                .to_str()
+                .context("carrier checkout path is not UTF-8")?;
+            if relative.contains('\n') || relative.contains('\0') {
+                bail!("carrier checkout path contains a forbidden character")
+            }
+            output.extend_from_slice(relative.as_bytes());
+            output.push(0);
+        } else {
+            bail!("carrier checkout contains a non-regular staged path")
+        }
+        Ok(())
+    }
+
+    let mut paths = Vec::new();
+    let attributes = repo.join(".gitattributes");
+    if attributes.exists() {
+        collect(repo, &attributes, &mut paths)?;
+    }
+    let encrypted = repo.join("e2ee");
+    if encrypted.exists() {
+        collect(repo, &encrypted, &mut paths)?;
+    }
+    if paths.is_empty() {
+        bail!("carrier publication has no staged files")
+    }
+    git_command_with_object_directory_input(
+        repo,
+        object_directory,
+        &["add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"],
+        &paths,
+    )
+}
+
+fn git_command_with_object_directory(
+    repo: &Path,
+    object_directory: &Path,
+    args: &[&str],
+) -> Result<()> {
+    let output = carrier_git_command()
+        .arg("-C")
+        .arg(repo)
+        .env("GIT_OBJECT_DIRECTORY", object_directory)
+        .args(args)
+        .output()?;
+    if !output.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }
+    Ok(())
+}
+
+fn git_command_with_object_directory_input(
+    repo: &Path,
+    object_directory: &Path,
+    args: &[&str],
+    input: &[u8],
+) -> Result<()> {
+    let mut child = carrier_git_command()
+        .arg("-C")
+        .arg(repo)
+        .env("GIT_OBJECT_DIRECTORY", object_directory)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .context("open git pathspec stdin")?
+        .write_all(input)?;
+    let output = child.wait_with_output()?;
     if !output.status.success() {
         bail!(
             "git {} failed: {}",
@@ -695,11 +1947,53 @@ fn carrier_git_command() -> Command {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
 
     use super::*;
     use crate::crypto::object_id;
+
+    struct PartialWriteSink {
+        published: Arc<AtomicBool>,
+    }
+
+    impl Write for PartialWriteSink {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            Ok(data.len().min(3))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ObjectStageSink for PartialWriteSink {
+        fn publish(self, _id: &str) -> Result<()> {
+            self.published.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn object_stage_validates_all_written_bytes_before_publishing() {
+        let data = b"partial writes must all contribute to the staged object hash";
+        let published = Arc::new(AtomicBool::new(false));
+        let mut stage = ValidatingObjectStage::wrap(PartialWriteSink {
+            published: Arc::clone(&published),
+        });
+        stage.write_all(data).unwrap();
+        stage.finish(&object_id(data)).unwrap();
+        assert!(published.load(Ordering::Relaxed));
+
+        let published = Arc::new(AtomicBool::new(false));
+        let mut stage = ValidatingObjectStage::wrap(PartialWriteSink {
+            published: Arc::clone(&published),
+        });
+        stage.write_all(data).unwrap();
+        assert!(stage.finish(&object_id(b"different bytes")).is_err());
+        assert!(!published.load(Ordering::Relaxed));
+    }
 
     #[test]
     fn head_compare_and_swap_rejects_stale_writer() {
@@ -791,7 +2085,8 @@ mod tests {
             reader_id(ChunkReader {
                 paths,
                 next: 0,
-                current: None
+                current: None,
+                trace: trace::Io::new("carrier_object_read"),
             })
             .unwrap(),
             object_id(b"only")

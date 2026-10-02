@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 330" width="760" height="330" role="img" aria-labelledby="title desc">
+  <title id="title">What your devices see and what the storage host sees</title>
+  <desc id="desc">On your devices the repository is ordinary Git with branches, commits, and files. It is encrypted before it leaves the device, so the storage host only holds opaque ciphertext objects and one opaque head pointer.</desc>
+  <style>
+    text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+    .h { font-size: 15px; font-weight: 600; fill: #1c1a17; }
+    .sub { font-size: 12px; fill: #6b645a; }
+    .ink { fill: #1c1a17; }
+    .muted { fill: #8a8276; }
+    .cipher { fill: #7a8699; }
+  </style>
+  <rect x="0" y="0" width="760" height="330" rx="16" fill="#faf8f4"/>
+
+  <!-- Left: your devices -->
+  <rect x="24" y="24" width="300" height="282" rx="12" fill="#ffffff" stroke="#e4ded3"/>
+  <text x="44" y="54" class="h">On your devices</text>
+  <text x="44" y="73" class="sub">ordinary Git, fully readable</text>
+  <text x="44" y="108" class="mono ink">$ git log --oneline</text>
+  <text x="44" y="130" class="mono ink"><tspan fill="#b3542e">a1f3c9e</tspan> Fix login redirect</text>
+  <text x="44" y="150" class="mono ink"><tspan fill="#b3542e">7c02d41</tspan> Add customer notes</text>
+  <text x="44" y="170" class="mono ink"><tspan fill="#b3542e">3e9b7aa</tspan> Initial import</text>
+  <text x="44" y="204" class="mono ink">$ ls</text>
+  <text x="44" y="226" class="mono ink">src/auth.rs  notes/acme.md</text>
+  <text x="44" y="260" class="mono muted">branches: main, feature/sso</text>
+  <text x="44" y="282" class="mono muted">key: only on this device</text>
+
+  <!-- Arrow -->
+  <line x1="336" y1="165" x2="416" y2="165" stroke="#b3542e" stroke-width="2.5"/>
+  <polygon points="416,158 430,165 416,172" fill="#b3542e"/>
+  <text x="383" y="146" text-anchor="middle" font-size="12" font-weight="600" fill="#b3542e">encrypt</text>
+  <text x="383" y="190" text-anchor="middle" font-size="11" fill="#6b645a">before</text>
+  <text x="383" y="204" text-anchor="middle" font-size="11" fill="#6b645a">upload</text>
+
+  <!-- Right: storage host -->
+  <rect x="436" y="24" width="300" height="282" rx="12" fill="#eef1f5" stroke="#d5dbe4"/>
+  <text x="456" y="54" class="h">On the storage host</text>
+  <text x="456" y="73" class="sub">GitHub, a NAS, a bare repo…</text>
+  <text x="456" y="108" class="mono ink">e2ee/HEAD</text>
+  <text x="456" y="128" class="mono cipher">  9f4c…e21a</text>
+  <text x="456" y="154" class="mono ink">e2ee/objects/</text>
+  <text x="456" y="174" class="mono cipher">  3f/9a1c07…  (1.2 MiB)</text>
+  <text x="456" y="194" class="mono cipher">  7c/e04b5d…  (3.4 KiB)</text>
+  <text x="456" y="214" class="mono cipher">  b8/51f2aa…  (80 KiB)</text>
+  <text x="456" y="260" class="mono muted">no names, paths, messages,</text>
+  <text x="456" y="282" class="mono muted">authors, or branches</text>
+</svg>

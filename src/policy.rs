@@ -10,8 +10,8 @@ use crate::crypto::{
     verify_domain,
 };
 
-pub const POLICY_FORMAT_VERSION: u32 = 3;
-const POLICY_SIGNATURE_DOMAIN: &[u8] = b"git-remote-e2ee policy v4\0";
+pub const POLICY_FORMAT_VERSION: u32 = 5;
+const POLICY_SIGNATURE_DOMAIN: &[u8] = b"git-remote-e2ee policy v5\0";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -22,6 +22,14 @@ pub struct DeviceRoles {
 }
 
 impl DeviceRoles {
+    pub fn reader() -> Self {
+        Self {
+            reader: true,
+            writer: false,
+            administrator: false,
+        }
+    }
+
     pub fn owner() -> Self {
         Self {
             reader: true,
@@ -265,6 +273,11 @@ impl PolicyState {
             .is_some_and(|device| device.active() && device.roles.writer)
     }
 
+    pub fn is_active_reader(&self, device_id: &str) -> bool {
+        self.device(device_id)
+            .is_some_and(|device| device.active() && device.roles.reader)
+    }
+
     pub fn is_active_admin(&self, device_id: &str) -> bool {
         self.device(device_id)
             .is_some_and(|device| device.active() && device.roles.administrator)
@@ -340,6 +353,33 @@ mod tests {
         assert!(result.is_ok());
         let (unauthorized, _) = result.unwrap();
         assert!(unauthorized.validate_successor(&parent).is_err());
+    }
+
+    #[test]
+    fn writers_and_administrators_must_also_be_readers() {
+        let owner = KeyFile::generate();
+        let (parent, _) = PolicyState::genesis(&owner).unwrap();
+        for roles in [
+            DeviceRoles {
+                reader: false,
+                writer: true,
+                administrator: false,
+            },
+            DeviceRoles {
+                reader: false,
+                writer: false,
+                administrator: true,
+            },
+        ] {
+            let added = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
+            let mut devices = parent.body.devices.clone();
+            devices.push(DeviceRecord {
+                public: added.public_device().unwrap(),
+                roles,
+                revoked_at: None,
+            });
+            assert!(PolicyState::successor(&parent, devices, &owner).is_err());
+        }
     }
 
     #[test]
