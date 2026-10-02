@@ -20,9 +20,14 @@ raw logs are never written into the project. BENCH_TINY_COMMITS defaults to 5
 and BENCH_GCRYPT_TINY_COMMITS defaults to 5 (3 is allowed for a prohibitively
 slow full-history gcrypt run). BENCH_ROUNDS defaults to 3 and may be reduced
 for a smoke run. BENCH_SKIP_BUILD=1 uses existing release binaries instead of
-building them. Byte values are logical object-store file sizes, not packet
-captures. For fetches they use the matching newly published remote objects;
-client object-store growth is reported separately where measurable.
+building them. Peak RSS uses `/usr/bin/time -l`'s maximum resident set size on
+macOS and `/usr/bin/time -v`'s maximum RSS on Linux, converted to bytes. Both
+use the platform's reported usage for the measured command and children as
+supported by that `time` implementation. Logical directory sizes sum file
+lengths; allocated sizes use `du -sk` in 1 KiB blocks. Each row reports the
+remote/storage total, client `.git`, and auxiliary cache or gcrypt state after
+the phase. Remote byte deltas count newly stored objects, not packet wire
+bytes. Client object-store growth is also reported for fetches.
 Set BENCH_TRACE=1 to enable E2EE phase timing and print trace lines for each
 measured E2EE operation to stderr.
 Set BENCH_E2EE_ONLY=1 to skip plain and gcrypt measurements. Set
@@ -175,7 +180,7 @@ cleanup() {
 trap cleanup EXIT
 
 raw_tsv="$work/measurements.tsv"
-printf 'round\ttransport\tphase\titeration\twall_seconds\tremote_or_stored_bytes\tclient_object_store_growth\n' >"$raw_tsv"
+printf 'round\ttransport\tphase\titeration\twall_seconds\tmax_rss_bytes\tremote_or_stored_delta_bytes\tremote_or_stored_total_logical_bytes\tremote_or_stored_total_allocated_bytes\tclient_git_logical_bytes\tclient_git_allocated_bytes\tlocal_state_logical_bytes\tlocal_state_allocated_bytes\tclient_object_store_growth\n' >"$raw_tsv"
 
 tree_logical_bytes() {
   local path=$1
@@ -185,6 +190,15 @@ tree_logical_bytes() {
     find "$path" -type f -exec stat -f '%z' {} + | awk '{sum += $1} END {printf "%.0f\n", sum + 0}'
   else
     find "$path" -type f -exec stat -c '%s' {} + | awk '{sum += $1} END {printf "%.0f\n", sum + 0}'
+  fi
+}
+
+tree_allocated_bytes() {
+  local path=$1
+  if [[ ! -e $path ]]; then
+    echo 0
+  else
+    du -sk "$path" | awk '{printf "%.0f\n", $1 * 1024}'
   fi
 }
 
@@ -226,7 +240,8 @@ measure() {
       sed -n '1,100p' "$output" >&2
       return 1
     fi
-    awk '/ real / {print $1; exit}' "$timing"
+    MEASURED_WALL=$(awk '/ real / {print $1; exit}' "$timing")
+    MEASURED_RSS_BYTES=$(awk '/maximum resident set size/ {print $1; exit}' "$timing")
   else
     if ! /usr/bin/time -v -o "$timing" "$@" >"$output" 2>"$error"; then
       echo "benchmark phase failed: $label" >&2
@@ -234,11 +249,19 @@ measure() {
       sed -n '1,100p' "$output" >&2
       return 1
     fi
-    awk -F': ' '/Elapsed \(wall clock\)/ {
+    MEASURED_WALL=$(awk -F': ' '/Elapsed \(wall clock\)/ {
       n = split($2, a, ":")
       if (n == 3) printf "%.3f\n", a[1] * 3600 + a[2] * 60 + a[3]
       else printf "%.3f\n", a[1] * 60 + a[2]
-    }' "$timing"
+    }' "$timing")
+    MEASURED_RSS_BYTES=$(awk -F': ' '/Maximum resident set size \(kbytes\)/ {
+      printf "%.0f\n", $2 * 1024
+      exit
+    }' "$timing")
+  fi
+  if [[ -z $MEASURED_RSS_BYTES ]]; then
+    echo "could not read max RSS from $timing" >&2
+    return 1
   fi
   if [[ ${BENCH_TRACE:-0} == 1 && $label == *e2ee* ]]; then
     awk -v phase="$label" '/^git-remote-e2ee trace / {
@@ -248,7 +271,28 @@ measure() {
 }
 
 record() {
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >>"$raw_tsv"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >>"$raw_tsv"
+}
+
+record_sizes() {
+  local round=$1 transport=$2 phase=$3 iteration=$4 wall=$5 max_rss=$6
+  local remote_delta=$7 remote_path=$8 client_path=$9 state_path=${10} growth=${11}
+  local remote_logical remote_allocated client_logical=0 client_allocated=0
+  local state_logical=0 state_allocated=0
+  remote_logical=$(tree_logical_bytes "$remote_path")
+  remote_allocated=$(tree_allocated_bytes "$remote_path")
+  if [[ -n $client_path ]]; then
+    client_logical=$(tree_logical_bytes "$client_path")
+    client_allocated=$(tree_allocated_bytes "$client_path")
+  fi
+  if [[ -n $state_path ]]; then
+    state_logical=$(tree_logical_bytes "$state_path")
+    state_allocated=$(tree_allocated_bytes "$state_path")
+  fi
+  record "$round" "$transport" "$phase" "$iteration" "$wall" "$max_rss" \
+    "$remote_delta" "$remote_logical" "$remote_allocated" \
+    "$client_logical" "$client_allocated" "$state_logical" \
+    "$state_allocated" "$growth"
 }
 
 run_round() {
@@ -256,7 +300,8 @@ run_round() {
   local branch=main bare_local plain_git gcrypt_dir gcrypt_git carrier_git
   local gcrypt_url e2ee_url key_directory key_carrier fingerprint gpg_home bare_repo
   local source_work plain_fresh gcrypt_fresh e2ee_fresh
-  local cache_push cache_returning wall before after secondary i transport
+  local cache_push cache_returning wall rss before after secondary i transport
+  local remote_path state_path
 
   mkdir -m 700 "$round_dir"
   source_work="$round_dir/source"
@@ -341,72 +386,99 @@ run_round() {
 
   echo "round $round: initial local encryption and initial Git-backend pushes" >&2
   if [[ $e2ee_only != 1 ]]; then
-    wall=$(measure "$round-initial-local-plain" \
-      git -C "$source_work" push --quiet plain-local "$branch:$branch")
+    measure "$round-initial-local-plain" \
+      git -C "$source_work" push --quiet plain-local "$branch:$branch"
+    wall=$MEASURED_WALL
+    rss=$MEASURED_RSS_BYTES
     after=$(git_bare_object_db_bytes "$bare_local")
-    record "$round" plain initial_encryption 0 "$wall" "$after" 0
+    record_sizes "$round" plain initial_encryption 0 "$wall" "$rss" \
+      "$after" "$bare_local" "$source_work/.git" "" 0
 
-    wall=$(measure "$round-initial-local-gcrypt" \
-      git -C "$source_work" push --quiet --force gcrypt-directory "$branch:master")
+    measure "$round-initial-local-gcrypt" \
+      git -C "$source_work" push --quiet --force gcrypt-directory "$branch:master"
+    wall=$MEASURED_WALL
+    rss=$MEASURED_RSS_BYTES
     after=$(tree_logical_bytes "$gcrypt_dir")
-    record "$round" gcrypt initial_encryption 0 "$wall" "$after" 0
+    record_sizes "$round" gcrypt initial_encryption 0 "$wall" "$rss" \
+      "$after" "$gcrypt_dir" "$source_work/.git" "$source_work/.git/remote-gcrypt" 0
   fi
 
-  wall=$(measure "$round-initial-local-e2ee" \
-    git -C "$source_work" push --quiet e2ee-directory "$branch:$branch")
+  measure "$round-initial-local-e2ee" \
+    git -C "$source_work" push --quiet e2ee-directory "$branch:$branch"
+  wall=$MEASURED_WALL
+  rss=$MEASURED_RSS_BYTES
   after=$(tree_logical_bytes "$round_dir/e2ee-directory")
-  record "$round" e2ee initial_encryption 0 "$wall" "$after" 0
+  record_sizes "$round" e2ee initial_encryption 0 "$wall" "$rss" \
+    "$after" "$round_dir/e2ee-directory" "$source_work/.git" "" 0
 
   if [[ $e2ee_only != 1 ]]; then
     before=$(git_bare_object_db_bytes "$plain_git")
-    wall=$(measure "$round-initial-plain-push" \
-      git -C "$source_work" push --quiet plain-git "$branch:$branch")
+    measure "$round-initial-plain-push" \
+      git -C "$source_work" push --quiet plain-git "$branch:$branch"
+    wall=$MEASURED_WALL
+    rss=$MEASURED_RSS_BYTES
     after=$(git_bare_object_db_bytes "$plain_git")
-    record "$round" plain initial_push 0 "$wall" "$((after - before))" 0
+    record_sizes "$round" plain initial_push 0 "$wall" "$rss" \
+      "$((after - before))" "$plain_git" "$source_work/.git" "" 0
 
     before=$(git_bare_object_db_bytes "$gcrypt_git")
-    wall=$(measure "$round-initial-gcrypt-git-push" \
-      git -C "$source_work" push --quiet --force gcrypt-git "$branch:master")
+    measure "$round-initial-gcrypt-git-push" \
+      git -C "$source_work" push --quiet --force gcrypt-git "$branch:master"
+    wall=$MEASURED_WALL
+    rss=$MEASURED_RSS_BYTES
     after=$(git_bare_object_db_bytes "$gcrypt_git")
-    record "$round" gcrypt initial_push 0 "$wall" "$((after - before))" 0
+    record_sizes "$round" gcrypt initial_push 0 "$wall" "$rss" \
+      "$((after - before))" "$gcrypt_git" "$source_work/.git" \
+      "$source_work/.git/remote-gcrypt" 0
   fi
 
   before=$(git_bare_object_db_bytes "$carrier_git")
-  wall=$(measure "$round-initial-e2ee-carrier-push" \
+  measure "$round-initial-e2ee-carrier-push" \
     env "GIT_REMOTE_E2EE_CACHE_DIR=$cache_push" \
-    git -C "$source_work" push --quiet e2ee-carrier "$branch:$branch")
+    git -C "$source_work" push --quiet e2ee-carrier "$branch:$branch"
+  wall=$MEASURED_WALL
+  rss=$MEASURED_RSS_BYTES
   after=$(git_bare_object_db_bytes "$carrier_git")
-  record "$round" e2ee initial_push 0 "$wall" "$((after - before))" 0
+  record_sizes "$round" e2ee initial_push 0 "$wall" "$rss" \
+    "$((after - before))" "$carrier_git" "$source_work/.git" "$cache_push" 0
 
   echo "round $round: fresh no-checkout clones from Git backends" >&2
   if [[ $e2ee_only != 1 ]]; then
-    wall=$(measure "$round-fresh-plain-clone" git \
+    measure "$round-fresh-plain-clone" git \
       -c gc.auto=0 -c maintenance.auto=false \
       clone --quiet --no-local --no-tags --no-checkout --branch "$branch" \
-      "file://$plain_git" "$plain_fresh")
+      "file://$plain_git" "$plain_fresh"
+    wall=$MEASURED_WALL
+    rss=$MEASURED_RSS_BYTES
     after=$(git_object_db_bytes "$plain_fresh")
-    record "$round" plain fresh_fetch 0 "$wall" \
-      "$(git_bare_object_db_bytes "$plain_git")" "$after"
+    record_sizes "$round" plain fresh_fetch 0 "$wall" "$rss" \
+      "$(git_bare_object_db_bytes "$plain_git")" "$plain_git" \
+      "$plain_fresh/.git" "" "$after"
 
-    wall=$(measure "$round-fresh-gcrypt-clone" git \
+    measure "$round-fresh-gcrypt-clone" git \
       -c gc.auto=0 -c maintenance.auto=false -c "gpg.program=$gpg_bin" \
       -c "remote.origin.gcrypt-participants=$fingerprint" \
       -c "remote.origin.gcrypt-signingkey=$fingerprint" \
       clone --quiet --no-local --no-tags --no-checkout --branch master \
-      "$gcrypt_url" "$gcrypt_fresh")
+      "$gcrypt_url" "$gcrypt_fresh"
+    wall=$MEASURED_WALL
+    rss=$MEASURED_RSS_BYTES
     git -C "$gcrypt_fresh" config gc.auto 0
     git -C "$gcrypt_fresh" config maintenance.auto false
     after=$(git_object_db_bytes "$gcrypt_fresh")
-    record "$round" gcrypt fresh_fetch 0 "$wall" \
-      "$(git_bare_object_db_bytes "$gcrypt_git")" "$after"
+    record_sizes "$round" gcrypt fresh_fetch 0 "$wall" "$rss" \
+      "$(git_bare_object_db_bytes "$gcrypt_git")" "$gcrypt_git" \
+      "$gcrypt_fresh/.git" "$gcrypt_fresh/.git/remote-gcrypt" "$after"
   fi
 
   before=$(carrier_cache_object_db_bytes "$cache_returning")
-  wall=$(measure "$round-fresh-e2ee-clone" env \
+  measure "$round-fresh-e2ee-clone" env \
     "GIT_REMOTE_E2EE_CACHE_DIR=$cache_returning" \
     git -c gc.auto=0 -c maintenance.auto=false -c "e2ee.key=$key_carrier" \
     clone --quiet --no-local --no-tags --no-checkout --branch "$branch" \
-    "$e2ee_url" "$e2ee_fresh")
+    "$e2ee_url" "$e2ee_fresh"
+  wall=$MEASURED_WALL
+  rss=$MEASURED_RSS_BYTES
   if [[ $e2ee_only != 1 ]]; then
     git -C "$plain_fresh" config gc.auto 0
     git -C "$plain_fresh" config maintenance.auto false
@@ -415,11 +487,13 @@ run_round() {
   git -C "$e2ee_fresh" config maintenance.auto false
   after=$(carrier_cache_object_db_bytes "$cache_returning")
   secondary=$(git_object_db_bytes "$e2ee_fresh")
-  record "$round" e2ee fresh_fetch 0 "$wall" "$((after - before))" "$secondary"
+  record_sizes "$round" e2ee fresh_fetch 0 "$wall" "$rss" \
+    "$((after - before))" "$carrier_git" "$e2ee_fresh/.git" \
+    "$cache_returning" "$secondary"
 
   for ((i = 1; i <= tiny_commits; i++)); do
     local plain_added=0 gcrypt_added=0 e2ee_added=0
-    wall=$(measure "$round-tiny-commit-$i" bash -c '
+    measure "$round-tiny-commit-$i" bash -c '
       set -euo pipefail
       repo=$1
       iteration=$2
@@ -429,64 +503,91 @@ run_round() {
       mv "$temporary" "$readme"
       git -C "$repo" add -- README.md
       git -C "$repo" commit --quiet -m "benchmark: tiny update $iteration"
-    ' _ "$source_work" "$i")
+    ' _ "$source_work" "$i"
     for transport in "${transports[@]}"; do
-      record "$round" "$transport" tiny_commit "$i" "$wall" 0 0
+      wall=$MEASURED_WALL
+      rss=$MEASURED_RSS_BYTES
+      case $transport in
+        plain) remote_path=$plain_git; state_path= ;;
+        gcrypt) remote_path=$gcrypt_git; state_path="$source_work/.git/remote-gcrypt" ;;
+        e2ee) remote_path=$carrier_git; state_path=$cache_push ;;
+      esac
+      record_sizes "$round" "$transport" tiny_commit "$i" "$wall" "$rss" \
+        0 "$remote_path" "$source_work/.git" "$state_path" 0
     done
 
     if [[ $e2ee_only != 1 ]]; then
       before=$(git_bare_object_db_bytes "$plain_git")
-      wall=$(measure "$round-tiny-plain-push-$i" \
-        git -C "$source_work" push --quiet plain-git "$branch:$branch")
+      measure "$round-tiny-plain-push-$i" \
+        git -C "$source_work" push --quiet plain-git "$branch:$branch"
+      wall=$MEASURED_WALL
+      rss=$MEASURED_RSS_BYTES
       after=$(git_bare_object_db_bytes "$plain_git")
       plain_added=$((after - before))
-      record "$round" plain tiny_push "$i" "$wall" "$plain_added" 0
+      record_sizes "$round" plain tiny_push "$i" "$wall" "$rss" \
+        "$plain_added" "$plain_git" "$source_work/.git" "" 0
     fi
 
     if [[ $e2ee_only != 1 ]] && (( i <= gcrypt_tiny_commits )); then
       before=$(git_bare_object_db_bytes "$gcrypt_git")
-      wall=$(measure "$round-tiny-gcrypt-push-$i" \
-        git -C "$source_work" push --quiet --force gcrypt-git "$branch:master")
+      measure "$round-tiny-gcrypt-push-$i" \
+        git -C "$source_work" push --quiet --force gcrypt-git "$branch:master"
+      wall=$MEASURED_WALL
+      rss=$MEASURED_RSS_BYTES
       after=$(git_bare_object_db_bytes "$gcrypt_git")
       gcrypt_added=$((after - before))
-      record "$round" gcrypt tiny_push "$i" "$wall" "$gcrypt_added" 0
+      record_sizes "$round" gcrypt tiny_push "$i" "$wall" "$rss" \
+        "$gcrypt_added" "$gcrypt_git" "$source_work/.git" \
+        "$source_work/.git/remote-gcrypt" 0
     fi
 
     before=$(git_bare_object_db_bytes "$carrier_git")
-    wall=$(measure "$round-tiny-e2ee-push-$i" \
+    measure "$round-tiny-e2ee-push-$i" \
       env "GIT_REMOTE_E2EE_CACHE_DIR=$cache_push" \
-      git -C "$source_work" push --quiet e2ee-carrier "$branch:$branch")
+      git -C "$source_work" push --quiet e2ee-carrier "$branch:$branch"
+    wall=$MEASURED_WALL
+    rss=$MEASURED_RSS_BYTES
     after=$(git_bare_object_db_bytes "$carrier_git")
     e2ee_added=$((after - before))
-    record "$round" e2ee tiny_push "$i" "$wall" "$e2ee_added" 0
+    record_sizes "$round" e2ee tiny_push "$i" "$wall" "$rss" \
+      "$e2ee_added" "$carrier_git" "$source_work/.git" "$cache_push" 0
 
     if [[ $e2ee_only != 1 ]]; then
       before=$(git_object_db_bytes "$plain_fresh")
-      wall=$(measure "$round-tiny-plain-fetch-$i" \
-        git -C "$plain_fresh" fetch --quiet origin)
+      measure "$round-tiny-plain-fetch-$i" \
+        git -C "$plain_fresh" fetch --quiet origin
+      wall=$MEASURED_WALL
+      rss=$MEASURED_RSS_BYTES
       after=$(git_object_db_bytes "$plain_fresh")
-      record "$round" plain tiny_update "$i" "$wall" \
-        "$plain_added" "$((after - before))"
+      record_sizes "$round" plain tiny_update "$i" "$wall" "$rss" \
+        "$plain_added" "$plain_git" "$plain_fresh/.git" "" \
+        "$((after - before))"
     fi
 
     if [[ $e2ee_only != 1 ]] && (( i <= gcrypt_tiny_commits )); then
       before=$(git_object_db_bytes "$gcrypt_fresh")
-      wall=$(measure "$round-tiny-gcrypt-fetch-$i" \
-        git -C "$gcrypt_fresh" fetch --quiet origin)
+      measure "$round-tiny-gcrypt-fetch-$i" \
+        git -C "$gcrypt_fresh" fetch --quiet origin
+      wall=$MEASURED_WALL
+      rss=$MEASURED_RSS_BYTES
       after=$(git_object_db_bytes "$gcrypt_fresh")
-      record "$round" gcrypt tiny_update "$i" "$wall" \
-        "$gcrypt_added" "$((after - before))"
+      record_sizes "$round" gcrypt tiny_update "$i" "$wall" "$rss" \
+        "$gcrypt_added" "$gcrypt_git" "$gcrypt_fresh/.git" \
+        "$gcrypt_fresh/.git/remote-gcrypt" "$((after - before))"
     fi
 
     before=$(carrier_cache_object_db_bytes "$cache_returning")
     secondary_before=$(git_object_db_bytes "$e2ee_fresh")
-    wall=$(measure "$round-tiny-e2ee-fetch-$i" \
+    measure "$round-tiny-e2ee-fetch-$i" \
       env "GIT_REMOTE_E2EE_CACHE_DIR=$cache_returning" \
-      git -C "$e2ee_fresh" fetch --quiet origin)
+      git -C "$e2ee_fresh" fetch --quiet origin
+    wall=$MEASURED_WALL
+    rss=$MEASURED_RSS_BYTES
     after=$(carrier_cache_object_db_bytes "$cache_returning")
     secondary=$(git_object_db_bytes "$e2ee_fresh")
-    record "$round" e2ee tiny_update "$i" "$wall" \
-      "$e2ee_added" "$((secondary - secondary_before))"
+    record_sizes "$round" e2ee tiny_update "$i" "$wall" "$rss" \
+      "$e2ee_added" "$carrier_git" "$e2ee_fresh/.git" \
+      "$cache_returning" "$((secondary - secondary_before))"
   done
 
   if [[ $e2ee_only != 1 ]]; then
@@ -543,40 +644,44 @@ printf 'git_remote_e2ee_revision\t%s\n' "$e2ee_revision"
 printf 'git_version\t%s\n' "$(git --version)"
 printf 'gpg_version\t%s\n' "$("$gpg_bin" --version | sed -n '1p')"
 printf '\nmedians across %s fresh round(s)\n' "$rounds"
-printf 'transport\tphase\titeration\tmedian_wall_seconds\tmedian_remote_or_stored_bytes\tmedian_client_object_store_growth\n'
+printf 'transport\tphase\titeration\tmedian_wall_seconds\tmedian_max_rss_bytes\tmedian_remote_delta_bytes\tmedian_remote_total_logical_bytes\tmedian_remote_total_allocated_bytes\tmedian_client_git_logical_bytes\tmedian_client_git_allocated_bytes\tmedian_local_state_logical_bytes\tmedian_local_state_allocated_bytes\tmedian_client_object_store_growth\n'
 for phase in initial_encryption initial_push fresh_fetch tiny_commit tiny_push tiny_update; do
   for transport in "${transports[@]}"; do
-    wall=$(median_value "$transport" "$phase" 5)
-    bytes=$(median_value "$transport" "$phase" 6)
-    client_bytes=$(median_value "$transport" "$phase" 7)
-    printf '%s\t%s\tall\t%s\t%s\t%s\n' \
-      "$transport" "$phase" "$wall" "$bytes" "$client_bytes"
+    printf '%s\t%s\tall' "$transport" "$phase"
+    for field in 5 6 7 8 9 10 11 12 13 14; do
+      printf '\t%s' "$(median_value "$transport" "$phase" "$field")"
+    done
+    printf '\n'
   done
 done
 
 printf '\nper-push series: tiny push\n'
-printf 'transport\titeration\tmedian_wall_seconds\tmedian_remote_bytes_added\n'
+printf 'transport\titeration\tmedian_wall_seconds\tmedian_max_rss_bytes\tmedian_remote_delta_bytes\tmedian_remote_total_logical_bytes\tmedian_remote_total_allocated_bytes\tmedian_client_git_logical_bytes\tmedian_client_git_allocated_bytes\tmedian_local_state_logical_bytes\tmedian_local_state_allocated_bytes\n'
 for ((i = 1; i <= tiny_commits; i++)); do
   for transport in "${transports[@]}"; do
     if [[ $transport == gcrypt ]] && (( i > gcrypt_tiny_commits )); then
       continue
     fi
-    printf '%s\t%s\t%s\t%s\n' "$transport" "$i" \
-      "$(median_value "$transport" tiny_push 5 "$i")" \
-      "$(median_value "$transport" tiny_push 6 "$i")"
+    printf '%s\t%s' "$transport" "$i"
+    for field in 5 6 7 8 9 10 11 12 13; do
+      printf '\t%s' "$(median_value "$transport" tiny_push "$field" "$i")"
+    done
+    printf '\n'
   done
 done
 
 printf '\nper-push series: tiny update fetch\n'
-printf 'transport\titeration\tmedian_wall_seconds\tmedian_new_remote_object_bytes\n'
+printf 'transport\titeration\tmedian_wall_seconds\tmedian_max_rss_bytes\tmedian_remote_delta_bytes\tmedian_remote_total_logical_bytes\tmedian_remote_total_allocated_bytes\tmedian_client_git_logical_bytes\tmedian_client_git_allocated_bytes\tmedian_local_state_logical_bytes\tmedian_local_state_allocated_bytes\tmedian_client_object_store_growth\n'
 for ((i = 1; i <= tiny_commits; i++)); do
   for transport in "${transports[@]}"; do
     if [[ $transport == gcrypt ]] && (( i > gcrypt_tiny_commits )); then
       continue
     fi
-    printf '%s\t%s\t%s\t%s\n' "$transport" "$i" \
-      "$(median_value "$transport" tiny_update 5 "$i")" \
-      "$(median_value "$transport" tiny_update 6 "$i")"
+    printf '%s\t%s' "$transport" "$i"
+    for field in 5 6 7 8 9 10 11 12 13 14; do
+      printf '\t%s' "$(median_value "$transport" tiny_update "$field" "$i")"
+    done
+    printf '\n'
   done
 done
 
