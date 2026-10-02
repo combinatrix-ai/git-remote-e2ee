@@ -25,6 +25,9 @@ captures. For fetches they use the matching newly published remote objects;
 client object-store growth is reported separately where measurable.
 Set BENCH_TRACE=1 to enable E2EE phase timing and print trace lines for each
 measured E2EE operation to stderr.
+Set BENCH_E2EE_ONLY=1 to skip plain and gcrypt measurements. Set
+BENCH_CARRIER_ATTR_TREE=0 to leave attr.tree unset on the local carrier
+receiver, simulating servers that ignore the committed carrier attributes.
 EOF
 }
 
@@ -48,6 +51,21 @@ e2ee_revision=$(git -C "$project_root" rev-parse HEAD)
 tiny_commits=${BENCH_TINY_COMMITS:-5}
 gcrypt_tiny_commits=${BENCH_GCRYPT_TINY_COMMITS:-5}
 rounds=${BENCH_ROUNDS:-3}
+e2ee_only=${BENCH_E2EE_ONLY:-0}
+carrier_attr_tree=${BENCH_CARRIER_ATTR_TREE:-1}
+
+if [[ $e2ee_only != 0 && $e2ee_only != 1 ]]; then
+  echo "BENCH_E2EE_ONLY must be 0 or 1" >&2
+  exit 2
+fi
+if [[ $carrier_attr_tree != 0 && $carrier_attr_tree != 1 ]]; then
+  echo "BENCH_CARRIER_ATTR_TREE must be 0 or 1" >&2
+  exit 2
+fi
+transports=(plain gcrypt e2ee)
+if [[ $e2ee_only == 1 ]]; then
+  transports=(e2ee)
+fi
 
 if [[ ! $tiny_commits =~ ^[1-5]$ ]]; then
   echo "BENCH_TINY_COMMITS must be from 1 to 5" >&2
@@ -290,7 +308,11 @@ run_round() {
     git --git-dir="$bare_repo" config receive.unpackLimit 0
   done
   git --git-dir="$gcrypt_git" symbolic-ref HEAD refs/heads/gcrypt-carrier
-  git --git-dir="$carrier_git" config attr.tree refs/heads/git-remote-e2ee
+  if [[ $carrier_attr_tree == 1 ]]; then
+    git --git-dir="$carrier_git" config attr.tree refs/heads/git-remote-e2ee
+  else
+    git --git-dir="$carrier_git" config --unset-all attr.tree 2>/dev/null || true
+  fi
 
   key_directory="$round_dir/directory.key.json"
   key_carrier="$round_dir/carrier.key.json"
@@ -318,32 +340,36 @@ run_round() {
     "$git_e2ee" carrier-init --remote "$carrier_git" --key "$key_carrier" >/dev/null
 
   echo "round $round: initial local encryption and initial Git-backend pushes" >&2
-  wall=$(measure "$round-initial-local-plain" \
-    git -C "$source_work" push --quiet plain-local "$branch:$branch")
-  after=$(git_bare_object_db_bytes "$bare_local")
-  record "$round" plain initial_encryption 0 "$wall" "$after" 0
+  if [[ $e2ee_only != 1 ]]; then
+    wall=$(measure "$round-initial-local-plain" \
+      git -C "$source_work" push --quiet plain-local "$branch:$branch")
+    after=$(git_bare_object_db_bytes "$bare_local")
+    record "$round" plain initial_encryption 0 "$wall" "$after" 0
 
-  wall=$(measure "$round-initial-local-gcrypt" \
-    git -C "$source_work" push --quiet --force gcrypt-directory "$branch:master")
-  after=$(tree_logical_bytes "$gcrypt_dir")
-  record "$round" gcrypt initial_encryption 0 "$wall" "$after" 0
+    wall=$(measure "$round-initial-local-gcrypt" \
+      git -C "$source_work" push --quiet --force gcrypt-directory "$branch:master")
+    after=$(tree_logical_bytes "$gcrypt_dir")
+    record "$round" gcrypt initial_encryption 0 "$wall" "$after" 0
+  fi
 
   wall=$(measure "$round-initial-local-e2ee" \
     git -C "$source_work" push --quiet e2ee-directory "$branch:$branch")
   after=$(tree_logical_bytes "$round_dir/e2ee-directory")
   record "$round" e2ee initial_encryption 0 "$wall" "$after" 0
 
-  before=$(git_bare_object_db_bytes "$plain_git")
-  wall=$(measure "$round-initial-plain-push" \
-    git -C "$source_work" push --quiet plain-git "$branch:$branch")
-  after=$(git_bare_object_db_bytes "$plain_git")
-  record "$round" plain initial_push 0 "$wall" "$((after - before))" 0
+  if [[ $e2ee_only != 1 ]]; then
+    before=$(git_bare_object_db_bytes "$plain_git")
+    wall=$(measure "$round-initial-plain-push" \
+      git -C "$source_work" push --quiet plain-git "$branch:$branch")
+    after=$(git_bare_object_db_bytes "$plain_git")
+    record "$round" plain initial_push 0 "$wall" "$((after - before))" 0
 
-  before=$(git_bare_object_db_bytes "$gcrypt_git")
-  wall=$(measure "$round-initial-gcrypt-git-push" \
-    git -C "$source_work" push --quiet --force gcrypt-git "$branch:master")
-  after=$(git_bare_object_db_bytes "$gcrypt_git")
-  record "$round" gcrypt initial_push 0 "$wall" "$((after - before))" 0
+    before=$(git_bare_object_db_bytes "$gcrypt_git")
+    wall=$(measure "$round-initial-gcrypt-git-push" \
+      git -C "$source_work" push --quiet --force gcrypt-git "$branch:master")
+    after=$(git_bare_object_db_bytes "$gcrypt_git")
+    record "$round" gcrypt initial_push 0 "$wall" "$((after - before))" 0
+  fi
 
   before=$(git_bare_object_db_bytes "$carrier_git")
   wall=$(measure "$round-initial-e2ee-carrier-push" \
@@ -353,25 +379,27 @@ run_round() {
   record "$round" e2ee initial_push 0 "$wall" "$((after - before))" 0
 
   echo "round $round: fresh no-checkout clones from Git backends" >&2
-  wall=$(measure "$round-fresh-plain-clone" git \
-    -c gc.auto=0 -c maintenance.auto=false \
-    clone --quiet --no-local --no-tags --no-checkout --branch "$branch" \
-    "file://$plain_git" "$plain_fresh")
-  after=$(git_object_db_bytes "$plain_fresh")
-record "$round" plain fresh_fetch 0 "$wall" \
-    "$(git_bare_object_db_bytes "$plain_git")" "$after"
+  if [[ $e2ee_only != 1 ]]; then
+    wall=$(measure "$round-fresh-plain-clone" git \
+      -c gc.auto=0 -c maintenance.auto=false \
+      clone --quiet --no-local --no-tags --no-checkout --branch "$branch" \
+      "file://$plain_git" "$plain_fresh")
+    after=$(git_object_db_bytes "$plain_fresh")
+    record "$round" plain fresh_fetch 0 "$wall" \
+      "$(git_bare_object_db_bytes "$plain_git")" "$after"
 
-  wall=$(measure "$round-fresh-gcrypt-clone" git \
-    -c gc.auto=0 -c maintenance.auto=false -c "gpg.program=$gpg_bin" \
-    -c "remote.origin.gcrypt-participants=$fingerprint" \
-    -c "remote.origin.gcrypt-signingkey=$fingerprint" \
-    clone --quiet --no-local --no-tags --no-checkout --branch master \
-    "$gcrypt_url" "$gcrypt_fresh")
-  git -C "$gcrypt_fresh" config gc.auto 0
-  git -C "$gcrypt_fresh" config maintenance.auto false
-  after=$(git_object_db_bytes "$gcrypt_fresh")
-  record "$round" gcrypt fresh_fetch 0 "$wall" \
-    "$(git_bare_object_db_bytes "$gcrypt_git")" "$after"
+    wall=$(measure "$round-fresh-gcrypt-clone" git \
+      -c gc.auto=0 -c maintenance.auto=false -c "gpg.program=$gpg_bin" \
+      -c "remote.origin.gcrypt-participants=$fingerprint" \
+      -c "remote.origin.gcrypt-signingkey=$fingerprint" \
+      clone --quiet --no-local --no-tags --no-checkout --branch master \
+      "$gcrypt_url" "$gcrypt_fresh")
+    git -C "$gcrypt_fresh" config gc.auto 0
+    git -C "$gcrypt_fresh" config maintenance.auto false
+    after=$(git_object_db_bytes "$gcrypt_fresh")
+    record "$round" gcrypt fresh_fetch 0 "$wall" \
+      "$(git_bare_object_db_bytes "$gcrypt_git")" "$after"
+  fi
 
   before=$(carrier_cache_object_db_bytes "$cache_returning")
   wall=$(measure "$round-fresh-e2ee-clone" env \
@@ -379,8 +407,10 @@ record "$round" plain fresh_fetch 0 "$wall" \
     git -c gc.auto=0 -c maintenance.auto=false -c "e2ee.key=$key_carrier" \
     clone --quiet --no-local --no-tags --no-checkout --branch "$branch" \
     "$e2ee_url" "$e2ee_fresh")
-  git -C "$plain_fresh" config gc.auto 0
-  git -C "$plain_fresh" config maintenance.auto false
+  if [[ $e2ee_only != 1 ]]; then
+    git -C "$plain_fresh" config gc.auto 0
+    git -C "$plain_fresh" config maintenance.auto false
+  fi
   git -C "$e2ee_fresh" config gc.auto 0
   git -C "$e2ee_fresh" config maintenance.auto false
   after=$(carrier_cache_object_db_bytes "$cache_returning")
@@ -400,18 +430,20 @@ record "$round" plain fresh_fetch 0 "$wall" \
       git -C "$repo" add -- README.md
       git -C "$repo" commit --quiet -m "benchmark: tiny update $iteration"
     ' _ "$source_work" "$i")
-    for transport in plain gcrypt e2ee; do
+    for transport in "${transports[@]}"; do
       record "$round" "$transport" tiny_commit "$i" "$wall" 0 0
     done
 
-    before=$(git_bare_object_db_bytes "$plain_git")
-    wall=$(measure "$round-tiny-plain-push-$i" \
-      git -C "$source_work" push --quiet plain-git "$branch:$branch")
-    after=$(git_bare_object_db_bytes "$plain_git")
-    plain_added=$((after - before))
-    record "$round" plain tiny_push "$i" "$wall" "$plain_added" 0
+    if [[ $e2ee_only != 1 ]]; then
+      before=$(git_bare_object_db_bytes "$plain_git")
+      wall=$(measure "$round-tiny-plain-push-$i" \
+        git -C "$source_work" push --quiet plain-git "$branch:$branch")
+      after=$(git_bare_object_db_bytes "$plain_git")
+      plain_added=$((after - before))
+      record "$round" plain tiny_push "$i" "$wall" "$plain_added" 0
+    fi
 
-    if (( i <= gcrypt_tiny_commits )); then
+    if [[ $e2ee_only != 1 ]] && (( i <= gcrypt_tiny_commits )); then
       before=$(git_bare_object_db_bytes "$gcrypt_git")
       wall=$(measure "$round-tiny-gcrypt-push-$i" \
         git -C "$source_work" push --quiet --force gcrypt-git "$branch:master")
@@ -428,14 +460,16 @@ record "$round" plain fresh_fetch 0 "$wall" \
     e2ee_added=$((after - before))
     record "$round" e2ee tiny_push "$i" "$wall" "$e2ee_added" 0
 
-    before=$(git_object_db_bytes "$plain_fresh")
-    wall=$(measure "$round-tiny-plain-fetch-$i" \
-      git -C "$plain_fresh" fetch --quiet origin)
-    after=$(git_object_db_bytes "$plain_fresh")
-    record "$round" plain tiny_update "$i" "$wall" \
-      "$plain_added" "$((after - before))"
+    if [[ $e2ee_only != 1 ]]; then
+      before=$(git_object_db_bytes "$plain_fresh")
+      wall=$(measure "$round-tiny-plain-fetch-$i" \
+        git -C "$plain_fresh" fetch --quiet origin)
+      after=$(git_object_db_bytes "$plain_fresh")
+      record "$round" plain tiny_update "$i" "$wall" \
+        "$plain_added" "$((after - before))"
+    fi
 
-    if (( i <= gcrypt_tiny_commits )); then
+    if [[ $e2ee_only != 1 ]] && (( i <= gcrypt_tiny_commits )); then
       before=$(git_object_db_bytes "$gcrypt_fresh")
       wall=$(measure "$round-tiny-gcrypt-fetch-$i" \
         git -C "$gcrypt_fresh" fetch --quiet origin)
@@ -455,10 +489,12 @@ record "$round" plain fresh_fetch 0 "$wall" \
       "$e2ee_added" "$((secondary - secondary_before))"
   done
 
-  [[ $(git -C "$plain_fresh" rev-parse "refs/remotes/origin/$branch") == \
-    $(git -C "$source_work" rev-parse "$branch") ]]
-  [[ $(git -C "$gcrypt_fresh" rev-parse refs/remotes/origin/master) == \
-    $(git -C "$source_work" rev-parse "$branch~$((tiny_commits - gcrypt_tiny_commits))") ]]
+  if [[ $e2ee_only != 1 ]]; then
+    [[ $(git -C "$plain_fresh" rev-parse "refs/remotes/origin/$branch") == \
+      $(git -C "$source_work" rev-parse "$branch") ]]
+    [[ $(git -C "$gcrypt_fresh" rev-parse refs/remotes/origin/master) == \
+      $(git -C "$source_work" rev-parse "$branch~$((tiny_commits - gcrypt_tiny_commits))") ]]
+  fi
   [[ $(git -C "$e2ee_fresh" rev-parse "refs/remotes/origin/$branch") == \
     $(git -C "$source_work" rev-parse "$branch") ]]
 
@@ -509,7 +545,7 @@ printf 'gpg_version\t%s\n' "$("$gpg_bin" --version | sed -n '1p')"
 printf '\nmedians across %s fresh round(s)\n' "$rounds"
 printf 'transport\tphase\titeration\tmedian_wall_seconds\tmedian_remote_or_stored_bytes\tmedian_client_object_store_growth\n'
 for phase in initial_encryption initial_push fresh_fetch tiny_commit tiny_push tiny_update; do
-  for transport in plain gcrypt e2ee; do
+  for transport in "${transports[@]}"; do
     wall=$(median_value "$transport" "$phase" 5)
     bytes=$(median_value "$transport" "$phase" 6)
     client_bytes=$(median_value "$transport" "$phase" 7)
@@ -521,7 +557,7 @@ done
 printf '\nper-push series: tiny push\n'
 printf 'transport\titeration\tmedian_wall_seconds\tmedian_remote_bytes_added\n'
 for ((i = 1; i <= tiny_commits; i++)); do
-  for transport in plain gcrypt e2ee; do
+  for transport in "${transports[@]}"; do
     if [[ $transport == gcrypt ]] && (( i > gcrypt_tiny_commits )); then
       continue
     fi
@@ -534,7 +570,7 @@ done
 printf '\nper-push series: tiny update fetch\n'
 printf 'transport\titeration\tmedian_wall_seconds\tmedian_new_remote_object_bytes\n'
 for ((i = 1; i <= tiny_commits; i++)); do
-  for transport in plain gcrypt e2ee; do
+  for transport in "${transports[@]}"; do
     if [[ $transport == gcrypt ]] && (( i > gcrypt_tiny_commits )); then
       continue
     fi
