@@ -277,20 +277,28 @@ or another Git host is the storage.
 
 Measured on the Godot repository (867 MiB of history), with a local bare
 repository standing in for the Git host, on an Apple M1 Max. Median of three
-runs; tiny rows are a one-line change.
+runs; tiny rows are a one-line change, repeated five times.
 
 | | Plain Git | `git-remote-gcrypt` | `git-remote-e2ee` |
 |---|---:|---:|---:|
-| Initial encryption (to a local directory) | 30.2 s | 11.8 s | 14.2 s |
-| Initial push | 30.2 s | 38.0 s | 29.5 s |
-| Fresh fetch | 28.9 s | 55.7 s | 40.4 s |
-| Tiny commit | 0.16 s | 0.16 s | 0.16 s |
-| Tiny push | 0.08 s | 6.8 s | 1.2 s |
+| Initial encryption (to a local directory) | 32.0 s | 13.4 s | 10.1 s |
+| Initial push | 32.9 s | 41.1 s | 25.8 s |
+| Fresh fetch | 30.8 s | 56.7 s | 41.1 s |
+| Tiny commit | 0.19 s | 0.19 s | 0.19 s |
+| Tiny push | 0.10 s | 7.3 s | 1.5 s |
+| Tiny update (fetch) | 0.08 s | 25.4 s | 1.0 s |
 | Data sent per tiny push | 4.8 KB | 921 MB | 9.5 KB |
-| Tiny update (fetch) | 0.06 s | 24.1 s | 0.9 s |
+| Peak memory, initial push | 1.27 GiB | 0.96 GiB | 1.27 GiB |
+| Peak memory, tiny push | 37 MiB | 887 MiB | 38 MiB |
+| Remote size after five tiny pushes | 891 MiB | 3,515 MiB | 878 MiB |
+| Client disk after fresh fetch | 891 MiB | 1,780 MiB | 1,779 MiB |
 
 With a Git backend, gcrypt sends the whole encrypted history again on every
-push. `git-remote-e2ee` sends the new pack plus a few KB of metadata. Plain Git
+push, so the remote grows by about the repository size each time.
+`git-remote-e2ee` sends the new pack plus a few KB of metadata. On the client,
+`git-remote-e2ee` keeps a local cache of the encrypted carrier next to your
+repository, which roughly doubles disk use, the same as gcrypt's local copy.
+Peak memory for full transfers is dominated by Git's own pack generation. Plain Git
 stays faster on small operations because a Git server understands the
 repository; an encrypted remote has to verify and decrypt on the client. These
 are local measurements without network latency. See
