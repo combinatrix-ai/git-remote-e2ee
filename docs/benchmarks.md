@@ -1,102 +1,132 @@
 # Benchmarks
 
-## Primary Git-backend benchmark: Godot (2026-10-02)
+## Primary Git-backend benchmark: Godot (2026-10-03)
 
-This benchmark compares ordinary Git transport to local bare repositories.
-Plain Git uses `file://` with `--no-local`; `git-remote-gcrypt` uses its Git
-backend (`gcrypt::file://...`); E2EE uses its carrier-Git backend
-(`e2ee::git+file://...`). The initial-encryption row is a separate local
-baseline: plain Git pushes to a local bare repository, while gcrypt and E2EE
-write through their local-directory backends.
+This compares plain Git over `file://` with `--no-local`, `git-remote-gcrypt`
+using its Git backend (`gcrypt::file://...`), and E2EE using its carrier-Git
+backend (`e2ee::git+file://...`). Initial encryption is a separate local
+backend baseline: plain Git pushes to a local bare repository, while gcrypt
+and E2EE use their local-directory backends.
 
 The source was `godotengine/godot` at `00932449c9f372b30301d8b5fdc1be70ec12b5c0`
 (default branch only, no tags): 85,678 commits, 14,162 files at HEAD, and
-910,290,704 reachable object bytes. The gcrypt helper was checked out at
-`a5ff704d071f14b95b6b1fa0caa8cdbf0c6cdadb`; E2EE was built in release mode
-from `321f5934613b9b5bb65bf2f9df5a60854423a355`. Each of three rounds used
-fresh bare remotes, clients, cache directories, and a temporary GPG home. The
-Git clients used `--no-local`, no tags, and no checkout; Git auto-GC,
-maintenance, and receive auto-GC were disabled. Each bare receiver used
-`receive.unpackLimit=0` so incoming packs remain measurable as packs. The local
-carrier receiver also used `attr.tree=refs/heads/git-remote-e2ee`, allowing its
-`upload-pack` to read the committed `e2ee/** -delta` attribute. Every tiny
-commit replaced one line in the tracked Godot README and was pushed and fetched
-before the next. The E2EE pushing clone used one isolated carrier cache, and
-its returning clone used a separate initially empty cache which became warm
-on the initial clone. `scripts/benchmark-git-backend.sh` contains the complete
-harness and prints per-round measurements and medians.
-One unrelated periodic helper invocation briefly overlapped a benchmark
-round; it was left untouched, so any effect on wall time is unquantified.
+910,290,704 reachable object bytes. The gcrypt helper was at
+`a5ff704d071f14b95b6b1fa0caa8cdbf0c6cdadb`; the E2EE release binary was built
+from `7036a37dda4eea16195e19429e5a5807ebd37858`. Each of three rounds used
+fresh bare remotes, clients, cache directories, and a temporary GPG home. Git
+auto-GC, maintenance, and receive auto-GC were disabled. The bare receivers
+used `receive.unpackLimit=0`; the carrier receiver also used
+`attr.tree=refs/heads/git-remote-e2ee`, so it could read the committed
+`e2ee/** -delta` attribute. The E2EE push and returning-client caches were
+isolated per round under the temporary benchmark directory. Each tiny commit
+replaced one line in Godot's tracked README and was pushed and fetched before
+the next. See `scripts/benchmark-git-backend.sh` for the complete harness.
 
-Machine: Apple M1 Max (`sysctl machdep.cpu.brand_string`), 10 CPU cores,
-64 GiB RAM (`sysctl hw.memsize` = 68,719,476,736 bytes), macOS 27.0 build
-26A428. Versions: Git 2.55.0, GnuPG 2.5.24, Rust 1.97.1.
+Machine: Apple M1 Max (10 CPU cores), 64 GiB RAM (`sysctl hw.memsize` =
+68,719,476,736 bytes), macOS 27.0 build 26A428. Versions: Git 2.55.0, GnuPG
+2.5.24, Rust 1.97.1.
 
-The table shows medians across the three fresh rounds. Bytes are logical
-stored/object-database bytes, not packet captures. Initial-encryption bytes
-are total bytes stored in each local backend; push bytes are the increase in
-the bare remote's `objects/` files; fresh-fetch bytes are the matching remote
-object-store size; tiny-update bytes are the remote object bytes introduced by
-the preceding push. Tiny-update client growth is listed separately below.
-Git object compression and outer/encrypted object layouts differ, so these
-logical sizes are useful for this controlled comparison but are not exact wire
-traffic. The carrier server-side `attr.tree` setting is available on this
-local bare receiver; hosted Git services control their own receive-side Git
-configuration, so their absolute timings may differ.
+The harness wraps every measured command in macOS `/usr/bin/time -l` (or GNU
+`/usr/bin/time -v` on Linux). Peak RSS is the platform-reported maximum for
+that command and its waited-for children, where supported; it is not the sum
+of concurrent process RSS. Logical directory size sums regular-file lengths.
+Allocated size uses `du -sk` in 1 KiB blocks. `Remote / stored L/A` is logical
+and allocated MiB for the local storage directory or bare remote after the
+phase. `Client .git L/A` is the whole client Git directory after the phase.
+`Auxiliary state / cache L/A` is gcrypt's `.git/remote-gcrypt` state or the
+whole isolated E2EE cache; `—` means not applicable. The byte column is the
+logical object-store increase for pushes and tiny updates, the stored amount
+for initial encryption, and the remote object-store reference size for fresh
+fetch. Fetch rows also include client object-store growth in the final column.
+These are filesystem/object-database measurements, not packet-level wire
+counts. Gcrypt's client `.git` contains both encrypted carrier objects and
+imported inner Git objects. The sizes are workload-specific and the local
+`file://` timings do not predict GitHub server throughput.
+The harness processes used only run-specific caches under the temporary
+benchmark directory. A separate short-lived Git helper against the default
+user cache appeared in process listings during the run; it was left untouched,
+and any timing effect from that concurrent activity is unquantified.
 
-| Phase | Plain Git | `git-remote-gcrypt` Git backend | `git-remote-e2ee` carrier-Git backend |
+Medians across three fresh rounds; repository sizes are MiB (`L/A` = logical /
+allocated). The byte column remains exact bytes.
+
+| Phase | Transport | Time | Peak RSS | Object/stored bytes | Remote / stored L/A | Client `.git` L/A | Auxiliary state / cache L/A | Client object growth B |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| Initial encryption | Plain Git | 31.97 s | 1302.70 MiB | 934,460,946 | 891.20 / 903.80 | 892.77 / 904.83 | — | — |
+| Initial encryption | gcrypt | 13.38 s | 983.23 MiB | 921,021,599 | 878.35 / 878.36 | 892.77 / 904.84 | — | — |
+| Initial encryption | E2EE | 10.08 s | 1302.02 MiB | 920,636,512 | 877.99 / 880.02 | 892.77 / 904.85 | — | — |
+| Initial push | Plain Git | 32.91 s | 1301.84 MiB | 934,460,946 | 891.20 / 903.42 | 892.77 / 904.86 | — | — |
+| Initial push | gcrypt | 41.11 s | 983.28 MiB | 921,304,151 | 878.65 / 881.59 | 1771.39 / 1785.52 | — | — |
+| Initial push | E2EE | 25.76 s | 1304.09 MiB | 920,777,562 | 878.15 / 880.31 | 1771.39 / 1785.53 | 878.18 / 892.33 | — |
+| Fresh fetch | Plain Git | 30.83 s | 1306.02 MiB | 934,460,946 | 891.20 / 903.42 | 891.20 / 903.25 | — | 934,460,946 |
+| Fresh fetch | gcrypt | 56.70 s | 886.61 MiB | 921,304,151 | 878.65 / 881.59 | 1779.70 / 1784.19 | 0.00 / 0.00 | 1,866,126,563 |
+| Fresh fetch | E2EE | 41.09 s | 886.42 MiB | 920,764,311 | 878.15 / 880.31 | 901.08 / 903.70 | 878.14 / 878.37 | 944,824,608 |
+| Tiny commit | Plain Git | 0.19 s | 13.53 MiB | 0 | 891.21 / 903.44 | 1771.41 / 1785.24 | — | — |
+| Tiny commit | gcrypt | 0.19 s | 13.53 MiB | 0 | 2635.91 / 2656.59 | 1771.41 / 1785.24 | — | — |
+| Tiny commit | E2EE | 0.19 s | 13.53 MiB | 0 | 878.17 / 880.34 | 1771.41 / 1785.24 | 878.20 / 892.42 | — |
+| Tiny push (median) | Plain Git | 0.10 s | 37.47 MiB | 4,762 | 891.21 / 903.45 | 1771.41 / 1785.24 | — | — |
+| Tiny push (median) | gcrypt | 7.29 s | 887.44 MiB | 921,315,032 | 3514.54 / 3548.37 | 1771.42 / 1785.27 | — | — |
+| Tiny push (median) | E2EE | 1.47 s | 37.91 MiB | 9,462 | 878.18 / 880.36 | 1771.42 / 1785.27 | 878.21 / 892.47 | — |
+| Tiny update (median) | Plain Git | 0.08 s | 37.33 MiB | 4,762 | 891.21 / 903.45 | 891.21 / 903.30 | — | 3,359 |
+| Tiny update (median) | gcrypt | 25.41 s | 886.67 MiB | 921,315,032 | 3514.54 / 3548.37 | 1779.73 / 1784.28 | 0.00 / 0.00 | 9,472 |
+| Tiny update (median) | E2EE | 1.04 s | 39.03 MiB | 9,462 | 878.18 / 880.36 | 901.10 / 903.74 | 878.16 / 878.51 | 4,499 |
+
+The per-push medians below include wall time, peak RSS, and logical bytes
+added to the bare remote (for fetches, remote bytes associated with that
+update followed by client object-store growth). RSS is MiB.
+
+| Tiny push | Plain Git: time / RSS / remote bytes | gcrypt Git: time / RSS / remote bytes | E2EE carrier Git: time / RSS / remote bytes |
 |---|---:|---:|---:|
-| Initial encryption: wall time; stored bytes | 30.190 s; 934,460,946 B | 11.790 s; 921,021,599 B | 14.200 s; 920,636,512 B |
-| Initial push: wall time; remote bytes added | 30.150 s; 934,460,946 B | 38.000 s; 921,304,151 B | 29.460 s; 920,777,562 B |
-| Fresh fetch: wall time; matching remote object bytes | 28.850 s; 934,460,946 B | 55.650 s; 921,304,151 B | 40.430 s; 920,764,176 B |
-| Tiny commit: wall time; remote bytes added | 0.160 s; 0 B | 0.160 s; 0 B | 0.160 s; 0 B |
-| Tiny push: median wall time; median remote bytes added per push | 0.080 s; 4,761 B | 6.750 s; 921,315,037 B | 1.230 s; 9,460 B |
-| Tiny update: median fetch time; matching remote object bytes per update | 0.060 s; 4,761 B | 24.050 s; 921,315,037 B | 0.890 s; 9,460 B |
+| 1 (first) | 0.20 s / 37.3 MiB / 4,776 | 8.06 s / 887.1 MiB / 921,307,778 | 5.20 s / 522.3 MiB / 9,345 |
+| 2 | 0.10 s / 37.9 MiB / 4,760 | 7.38 s / 887.1 MiB / 921,311,401 | 1.32 s / 38.0 MiB / 9,405 |
+| 3 | 0.10 s / 37.9 MiB / 4,762 | 7.21 s / 887.1 MiB / 921,315,032 | 1.35 s / 37.9 MiB / 9,462 |
+| 4 | 0.10 s / 37.9 MiB / 4,763 | 7.47 s / 887.2 MiB / 921,318,660 | 1.47 s / 37.9 MiB / 9,522 |
+| 5 | 0.10 s / 38.0 MiB / 4,759 | 7.27 s / 887.2 MiB / 921,322,283 | 1.53 s / 37.9 MiB / 9,577 |
 
-Fresh-fetch client object-store growth was 934,460,946 B for plain Git,
-1,866,126,567 B for gcrypt, and 944,824,608 B of inner Git objects for E2EE.
-Gcrypt's client stores both its outer encrypted objects and the imported inner
-Git objects, so this value is not a wire-byte estimate. E2EE's carrier cache
-also grew by 920,764,176 B during that fresh fetch. On tiny updates, inner
-client object-store growth was 3,357 B / 9,474 B / 4,498 B for plain Git /
-gcrypt / E2EE respectively; E2EE's carrier cache received the new encrypted
-pack and manifest.
-
-The per-push series shows the first and steady updates separately. Each cell
-is median wall time and logical remote object-store growth over the three
-rounds:
-
-| Tiny push | Plain Git | gcrypt Git backend | E2EE carrier-Git backend |
+| Tiny update fetch | Plain Git: time / RSS / remote bytes / client growth | gcrypt Git: time / RSS / remote bytes / client growth | E2EE carrier Git: time / RSS / remote bytes / client growth |
 |---|---:|---:|---:|
-| 1 (first) | 0.180 s / 4,775 B | 7.420 s / 921,307,775 B | 4.380 s / 9,344 B |
-| 2 | 0.080 s / 4,762 B | 6.640 s / 921,311,411 B | 1.090 s / 9,407 B |
-| 3 | 0.080 s / 4,760 B | 6.780 s / 921,315,037 B | 1.150 s / 9,460 B |
-| 4 | 0.080 s / 4,761 B | 6.630 s / 921,318,661 B | 1.220 s / 9,520 B |
-| 5 | 0.080 s / 4,759 B | 6.750 s / 921,322,287 B | 1.250 s / 9,578 B |
+| 1 (first) | 0.18 s / 37.4 MiB / 4,776 / 3,358 B | 25.95 s / 887.0 MiB / 921,307,778 / 9,010 B | 0.89 s / 39.0 MiB / 9,345 / 4,498 B |
+| 2 | 0.08 s / 37.3 MiB / 4,760 / 3,359 B | 25.20 s / 887.0 MiB / 921,311,401 / 9,241 B | 0.92 s / 39.0 MiB / 9,405 / 4,500 B |
+| 3 | 0.08 s / 37.3 MiB / 4,762 / 3,359 B | 25.33 s / 887.1 MiB / 921,315,032 / 9,472 B | 1.04 s / 39.1 MiB / 9,462 / 4,499 B |
+| 4 | 0.09 s / 37.3 MiB / 4,763 / 3,359 B | 25.50 s / 887.1 MiB / 921,318,660 / 9,706 B | 1.04 s / 39.0 MiB / 9,522 / 4,501 B |
+| 5 | 0.08 s / 37.3 MiB / 4,759 / 3,356 B | 25.41 s / 887.1 MiB / 921,322,283 / 9,927 B | 1.15 s / 39.1 MiB / 9,577 / 4,498 B |
 
-Returning-clone fetch times and matching remote deltas by update were:
+Gcrypt added about 921 MiB to the remote on each tiny push. E2EE's first tiny
+push used about 522 MiB peak RSS while it prepared the initial carrier state;
+later tiny pushes used about 38 MiB and added 9.3--9.6 KiB. E2EE's median
+tiny push and fetch remained below 1.5 s and 1.1 s, respectively.
 
-| Tiny update | Plain Git | gcrypt Git backend | E2EE carrier-Git backend |
-|---|---:|---:|---:|
-| 1 (first) | 0.170 s / 4,775 B | 24.380 s / 921,307,775 B | 0.730 s / 9,344 B |
-| 2 | 0.060 s / 4,762 B | 24.000 s / 921,311,411 B | 0.790 s / 9,407 B |
-| 3 | 0.070 s / 4,760 B | 24.130 s / 921,315,037 B | 0.910 s / 9,460 B |
-| 4 | 0.060 s / 4,761 B | 24.050 s / 921,318,661 B | 0.890 s / 9,520 B |
-| 5 | 0.060 s / 4,759 B | 24.050 s / 921,322,287 B | 1.050 s / 9,578 B |
+#### Initial-encryption profiling and changes
 
-Each gcrypt update added about 921 MiB to the bare remote, consistent with a
-full-history encrypted payload per update in this workload. E2EE's first tiny
-push took 4.38 s, then warm pushes were 1.09--1.25 s; each added about 9.3--9.6
-KiB. E2EE's median update fetch was 0.89 s and downloaded only the matching
-new carrier objects. These fetch-byte values are object-store growth, not
-packet-level counters. The results are local `file://` measurements, not
-GitHub service throughput or network-latency measurements.
+The before and after profiles are traced single runs; the final result above
+is the median of three untraced rounds. Phase timers overlap and must not be
+summed. Before enabling accelerated crypto, the traced directory encryption
+took 17.47 s: `git_pack_objects_stream_lifetime` 16.928 s, pack-pipe reads
+8.276 s, ciphertext stage writes 3.254 s, SHA-256 2.919 s, ChaCha20-Poly1305
+2.451 s, and durable stage finish 0.033 s. With `sha2` hardware assembly and
+the AArch64 ChaCha20 NEON backend, a traced run took 9.80 s: stream lifetime
+9.399 s, pipe reads 6.411 s, stage writes 0.877 s, SHA-256 0.453 s, ChaCha
+1.657 s, and stage finish 0.033 s. The final untraced median was 10.08 s.
+Compared with the prior 14.20 s median, this is 4.12 s (29%) faster; in the
+same final run, it beat gcrypt's 13.38 s by 3.30 s (25%).
+E2EE used 1302.02 MiB peak RSS for this phase, 318.79 MiB more than gcrypt's
+983.23 MiB; Git's inner `pack-objects` process dominates that peak.
 
-The initial-encryption row is the one measured row where E2EE remains slower
-than gcrypt: 14.20 s versus 11.79 s. It uses the local-directory backends, not
-the carrier Git path. The trace attributes almost all of E2EE's time to the
-inner `git pack-objects` operation (about 14.7 s); the carrier-side optimizations
-below do not change that local history-packing work.
+The source repository had no bitmap and no pack-related compression overrides.
+The carrier's compression-free settings do not apply to the user's inner Git
+repository. A cold standalone `pack-objects --stdout --revs` took 8.96 s.
+For gcrypt's shape, `rev-list --objects` took 3.16 s and the following
+`pack-objects --stdout` took 4.17 s; the intermediate object list was 46.5 MB
+for 756,518 objects. On warm probes, the direct pipeline took 6.33 s versus
+6.72 s for `pack-objects --stdout --revs`. Individual options also showed no
+stable gain: `--delta-base-offset` took 6.40 s, `--threads=0` 6.37 s, and
+`--path-walk` 6.56 s. There was no bitmap index for `--use-bitmap-index` to
+use. Existing packed-object reuse remains enabled. A bounded writer-thread
+experiment was reverted: its queue wait was only about 40 ms and the traced
+end-to-end samples did not improve.
+The retained change accelerates the existing SHA-256 and ChaCha20 operations;
+the wire format, AAD, segment counters, durability steps, and Git pack
+generation command are unchanged.
 
 ### Carrier receiver attribute sensitivity probe (2026-10-02)
 
@@ -145,13 +175,13 @@ hosted server's `upload-pack` configuration; hosted services may choose
 different pack reuse and generation behavior. To reproduce the probe, the
 harness accepts `BENCH_E2EE_ONLY=1 BENCH_CARRIER_ATTR_TREE=0`.
 
-### Phase profile before and after carrier optimizations
+### Historical phase profile before and after carrier optimizations
 
-The before figures are a traced single run of the previous implementation;
-the after figures are a traced smoke run after the changes. The three-round
-medians above are the final benchmark results. Pack decryption and
-`index-pack` timers overlap because Git consumes the decrypted stream while it
-is being produced; their durations must not be summed.
+These traced single-run figures predate the initial-encryption crypto
+acceleration above. The three-round medians earlier in this section are the
+current benchmark results. Pack decryption and `index-pack` timers overlap
+because Git consumes the decrypted stream while it is being produced; their
+durations must not be summed.
 
 | Operation | Before: wall and main phases | After: wall and main phases |
 |---|---|---|

@@ -118,6 +118,10 @@ administrative CAS is never automatically rebased.
 - New data is generated with `git pack-objects --stdout --revs`.
 - Pack output is encrypted as 1 MiB authenticated segments directly into a
   backend-owned stage; it is never collected into a whole-pack Rust buffer.
+- Pack ciphertext hashing uses `sha2`'s runtime-selected hardware assembly
+  when available, with its portable fallback otherwise. AArch64 builds enable
+  the ChaCha20 NEON backend. These code-generation choices do not change the
+  stream format or affect Git configuration in the user's inner repository.
 - Existing remote tips present locally are pack exclusions.
 - Packs are decrypted segment by segment directly into `git index-pack`
   oldest-first.
