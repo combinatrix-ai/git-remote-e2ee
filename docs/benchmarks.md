@@ -98,6 +98,53 @@ the carrier Git path. The trace attributes almost all of E2EE's time to the
 inner `git pack-objects` operation (about 14.7 s); the carrier-side optimizations
 below do not change that local history-packing work.
 
+### Carrier receiver attribute sensitivity probe (2026-10-02)
+
+I repeated the E2EE phases once with `BENCH_ROUNDS=1 BENCH_E2EE_ONLY=1
+BENCH_CARRIER_ATTR_TREE=0 BENCH_TRACE=1 BENCH_TINY_COMMITS=5`. This leaves the
+local bare carrier receiver's `attr.tree` unset while keeping
+`receive.unpackLimit=0`; plain Git and gcrypt were skipped. The probe used the
+same Godot and gcrypt revisions above and helper revision
+`338d94ef59b8141309355007678e0e0d94a1cbf8`. Its single-run readings are
+compared below with the three-round medians above, so small differences include
+normal run-to-run noise.
+
+| E2EE phase | `attr.tree` set: 3-round median | `attr.tree` unset: one run |
+|---|---:|---:|
+| Initial encryption: wall time; stored bytes | 14.200 s; 920,636,512 B | 15.160 s; 920,636,512 B |
+| Initial carrier push: wall time; remote bytes added | 29.460 s; 920,777,562 B | 31.080 s; 920,777,562 B |
+| Fresh fetch: wall time; matching remote object bytes | 40.430 s; 920,764,176 B | 41.540 s; 920,764,396 B |
+| Tiny commit: median wall time across five commits | 0.160 s | 0.150 s |
+| Tiny push: median wall time; median remote bytes per push | 1.230 s; 9,460 B | 1.290 s; 9,460 B |
+| Tiny update: median fetch; matching remote bytes per update | 0.890 s; 9,460 B | 0.840 s; 9,460 B |
+
+The receiver without `attr.tree` did not make fresh fetch materially slower:
+41.54 s versus 40.43 s, a 1.11 s difference in these differently sized
+samples. The traced carrier-cache fetch from the remote took 6.72 s; object
+reads took 0.40 s for 920.6 MB, decryption took 15.75 s, `index-pack` took
+28.34 s, and inner-ref connectivity took 3.15 s. The decryption and
+`index-pack` timers overlap. Warm update fetches took 0.80--0.94 s, with remote
+cache refresh around 0.08 s and incremental decrypt/import around 0.01--0.02 s.
+
+| Tiny operation | `attr.tree` set: earlier median | `attr.tree` unset: one run |
+|---|---:|---:|
+| Push 1 | 4.380 s / 9,344 B | 4.160 s / 9,346 B |
+| Push 2 | 1.090 s / 9,407 B | 1.170 s / 9,405 B |
+| Push 3 | 1.150 s / 9,460 B | 1.290 s / 9,460 B |
+| Push 4 | 1.220 s / 9,520 B | 1.260 s / 9,518 B |
+| Push 5 | 1.250 s / 9,578 B | 1.370 s / 9,577 B |
+| Update fetches 1--5 | 0.730 / 0.790 / 0.910 / 0.890 / 1.050 s | 0.800 / 0.840 / 0.830 / 0.920 / 0.940 s |
+
+No client-side change was warranted by this result. The test client created
+the uploaded carrier pack with delta search disabled, and the receiver kept
+incoming packs intact with `receive.unpackLimit=0`. The 6.72 s remote fetch
+shows no sign of the expensive server-side repack seen in the pre-optimization
+profile; pack reuse is the likely explanation, though this run did not
+instrument the server's `upload-pack` internals. A Git client cannot set a
+hosted server's `upload-pack` configuration; hosted services may choose
+different pack reuse and generation behavior. To reproduce the probe, the
+harness accepts `BENCH_E2EE_ONLY=1 BENCH_CARRIER_ATTR_TREE=0`.
+
 ### Phase profile before and after carrier optimizations
 
 The before figures are a traced single run of the previous implementation;
