@@ -287,8 +287,10 @@ run_round() {
     git --git-dir="$bare_repo" config gc.auto 0
     git --git-dir="$bare_repo" config maintenance.auto false
     git --git-dir="$bare_repo" config receive.autogc false
+    git --git-dir="$bare_repo" config receive.unpackLimit 0
   done
   git --git-dir="$gcrypt_git" symbolic-ref HEAD refs/heads/gcrypt-carrier
+  git --git-dir="$carrier_git" config attr.tree refs/heads/git-remote-e2ee
 
   key_directory="$round_dir/directory.key.json"
   key_carrier="$round_dir/carrier.key.json"
