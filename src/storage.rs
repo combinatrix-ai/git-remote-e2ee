@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
@@ -489,6 +489,150 @@ impl Read for ChunkReader {
     }
 }
 
+struct GitChunkReader {
+    child: Child,
+    input: Option<ChildStdin>,
+    output: BufReader<std::process::ChildStdout>,
+    chunks: Vec<(String, String)>,
+    next: usize,
+    remaining: u64,
+    finished: bool,
+    trace: trace::Io,
+}
+
+impl GitChunkReader {
+    fn new(repo: &Path, chunks: Vec<(String, String)>) -> Result<Self> {
+        let mut child = carrier_git_command()
+            .arg("-C")
+            .arg(repo)
+            .args(["cat-file", "--batch"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let input = child.stdin.take().context("open git cat-file stdin")?;
+        let output = child.stdout.take().context("open git cat-file stdout")?;
+        Ok(Self {
+            child,
+            input: Some(input),
+            output: BufReader::new(output),
+            chunks,
+            next: 0,
+            remaining: 0,
+            finished: false,
+            trace: trace::Io::new("carrier_object_read"),
+        })
+    }
+
+    fn start_next_chunk(&mut self) -> std::io::Result<bool> {
+        if self.next == self.chunks.len() {
+            return Ok(false);
+        }
+        let expected = &self.chunks[self.next].1;
+        let input = self
+            .input
+            .as_mut()
+            .expect("git cat-file input is open until all chunks are read");
+        writeln!(input, "{expected}")?;
+        input.flush()?;
+        let mut header = String::new();
+        if self.output.read_line(&mut header)? == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "git cat-file ended before returning a carrier chunk",
+            ));
+        }
+        let fields: Vec<_> = header.split_ascii_whitespace().collect();
+        if fields.len() != 3 || fields[0] != expected || fields[1] != "blob" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "git cat-file returned an invalid carrier chunk header",
+            ));
+        }
+        let size = fields[2]
+            .parse::<u64>()
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let last = self.next + 1 == self.chunks.len();
+        if (!last && size != CARRIER_CHUNK_SIZE as u64)
+            || (last && (size == 0 || size > CARRIER_CHUNK_SIZE as u64))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "carrier object chunk has invalid size",
+            ));
+        }
+        self.next += 1;
+        self.remaining = size;
+        Ok(true)
+    }
+
+    fn finish(&mut self) -> std::io::Result<()> {
+        self.input.take();
+        let status = self.child.wait()?;
+        self.finished = true;
+        if !status.success() {
+            return Err(std::io::Error::other("git cat-file failed"));
+        }
+        Ok(())
+    }
+}
+
+impl Read for GitChunkReader {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        let started = self.trace.is_active().then(std::time::Instant::now);
+        loop {
+            if self.remaining == 0 {
+                if self.next == self.chunks.len() {
+                    self.finish()?;
+                    self.trace
+                        .record(0, started.map_or(0, |started| started.elapsed().as_nanos()));
+                    return Ok(0);
+                }
+                if !self.start_next_chunk()? {
+                    return Ok(0);
+                }
+            }
+            let amount = output.len().min(self.remaining as usize);
+            let read = self.output.read(&mut output[..amount])?;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "git cat-file truncated a carrier chunk",
+                ));
+            }
+            self.remaining -= read as u64;
+            if self.remaining == 0 {
+                let mut trailer = [0_u8; 1];
+                self.output.read_exact(&mut trailer)?;
+                if trailer[0] != b'\n' {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "git cat-file returned a malformed chunk trailer",
+                    ));
+                }
+            }
+            self.trace.record(
+                read,
+                started.map_or(0, |started| started.elapsed().as_nanos()),
+            );
+            return Ok(read);
+        }
+    }
+}
+
+impl Drop for GitChunkReader {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.input.take();
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
 struct CarrierObjectStage {
     staging: PathBuf,
     root: PathBuf,
@@ -681,13 +825,33 @@ impl GitStorage {
                 validate_id(&value)?;
                 Ok(Some(value))
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(commit) = git_rev_parse(self.root(), "HEAD")? else {
+                    return Ok(None);
+                };
+                let Some(bytes) = self.head_bytes_at_commit(&commit)? else {
+                    return Ok(None);
+                };
+                let value = String::from_utf8(bytes)?.trim().to_owned();
+                validate_id(&value)?;
+                Ok(Some(value))
+            }
             Err(error) => Err(error.into()),
         }
     }
 
     fn local_head_bytes(&self) -> Result<Option<Vec<u8>>> {
-        read_bounded_head_file(&self.root().join("e2ee/HEAD"))
+        let path = self.root().join("e2ee/HEAD");
+        match read_bounded_head_file(&path) {
+            Ok(Some(bytes)) => Ok(Some(bytes)),
+            Ok(None) => {
+                let Some(commit) = git_rev_parse(self.root(), "HEAD")? else {
+                    return Ok(None);
+                };
+                self.head_bytes_at_commit(&commit)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn head_at_commit(&self, commit: Option<&str>) -> Result<Option<String>> {
@@ -770,54 +934,7 @@ impl GitStorage {
         kind: ObjectKind,
         id: &str,
     ) -> Result<Option<Vec<(String, String)>>> {
-        validate_id(id)?;
-        let directory = format!("e2ee/{}/{}/{id}", kind.directory(), &id[..2]);
-        let output = carrier_git_command()
-            .arg("-C")
-            .arg(self.root())
-            .args(["ls-tree", "-r", "-z", commit, "--", &directory])
-            .output()?;
-        ensure_git_success(&output, "git ls-tree historical carrier object")?;
-        if output.stdout.is_empty() {
-            return Ok(None);
-        }
-        if output.stdout.len() > 8 * 1024 * 1024 {
-            bail!("carrier recovery object listing exceeds its size budget")
-        }
-        let mut chunks = Vec::new();
-        for entry in output
-            .stdout
-            .split(|byte| *byte == 0)
-            .filter(|entry| !entry.is_empty())
-        {
-            let tab = entry
-                .iter()
-                .position(|byte| *byte == b'\t')
-                .context("parse historical carrier tree entry")?;
-            let (metadata, path) = (&entry[..tab], &entry[tab + 1..]);
-            let metadata = std::str::from_utf8(metadata)?;
-            let path = std::str::from_utf8(path)?.to_owned();
-            let mut fields = metadata.split_ascii_whitespace();
-            if fields.next() != Some("100644") || fields.next() != Some("blob") {
-                bail!("historical carrier object contains a non-regular blob")
-            }
-            let blob_id = fields.next().context("historical carrier blob has no id")?;
-            if fields.next().is_some() || !path.starts_with(&format!("{directory}/")) {
-                bail!("unexpected historical carrier object path")
-            }
-            chunks.push((path, blob_id.to_owned()));
-        }
-        chunks.sort_by(|left, right| left.0.cmp(&right.0));
-        if chunks.is_empty() || chunks.len() > 4096 {
-            bail!("historical carrier object has an invalid chunk count")
-        }
-        for (index, (path, _)) in chunks.iter().enumerate() {
-            let expected = format!("{directory}/{index:08}");
-            if path != &expected {
-                bail!("historical carrier object chunks are not a dense canonical sequence")
-            }
-        }
-        Ok(Some(chunks))
+        carrier_chunk_entries(self.root(), commit, kind, id)
     }
 
     fn object_at_commit(
@@ -912,11 +1029,7 @@ impl GitStorage {
         fs::create_dir_all(self.root().join("e2ee"))?;
         fs::write(self.root().join("e2ee/HEAD"), format!("{next}\n"))?;
         let add_timer = trace::Span::new("carrier_git_add");
-        git_command_with_object_directory(
-            self.root(),
-            &cache.path.join("objects"),
-            &["add", ".gitattributes", "e2ee"],
-        )?;
+        stage_carrier_checkout(self.root(), &cache.path.join("objects"))?;
         drop(add_timer);
         let commit_timer = trace::Span::new("carrier_git_commit");
         git_command_with_object_directory(
@@ -965,13 +1078,23 @@ impl Storage for GitStorage {
     }
 
     fn open_object(&self, kind: ObjectKind, id: &str) -> Result<Box<dyn Read + Send>> {
-        let paths = validated_chunk_paths(&self.object_directory(kind, id)?)?;
-        Ok(Box::new(ChunkReader {
-            paths,
-            next: 0,
-            current: None,
-            trace: trace::Io::new("carrier_object_read"),
-        }))
+        let directory = self.object_directory(kind, id)?;
+        if directory.exists() {
+            let paths = validated_chunk_paths(&directory)?;
+            return Ok(Box::new(ChunkReader {
+                paths,
+                next: 0,
+                current: None,
+                trace: trace::Io::new("carrier_object_read"),
+            }));
+        }
+        let Some(commit) = git_rev_parse(self.root(), "HEAD")? else {
+            bail!("carrier object {id} is unavailable")
+        };
+        let chunks = self
+            .chunk_entries_at(&commit, kind, id)?
+            .with_context(|| format!("carrier object {id} is unavailable"))?;
+        Ok(Box::new(GitChunkReader::new(self.root(), chunks)?))
     }
 
     fn read_head(&self) -> Result<Option<String>> {
@@ -1009,11 +1132,7 @@ impl Storage for GitStorage {
         fs::create_dir_all(self.root().join("e2ee"))?;
         fs::write(self.root().join("e2ee/HEAD"), format!("{next}\n"))?;
         let add_timer = trace::Span::new("carrier_git_add");
-        git_command_with_object_directory(
-            self.root(),
-            &cache.path.join("objects"),
-            &["add", ".gitattributes", "e2ee"],
-        )?;
+        stage_carrier_checkout(self.root(), &cache.path.join("objects"))?;
         drop(add_timer);
         let commit_timer = trace::Span::new("carrier_git_commit");
         git_command_with_object_directory(
@@ -1167,16 +1286,60 @@ impl Storage for GitStorage {
     }
 
     fn prepare_recovery(&self, manifest_ids: &[String], pack_ids: &[String]) -> Result<()> {
-        retain_carrier_objects(
-            &self.root().join("e2ee/manifests"),
-            &manifest_ids.iter().map(String::as_str).collect(),
-        )?;
-        retain_carrier_objects(
-            &self.root().join("e2ee/objects"),
-            &pack_ids.iter().map(String::as_str).collect(),
-        )?;
+        let manifests: HashSet<&str> = manifest_ids.iter().map(String::as_str).collect();
+        let packs: HashSet<&str> = pack_ids.iter().map(String::as_str).collect();
+        retain_carrier_objects(&self.root().join("e2ee/manifests"), &manifests)?;
+        retain_carrier_objects(&self.root().join("e2ee/objects"), &packs)?;
+        remove_unretained_index_objects(self.root(), ObjectKind::Manifest, &manifests)?;
+        remove_unretained_index_objects(self.root(), ObjectKind::Pack, &packs)?;
         Ok(())
     }
+}
+
+fn remove_unretained_index_objects(
+    repo: &Path,
+    kind: ObjectKind,
+    keep: &HashSet<&str>,
+) -> Result<()> {
+    let tree = format!("e2ee/{}", kind.directory());
+    let output = carrier_git_command()
+        .arg("-C")
+        .arg(repo)
+        .args(["ls-files", "-z", "--", &tree])
+        .output()?;
+    ensure_git_success(&output, "git ls-files carrier recovery objects")?;
+    let mut remove = Vec::new();
+    for path in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        let path = std::str::from_utf8(path)?;
+        let mut fields = path.split('/');
+        if fields.next() != Some("e2ee") || fields.next() != Some(kind.directory()) {
+            bail!("unexpected carrier index path during recovery")
+        }
+        let _prefix = fields.next().context("carrier index path has no prefix")?;
+        let id = fields
+            .next()
+            .context("carrier index path has no object id")?;
+        let _chunk = fields.next().context("carrier index path has no chunk")?;
+        if fields.next().is_some() {
+            bail!("unexpected carrier index path depth during recovery")
+        }
+        if !keep.contains(id) {
+            remove.extend_from_slice(path.as_bytes());
+            remove.push(0);
+        }
+    }
+    if !remove.is_empty() {
+        git_command_with_input(
+            repo,
+            &["update-index", "--force-remove", "-z", "--stdin"],
+            &remove,
+        )?;
+    }
+    Ok(())
 }
 
 fn retain_carrier_objects(root: &Path, keep: &HashSet<&str>) -> Result<()> {
@@ -1206,6 +1369,62 @@ fn retain_carrier_objects(root: &Path, keep: &HashSet<&str>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn carrier_chunk_entries(
+    repo: &Path,
+    commit: &str,
+    kind: ObjectKind,
+    id: &str,
+) -> Result<Option<Vec<(String, String)>>> {
+    validate_id(id)?;
+    let directory = format!("e2ee/{}/{}/{id}", kind.directory(), &id[..2]);
+    let output = carrier_git_command()
+        .arg("-C")
+        .arg(repo)
+        .args(["ls-tree", "-r", "-z", commit, "--", &directory])
+        .output()?;
+    ensure_git_success(&output, "git ls-tree carrier object")?;
+    if output.stdout.is_empty() {
+        return Ok(None);
+    }
+    if output.stdout.len() > 8 * 1024 * 1024 {
+        bail!("carrier object listing exceeds its size budget")
+    }
+    let mut chunks = Vec::new();
+    for entry in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let tab = entry
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .context("parse carrier tree entry")?;
+        let (metadata, path) = (&entry[..tab], &entry[tab + 1..]);
+        let metadata = std::str::from_utf8(metadata)?;
+        let path = std::str::from_utf8(path)?.to_owned();
+        let mut fields = metadata.split_ascii_whitespace();
+        if fields.next() != Some("100644") || fields.next() != Some("blob") {
+            bail!("carrier object contains a non-regular blob")
+        }
+        let blob_id = fields.next().context("carrier blob has no id")?;
+        if fields.next().is_some() || !path.starts_with(&format!("{directory}/")) {
+            bail!("unexpected carrier object path")
+        }
+        chunks.push((path, blob_id.to_owned()));
+    }
+    chunks.sort_by(|left, right| left.0.cmp(&right.0));
+    if chunks.is_empty() || chunks.len() > 4096 {
+        bail!("carrier object has an invalid chunk count")
+    }
+    for (index, (path, _)) in chunks.iter().enumerate() {
+        let expected = format!("{directory}/{index:08}");
+        if path != &expected {
+            bail!("carrier object chunks are not a dense canonical sequence")
+        }
+    }
+    Ok(Some(chunks))
 }
 
 struct CarrierCache {
@@ -1517,10 +1736,10 @@ fn create_carrier_checkout(
     match base_commit {
         Some(commit) => {
             git_command(checkout, &["update-ref", &remote_ref, commit])?;
-            git_command(
-                checkout,
-                &["checkout", "--quiet", "-B", CARRIER_BRANCH, &remote_ref],
-            )?;
+            let local_ref = format!("refs/heads/{CARRIER_BRANCH}");
+            git_command(checkout, &["update-ref", &local_ref, commit])?;
+            git_command(checkout, &["symbolic-ref", "HEAD", &local_ref])?;
+            git_command(checkout, &["read-tree", commit])?;
         }
         None => {
             git_command(
@@ -1585,6 +1804,74 @@ fn git_command(repo: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+fn git_command_with_input(repo: &Path, args: &[&str], input: &[u8]) -> Result<()> {
+    let mut child = carrier_git_command()
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .context("open git stdin")?
+        .write_all(input)?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }
+    Ok(())
+}
+
+fn stage_carrier_checkout(repo: &Path, object_directory: &Path) -> Result<()> {
+    fn collect(root: &Path, path: &Path, output: &mut Vec<u8>) -> Result<()> {
+        let entry = fs::symlink_metadata(path)?;
+        if entry.file_type().is_dir() {
+            for child in fs::read_dir(path)? {
+                collect(root, &child?.path(), output)?;
+            }
+        } else if entry.file_type().is_file() {
+            let relative = path
+                .strip_prefix(root)?
+                .to_str()
+                .context("carrier checkout path is not UTF-8")?;
+            if relative.contains('\n') || relative.contains('\0') {
+                bail!("carrier checkout path contains a forbidden character")
+            }
+            output.extend_from_slice(relative.as_bytes());
+            output.push(0);
+        } else {
+            bail!("carrier checkout contains a non-regular staged path")
+        }
+        Ok(())
+    }
+
+    let mut paths = Vec::new();
+    let attributes = repo.join(".gitattributes");
+    if attributes.exists() {
+        collect(repo, &attributes, &mut paths)?;
+    }
+    let encrypted = repo.join("e2ee");
+    if encrypted.exists() {
+        collect(repo, &encrypted, &mut paths)?;
+    }
+    if paths.is_empty() {
+        bail!("carrier publication has no staged files")
+    }
+    git_command_with_object_directory_input(
+        repo,
+        object_directory,
+        &["add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"],
+        &paths,
+    )
+}
+
 fn git_command_with_object_directory(
     repo: &Path,
     object_directory: &Path,
@@ -1596,6 +1883,37 @@ fn git_command_with_object_directory(
         .env("GIT_OBJECT_DIRECTORY", object_directory)
         .args(args)
         .output()?;
+    if !output.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }
+    Ok(())
+}
+
+fn git_command_with_object_directory_input(
+    repo: &Path,
+    object_directory: &Path,
+    args: &[&str],
+    input: &[u8],
+) -> Result<()> {
+    let mut child = carrier_git_command()
+        .arg("-C")
+        .arg(repo)
+        .env("GIT_OBJECT_DIRECTORY", object_directory)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .context("open git pathspec stdin")?
+        .write_all(input)?;
+    let output = child.wait_with_output()?;
     if !output.status.success() {
         bail!(
             "git {} failed: {}",
