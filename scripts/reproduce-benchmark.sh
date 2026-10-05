@@ -507,7 +507,11 @@ summary_file="$results_dir/summary.md"
     "$(format_mib "$(metric plain tiny_push all 5)")" \
     "$(format_mib "$(metric gcrypt tiny_push all 5)")" \
     "$(format_mib "$(metric e2ee tiny_push all 5)")"
-  printf '| Remote size after %s tiny pushes | %s | %s | %s |\n' "$common_pushes" \
+  tiny_push_label="tiny pushes"
+  if (( common_pushes == 1 )); then
+    tiny_push_label="tiny push"
+  fi
+  printf '| Remote size after %s %s | %s | %s | %s |\n' "$common_pushes" "$tiny_push_label" \
     "$(format_mib "$(metric plain tiny_push "$common_pushes" 7)")" \
     "$(format_mib "$(metric gcrypt tiny_push "$common_pushes" 7)")" \
     "$(format_mib "$(metric e2ee tiny_push "$common_pushes" 7)")"
