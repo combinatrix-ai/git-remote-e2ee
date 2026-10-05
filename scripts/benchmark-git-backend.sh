@@ -328,7 +328,9 @@ run_round() {
   if ! "$gpg_bin" --batch --pinentry-mode loopback --passphrase '' \
     --quick-generate-key 'Benchmark <benchmark@example.invalid>' ed25519 sign 0 \
     >"$gpg_home/keygen.stdout" 2>"$gpg_home/keygen.stderr"; then
-    echo "throwaway GPG key generation failed (temporary diagnostics: $gpg_home)" >&2
+    echo "throwaway GPG key generation failed" >&2
+    sed -n '1,100p' "$gpg_home/keygen.stderr" >&2
+    sed -n '1,100p' "$gpg_home/keygen.stdout" >&2
     return 1
   fi
   fingerprint=$("$gpg_bin" --batch --with-colons --list-secret-keys |
@@ -337,7 +339,9 @@ run_round() {
   if ! "$gpg_bin" --batch --pinentry-mode loopback --passphrase '' \
     --quick-add-key "$fingerprint" cv25519 encr 0 \
     >"$gpg_home/subkey.stdout" 2>"$gpg_home/subkey.stderr"; then
-    echo "throwaway GPG encryption subkey generation failed (temporary diagnostics: $gpg_home)" >&2
+    echo "throwaway GPG encryption subkey generation failed" >&2
+    sed -n '1,100p' "$gpg_home/subkey.stderr" >&2
+    sed -n '1,100p' "$gpg_home/subkey.stdout" >&2
     return 1
   fi
 
