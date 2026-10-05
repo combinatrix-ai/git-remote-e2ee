@@ -430,7 +430,7 @@ summary_file="$results_dir/summary.md"
   printf '# Benchmark summary\n\n'
   printf 'Medians across %s fresh round(s). Tiny commit and update rows cover %s commit(s) per round.\n\n' "$rounds" "$tiny_commits"
   printf '| | Plain Git | `git-remote-gcrypt` | `git-remote-e2ee` |\n'
-  printf '|---:|---:|---:|---:|\n'
+  printf '|---|---:|---:|---:|\n'
   printf '| Initial encryption (to a local directory) | %s | %s | %s |\n' \
     "$(format_initial_time "$(metric plain initial_encryption all 4)")" \
     "$(format_initial_time "$(metric gcrypt initial_encryption all 4)")" \
