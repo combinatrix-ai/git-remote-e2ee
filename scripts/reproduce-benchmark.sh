@@ -13,9 +13,10 @@ summary.md under ./bench-results/<UTC timestamp>-<host>/.
 
 Set BENCH_CACHE_DIR to override the input cache. Set BENCH_RESULTS_DIR to
 choose an exact results directory. Set BENCH_WORK_PARENT to choose a temporary
-work directory under the system temporary directory. BENCH_ROUNDS defaults to
-3, BENCH_TINY_COMMITS defaults to 5, and BENCH_GCRYPT_TINY_COMMITS defaults to
-BENCH_TINY_COMMITS.
+work directory under an allowed temporary root. Linux defaults to /var/tmp;
+TMPDIR overrides the default when set. tmpfs and ramfs work directories are
+rejected. BENCH_ROUNDS defaults to 3, BENCH_TINY_COMMITS defaults to 5, and
+BENCH_GCRYPT_TINY_COMMITS defaults to BENCH_TINY_COMMITS.
 EOF
 }
 
@@ -128,7 +129,11 @@ else
   e2ee_dirty=false
 fi
 
-default_tmp=${TMPDIR:-/tmp}
+if [[ $os == Linux ]]; then
+  default_tmp=${TMPDIR:-/var/tmp}
+else
+  default_tmp=${TMPDIR:-/tmp}
+fi
 work_parent=${BENCH_WORK_PARENT:-$default_tmp}
 [[ -d $work_parent ]] || {
   echo "BENCH_WORK_PARENT must already exist: $work_parent" >&2
@@ -136,7 +141,17 @@ work_parent=${BENCH_WORK_PARENT:-$default_tmp}
 }
 work_parent=$(cd "$work_parent" && pwd -P)
 allowed_work_parent=false
-for allowed_root in /private/tmp "$default_tmp"; do
+case $os in
+  Darwin)
+    allowed_roots=(/private/tmp "$default_tmp")
+    allowed_work_description="/private/tmp or TMPDIR"
+    ;;
+  Linux)
+    allowed_roots=(/var/tmp /tmp "$default_tmp")
+    allowed_work_description="/var/tmp, /tmp, or TMPDIR"
+    ;;
+esac
+for allowed_root in "${allowed_roots[@]}"; do
   [[ -d $allowed_root ]] || continue
   allowed_root=$(cd "$allowed_root" && pwd -P)
   if [[ $work_parent == "$allowed_root" || $work_parent == "$allowed_root"/* ]]; then
@@ -145,9 +160,35 @@ for allowed_root in /private/tmp "$default_tmp"; do
   fi
 done
 if [[ $allowed_work_parent != true ]]; then
-  echo "BENCH_WORK_PARENT must resolve under /private/tmp or the default temporary directory: $work_parent" >&2
+  echo "BENCH_WORK_PARENT must resolve under $allowed_work_description: $work_parent" >&2
   exit 2
 fi
+
+case $os in
+  Darwin)
+    work_filesystem_device=$(df -P "$work_parent" | awk 'NR == 2 { print $1 }')
+    filesystem=$(mount | awk -v device="$work_filesystem_device" '$1 == device {
+      if (match($0, /\([^,]+/)) {
+        print substr($0, RSTART + 1, RLENGTH - 1)
+        exit
+      }
+    }')
+    ;;
+  Linux)
+    filesystem=$(stat -f -c '%T' "$work_parent")
+    ;;
+esac
+if [[ -z $filesystem ]]; then
+  echo "could not identify the filesystem for $work_parent" >&2
+  exit 1
+fi
+case $filesystem in
+  tmpfs|ramfs)
+    echo "benchmark work directory is on $filesystem: $work_parent" >&2
+    echo "Choose disk-backed storage by setting TMPDIR, or set BENCH_WORK_PARENT under /var/tmp or TMPDIR." >&2
+    exit 2
+    ;;
+esac
 
 cache_default=${XDG_CACHE_HOME:-${HOME:?HOME must be set}/.cache}/git-remote-e2ee-bench
 cache_dir=${BENCH_CACHE_DIR:-$cache_default}
@@ -315,17 +356,6 @@ case $os in
     fi
     core_count=$(sysctl -n hw.ncpu)
     ram_bytes=$(sysctl -n hw.memsize)
-    filesystem_device=$(df -P "$work_parent" | awk 'NR == 2 { print $1 }')
-    filesystem=$(mount | awk -v device="$filesystem_device" '$1 == device {
-      if (match($0, /\([^,]+/)) {
-        print substr($0, RSTART + 1, RLENGTH - 1)
-        exit
-      }
-    }')
-    [[ -n $filesystem ]] || {
-      echo "could not identify the filesystem for $work_parent" >&2
-      exit 1
-    }
     ;;
   Linux)
     os_name=$(awk -F= '$1 == "NAME" { gsub(/^"|"$/, "", $2); print $2; exit }' /etc/os-release 2>/dev/null || true)
@@ -339,7 +369,6 @@ case $os in
       core_count=$(awk '/^processor[[:space:]]*:/ { count++ } END { print count + 0 }' /proc/cpuinfo)
     fi
     ram_bytes=$(awk '/^MemTotal:/ { printf "%.0f", $2 * 1024; exit }' /proc/meminfo)
-    filesystem=$(stat -f -c '%T' "$work_parent")
     ;;
 esac
 kernel=$(uname -r)

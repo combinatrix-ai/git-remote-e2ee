@@ -14,6 +14,11 @@ Godot `.git` size. The default three-round run takes hours. Results go to
 `./bench-results/<UTC timestamp>-<host>/` and include raw and median TSV files,
 `environment.json`, and a README-format `summary.md`.
 
+On Linux, the work directory defaults to `/var/tmp` because `/tmp` may be
+tmpfs. The runner detects the selected filesystem and refuses tmpfs or ramfs.
+Set `TMPDIR` to a disk-backed temporary directory, or set
+`BENCH_WORK_PARENT` to a disk-backed path under `/var/tmp` or `TMPDIR`.
+
 ## Primary Git-backend benchmark: Godot (2026-10-03)
 
 This compares plain Git over `file://` with `--no-local`, `git-remote-gcrypt`

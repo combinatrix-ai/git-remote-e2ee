@@ -107,16 +107,21 @@ gpg_bin=$(command -v gpg || true)
   echo "GnuPG executable 'gpg' was not found on PATH" >&2
   exit 1
 }
-case $(uname -s) in
+os=$(uname -s)
+case $os in
   Darwin) time_style=bsd ;;
   Linux) time_style=gnu ;;
-  *) echo "unsupported platform: $(uname -s)" >&2; exit 2 ;;
+  *) echo "unsupported platform: $os" >&2; exit 2 ;;
 esac
 [[ -x /usr/bin/time ]] || {
   echo "/usr/bin/time is required" >&2
   exit 1
 }
-default_tmp=${TMPDIR:-/tmp}
+if [[ $os == Linux ]]; then
+  default_tmp=${TMPDIR:-/var/tmp}
+else
+  default_tmp=${TMPDIR:-/tmp}
+fi
 work_parent=${BENCH_WORK_PARENT:-$default_tmp}
 [[ -d $work_parent ]] || {
   echo "BENCH_WORK_PARENT must already exist: $work_parent" >&2
@@ -124,7 +129,17 @@ work_parent=${BENCH_WORK_PARENT:-$default_tmp}
 }
 work_parent=$(cd "$work_parent" && pwd -P)
 allowed_work_parent=false
-for allowed_root in /private/tmp "$default_tmp"; do
+case $os in
+  Darwin)
+    allowed_roots=(/private/tmp "$default_tmp")
+    allowed_work_description="/private/tmp or TMPDIR"
+    ;;
+  Linux)
+    allowed_roots=(/var/tmp /tmp "$default_tmp")
+    allowed_work_description="/var/tmp, /tmp, or TMPDIR"
+    ;;
+esac
+for allowed_root in "${allowed_roots[@]}"; do
   [[ -n $allowed_root ]] || continue
   [[ -d $allowed_root ]] || continue
   allowed_root=$(cd "$allowed_root" && pwd -P)
@@ -134,9 +149,30 @@ for allowed_root in /private/tmp "$default_tmp"; do
   fi
 done
 if [[ $allowed_work_parent != true ]]; then
-  echo "benchmark work parent must resolve under /private/tmp or the default temporary directory: $work_parent" >&2
+  echo "benchmark work parent must resolve under $allowed_work_description: $work_parent" >&2
   exit 2
 fi
+case $os in
+  Darwin)
+    work_filesystem_device=$(df -P "$work_parent" | awk 'NR == 2 { print $1 }')
+    work_filesystem=$(mount | awk -v device="$work_filesystem_device" '$1 == device {
+      if (match($0, /\([^,]+/)) {
+        print substr($0, RSTART + 1, RLENGTH - 1)
+        exit
+      }
+    }')
+    ;;
+  Linux)
+    work_filesystem=$(stat -f -c '%T' "$work_parent")
+    ;;
+esac
+case $work_filesystem in
+  tmpfs|ramfs)
+    echo "benchmark work directory is on $work_filesystem: $work_parent" >&2
+    echo "Choose disk-backed storage by setting TMPDIR, or set BENCH_WORK_PARENT under /var/tmp or TMPDIR." >&2
+    exit 2
+    ;;
+esac
 source_git_kib=$(du -sk "$source_repo/.git" | awk '{print $1}')
 available_kib=$(df -Pk "$work_parent" |
   awk 'NR == 2 {print $4}')
