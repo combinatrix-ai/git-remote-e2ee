@@ -49,6 +49,18 @@ for result_file in raw.tsv medians.tsv; do
     exit 2
   }
 done
+git_config_count=${GIT_CONFIG_COUNT:-0}
+if [[ ! $git_config_count =~ ^[0-9]+$ ]]; then
+  echo "GIT_CONFIG_COUNT must be a non-negative integer" >&2
+  exit 2
+fi
+git_config_count=$((10#$git_config_count))
+printf -v git_config_key_name 'GIT_CONFIG_KEY_%d' "$git_config_count"
+printf -v git_config_value_name 'GIT_CONFIG_VALUE_%d' "$git_config_count"
+printf -v "$git_config_key_name" '%s' init.defaultBranch
+printf -v "$git_config_value_name" '%s' main
+export "$git_config_key_name" "$git_config_value_name"
+export GIT_CONFIG_COUNT=$((git_config_count + 1))
 e2ee_revision=$(git -C "$project_root" rev-parse HEAD)
 tiny_commits=${BENCH_TINY_COMMITS:-5}
 gcrypt_tiny_commits=${BENCH_GCRYPT_TINY_COMMITS:-$tiny_commits}
