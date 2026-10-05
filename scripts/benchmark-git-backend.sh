@@ -1,60 +1,57 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export LC_ALL=C
 
 usage() {
   cat >&2 <<'EOF'
-usage: benchmark-git-backend.sh [GODOT_CHECKOUT [GCRYPT_CHECKOUT]]
+usage: benchmark-git-backend.sh GODOT_CHECKOUT GCRYPT_CHECKOUT GODOT_REVISION GCRYPT_REVISION RESULTS_DIR
 
-Runs three fresh rounds comparing plain Git, git-remote-gcrypt's Git backend,
-and git-remote-e2ee's carrier-Git backend. Inputs default to the checkouts at
-/Volumes/Shared/local/references/godot and
-/Volumes/Shared/local/references/git-remote-gcrypt. The Godot checkout must
-have benchmark-00932449 at 00932449c9f372b30301d8b5fdc1be70ec12b5c0; the
-gcrypt checkout must be at a5ff704d071f14b95b6b1fa0caa8cdbf0c6cdadb.
-
-Set BENCH_WORK_PARENT to override the default /private/tmp location; the
-resolved path must remain under /private/tmp or $TMPDIR. Set
-BENCH_KEEP_WORK=1 to retain temporary repositories, raw logs, and the
-throwaway GPG home for local debugging. Results are printed as TSV; keys and
-raw logs are never written into the project. BENCH_TINY_COMMITS defaults to 5
-and BENCH_GCRYPT_TINY_COMMITS defaults to 5 (3 is allowed for a prohibitively
-slow full-history gcrypt run). BENCH_ROUNDS defaults to 3 and may be reduced
-for a smoke run. BENCH_SKIP_BUILD=1 uses existing release binaries instead of
-building them. Peak RSS uses `/usr/bin/time -l`'s maximum resident set size on
-macOS and `/usr/bin/time -v`'s maximum RSS on Linux, converted to bytes. Both
-use the platform's reported usage for the measured command and children as
-supported by that `time` implementation. Logical directory sizes sum file
-lengths; allocated sizes use `du -sk` in 1 KiB blocks. Each row reports the
-remote/storage total, client `.git`, and auxiliary cache or gcrypt state after
-the phase. Remote byte deltas count newly stored objects, not packet wire
-bytes. Client object-store growth is also reported for fetches.
-Set BENCH_TRACE=1 to enable E2EE phase timing and print trace lines for each
-measured E2EE operation to stderr.
-Set BENCH_E2EE_ONLY=1 to skip plain and gcrypt measurements. Set
+Internal measurement engine for reproduce-benchmark.sh. It requires the
+explicit, revision-verified input checkouts and a results directory.
+BENCH_TINY_COMMITS defaults to 5. BENCH_GCRYPT_TINY_COMMITS defaults to the
+same value and may be lower for a prohibitively slow full-history run.
+BENCH_ROUNDS defaults to 3. BENCH_SKIP_BUILD=1 uses existing release binaries.
+BENCH_KEEP_WORK=1 retains temporary repositories, command logs, and the
+throwaway GPG home under the temporary work directory. The results directory
+contains measurement TSV files only; keys and command logs stay under the
+temporary work directory. BENCH_TRACE=1 prints E2EE trace lines to stderr.
+BENCH_E2EE_ONLY=1 skips plain and gcrypt measurements. Set
 BENCH_CARRIER_ATTR_TREE=0 to leave attr.tree unset on the local carrier
 receiver, simulating servers that ignore the committed carrier attributes.
 EOF
 }
 
-if [[ $# -gt 2 ]]; then
-  usage
-  exit 2
-fi
 if [[ $# -gt 0 && ( $1 == -h || $1 == --help ) ]]; then
   usage
   exit 0
 fi
+if [[ $# -ne 5 ]]; then
+  usage
+  exit 2
+fi
 
 project_root=$(cd "$(dirname "$0")/.." && pwd -P)
-source_repo=${1:-/Volumes/Shared/local/references/godot}
-gcrypt_checkout=${2:-/Volumes/Shared/local/references/git-remote-gcrypt}
+source_repo=$1
+gcrypt_checkout=$2
+source_revision=$3
+gcrypt_revision=$4
+results_dir=$5
 source_repo=$(cd "$source_repo" && pwd -P)
 gcrypt_checkout=$(cd "$gcrypt_checkout" && pwd -P)
-source_revision=00932449c9f372b30301d8b5fdc1be70ec12b5c0
-gcrypt_revision=a5ff704d071f14b95b6b1fa0caa8cdbf0c6cdadb
+results_dir=$(cd "$results_dir" && pwd -P)
+[[ -d $results_dir ]] || {
+  echo "results directory does not exist: $results_dir" >&2
+  exit 2
+}
+for result_file in raw.tsv medians.tsv; do
+  [[ ! -e $results_dir/$result_file ]] || {
+    echo "results file already exists: $results_dir/$result_file" >&2
+    exit 2
+  }
+done
 e2ee_revision=$(git -C "$project_root" rev-parse HEAD)
 tiny_commits=${BENCH_TINY_COMMITS:-5}
-gcrypt_tiny_commits=${BENCH_GCRYPT_TINY_COMMITS:-5}
+gcrypt_tiny_commits=${BENCH_GCRYPT_TINY_COMMITS:-$tiny_commits}
 rounds=${BENCH_ROUNDS:-3}
 e2ee_only=${BENCH_E2EE_ONLY:-0}
 carrier_attr_tree=${BENCH_CARRIER_ATTR_TREE:-1}
@@ -88,8 +85,8 @@ fi
   echo "Godot checkout must be at $source_revision" >&2
   exit 2
 }
-[[ $(git -C "$source_repo" symbolic-ref --quiet --short HEAD) == benchmark-00932449 ]] || {
-  echo "Godot revision must be checked out on local branch benchmark-00932449" >&2
+[[ $(git -C "$source_repo" rev-parse --is-shallow-repository) == false ]] || {
+  echo "Godot checkout must contain full history, not a shallow clone" >&2
   exit 2
 }
 [[ $(git -C "$gcrypt_checkout" rev-parse HEAD) == "$gcrypt_revision" ]] || {
@@ -105,9 +102,9 @@ git -C "$source_repo" cat-file -e HEAD:README.md || {
   exit 2
 }
 
-gpg_bin=${BENCH_GPG:-/opt/homebrew/bin/gpg}
-[[ -x $gpg_bin ]] || {
-  echo "GnuPG executable not found: $gpg_bin" >&2
+gpg_bin=$(command -v gpg || true)
+[[ -n $gpg_bin && -x $gpg_bin ]] || {
+  echo "GnuPG executable 'gpg' was not found on PATH" >&2
   exit 1
 }
 case $(uname -s) in
@@ -119,11 +116,15 @@ esac
   echo "/usr/bin/time is required" >&2
   exit 1
 }
-work_parent=${BENCH_WORK_PARENT:-/private/tmp}
-mkdir -p "$work_parent"
+default_tmp=${TMPDIR:-/tmp}
+work_parent=${BENCH_WORK_PARENT:-$default_tmp}
+[[ -d $work_parent ]] || {
+  echo "BENCH_WORK_PARENT must already exist: $work_parent" >&2
+  exit 2
+}
 work_parent=$(cd "$work_parent" && pwd -P)
 allowed_work_parent=false
-for allowed_root in /private/tmp "${TMPDIR:-}"; do
+for allowed_root in /private/tmp "$default_tmp"; do
   [[ -n $allowed_root ]] || continue
   [[ -d $allowed_root ]] || continue
   allowed_root=$(cd "$allowed_root" && pwd -P)
@@ -133,14 +134,14 @@ for allowed_root in /private/tmp "${TMPDIR:-}"; do
   fi
 done
 if [[ $allowed_work_parent != true ]]; then
-  echo "benchmark work parent must resolve under /private/tmp or TMPDIR: $work_parent" >&2
+  echo "benchmark work parent must resolve under /private/tmp or the default temporary directory: $work_parent" >&2
   exit 2
 fi
 source_git_kib=$(du -sk "$source_repo/.git" | awk '{print $1}')
 available_kib=$(df -Pk "$work_parent" |
   awk 'NR == 2 {print $4}')
 if (( available_kib < source_git_kib * 12 )); then
-  echo "need at least 12x the Godot .git size free under the benchmark temp directory" >&2
+  echo "need at least 12x the Godot .git size free under the benchmark temporary directory" >&2
   exit 1
 fi
 
@@ -153,17 +154,18 @@ git_e2ee="$project_root/target/release/git-e2ee"
   exit 1
 }
 
-export PATH="$gcrypt_checkout:$project_root/target/release:$(dirname "$gpg_bin"):$PATH"
+export PATH="$gcrypt_checkout:$project_root/target/release:$PATH"
 if [[ ${BENCH_TRACE:-0} == 1 ]]; then
   export GIT_REMOTE_E2EE_TRACE=1
 fi
-work=$(mktemp -d "$work_parent/git-remote-e2ee-git-backend.XXXXXX")
+work=$(mktemp -d "$work_parent/git-remote-e2ee-bench.XXXXXX")
+work=$(cd "$work" && pwd -P)
 chmod 700 "$work"
+gpgconf_bin=$(command -v gpgconf || true)
 cleanup() {
   if [[ -n ${GNUPGHOME:-} ]]; then
-    cleanup_gpgconf="$(dirname "$gpg_bin")/gpgconf"
-    if [[ -x $cleanup_gpgconf ]]; then
-      "$cleanup_gpgconf" --homedir "$GNUPGHOME" --kill all >/dev/null 2>&1 || true
+    if [[ -n $gpgconf_bin ]]; then
+      "$gpgconf_bin" --homedir "$GNUPGHOME" --kill all >/dev/null 2>&1 || true
     fi
   fi
   if [[ ${BENCH_KEEP_WORK:-0} == 1 ]]; then
@@ -171,8 +173,12 @@ cleanup() {
     return
   fi
   case "$work" in
-    "$work_parent"/git-remote-e2ee-git-backend.*)
-      python3 -c 'import pathlib, shutil, sys; root = pathlib.Path(sys.argv[1]).resolve(); target = pathlib.Path(sys.argv[2]).resolve(); assert target.parent == root and target.name.startswith("git-remote-e2ee-git-backend."); shutil.rmtree(target)' "$work_parent" "$work"
+    "$work_parent"/git-remote-e2ee-bench.*)
+      if [[ $(cd "$(dirname "$work")" && pwd -P) == "$work_parent" && ! -L $work ]]; then
+        rm -rf "$work"
+      else
+        echo "refusing to remove unexpected benchmark path: $work" >&2
+      fi
       ;;
     *) echo "refusing to remove unexpected benchmark path: $work" >&2 ;;
   esac
@@ -336,7 +342,7 @@ run_round() {
   fi
 
   git clone --quiet --no-local --no-checkout --single-branch --no-tags \
-    --branch benchmark-00932449 "file://$source_repo" "$source_work"
+    "file://$source_repo" "$source_work"
   git -C "$source_work" checkout --quiet -B "$branch" "$source_revision"
   git -C "$source_work" checkout --quiet -- README.md
   git -C "$source_work" config gc.auto 0
@@ -599,21 +605,19 @@ run_round() {
   [[ $(git -C "$e2ee_fresh" rev-parse "refs/remotes/origin/$branch") == \
     $(git -C "$source_work" rev-parse "$branch") ]]
 
-  gpgconf_bin="$(dirname "$gpg_bin")/gpgconf"
-  if [[ -x $gpgconf_bin ]]; then
+  if [[ -n $gpgconf_bin ]]; then
     "$gpgconf_bin" --homedir "$gpg_home" --kill all >/dev/null 2>&1 || true
   fi
   unset GNUPGHOME
   if [[ ${BENCH_KEEP_WORK:-0} != 1 ]]; then
-    python3 -c 'import errno, pathlib, shutil, sys, time; root = pathlib.Path(sys.argv[1]).resolve(); target = pathlib.Path(sys.argv[2]).resolve(); assert target.parent == root and target.name in {"1", "2", "3"};
-for attempt in range(20):
-  try:
-    shutil.rmtree(target)
-    break
-  except OSError as error:
-    if error.errno not in (errno.ENOTEMPTY, errno.EBUSY) or attempt == 19:
-      raise
-    time.sleep(0.5)' "$work" "$round_dir"
+    case "$round_dir" in
+      "$work"/[1-3])
+        if [[ -d $round_dir && ! -L $round_dir ]]; then
+          rm -rf "$round_dir"
+        fi
+        ;;
+      *) echo "refusing to remove unexpected round path: $round_dir" >&2 ;;
+    esac
   fi
 }
 
@@ -635,58 +639,33 @@ for ((round = 1; round <= rounds; round++)); do
   run_round "$round"
 done
 
-printf 'source_revision\t%s\n' "$source_revision"
-printf 'godot_commits\t%s\n' "$(git -C "$source_repo" rev-list --count HEAD)"
-printf 'godot_head_files\t%s\n' "$(git -C "$source_repo" ls-tree -r --name-only HEAD | wc -l | tr -d ' ')"
-printf 'godot_reachable_bytes\t%s\n' "$(git -C "$source_repo" rev-list --disk-usage --objects HEAD | awk '{print $1}')"
-printf 'gcrypt_revision\t%s\n' "$gcrypt_revision"
-printf 'git_remote_e2ee_revision\t%s\n' "$e2ee_revision"
-printf 'git_version\t%s\n' "$(git --version)"
-printf 'gpg_version\t%s\n' "$("$gpg_bin" --version | sed -n '1p')"
-printf '\nmedians across %s fresh round(s)\n' "$rounds"
-printf 'transport\tphase\titeration\tmedian_wall_seconds\tmedian_max_rss_bytes\tmedian_remote_delta_bytes\tmedian_remote_total_logical_bytes\tmedian_remote_total_allocated_bytes\tmedian_client_git_logical_bytes\tmedian_client_git_allocated_bytes\tmedian_local_state_logical_bytes\tmedian_local_state_allocated_bytes\tmedian_client_object_store_growth\n'
+medians_tsv="$work/medians.tsv"
+printf 'transport\tphase\titeration\tmedian_wall_seconds\tmedian_max_rss_bytes\tmedian_remote_delta_bytes\tmedian_remote_total_logical_bytes\tmedian_remote_total_allocated_bytes\tmedian_client_git_logical_bytes\tmedian_client_git_allocated_bytes\tmedian_local_state_logical_bytes\tmedian_local_state_allocated_bytes\tmedian_client_object_store_growth\n' >"$medians_tsv"
 for phase in initial_encryption initial_push fresh_fetch tiny_commit tiny_push tiny_update; do
   for transport in "${transports[@]}"; do
-    printf '%s\t%s\tall' "$transport" "$phase"
+    printf '%s\t%s\tall' "$transport" "$phase" >>"$medians_tsv"
     for field in 5 6 7 8 9 10 11 12 13 14; do
-      printf '\t%s' "$(median_value "$transport" "$phase" "$field")"
+      printf '\t%s' "$(median_value "$transport" "$phase" "$field")" >>"$medians_tsv"
     done
-    printf '\n'
+    printf '\n' >>"$medians_tsv"
   done
 done
 
-printf '\nper-push series: tiny push\n'
-printf 'transport\titeration\tmedian_wall_seconds\tmedian_max_rss_bytes\tmedian_remote_delta_bytes\tmedian_remote_total_logical_bytes\tmedian_remote_total_allocated_bytes\tmedian_client_git_logical_bytes\tmedian_client_git_allocated_bytes\tmedian_local_state_logical_bytes\tmedian_local_state_allocated_bytes\n'
-for ((i = 1; i <= tiny_commits; i++)); do
-  for transport in "${transports[@]}"; do
-    if [[ $transport == gcrypt ]] && (( i > gcrypt_tiny_commits )); then
-      continue
-    fi
-    printf '%s\t%s' "$transport" "$i"
-    for field in 5 6 7 8 9 10 11 12 13; do
-      printf '\t%s' "$(median_value "$transport" tiny_push "$field" "$i")"
+for phase in tiny_push tiny_update; do
+  for ((i = 1; i <= tiny_commits; i++)); do
+    for transport in "${transports[@]}"; do
+      printf '%s\t%s\t%s' "$transport" "$phase" "$i" >>"$medians_tsv"
+      for field in 5 6 7 8 9 10 11 12 13 14; do
+        printf '\t%s' "$(median_value "$transport" "$phase" "$field" "$i")" >>"$medians_tsv"
+      done
+      printf '\n' >>"$medians_tsv"
     done
-    printf '\n'
   done
 done
 
-printf '\nper-push series: tiny update fetch\n'
-printf 'transport\titeration\tmedian_wall_seconds\tmedian_max_rss_bytes\tmedian_remote_delta_bytes\tmedian_remote_total_logical_bytes\tmedian_remote_total_allocated_bytes\tmedian_client_git_logical_bytes\tmedian_client_git_allocated_bytes\tmedian_local_state_logical_bytes\tmedian_local_state_allocated_bytes\tmedian_client_object_store_growth\n'
-for ((i = 1; i <= tiny_commits; i++)); do
-  for transport in "${transports[@]}"; do
-    if [[ $transport == gcrypt ]] && (( i > gcrypt_tiny_commits )); then
-      continue
-    fi
-    printf '%s\t%s' "$transport" "$i"
-    for field in 5 6 7 8 9 10 11 12 13 14; do
-      printf '\t%s' "$(median_value "$transport" tiny_update "$field" "$i")"
-    done
-    printf '\n'
-  done
-done
-
-printf '\nraw per-round metrics (not command logs)\n'
-cat "$raw_tsv"
+cp "$raw_tsv" "$results_dir/raw.tsv"
+cp "$medians_tsv" "$results_dir/medians.tsv"
+printf 'Wrote %s and %s\n' "$results_dir/raw.tsv" "$results_dir/medians.tsv"
 if [[ ${BENCH_KEEP_WORK:-0} == 1 ]]; then
   echo "raw command logs, repositories, and GPG homes retained under $work" >&2
 else

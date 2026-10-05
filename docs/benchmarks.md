@@ -1,5 +1,19 @@
 # Benchmarks
 
+## Reproduce
+
+From a fresh clone on macOS or Linux, run:
+
+```sh
+./scripts/reproduce-benchmark.sh
+```
+
+The first run downloads about 1 GB for Godot's full default-branch history and
+the pinned gcrypt source. Keep free temporary disk space of about 12 times the
+Godot `.git` size. The default three-round run takes hours. Results go to
+`./bench-results/<UTC timestamp>-<host>/` and include raw and median TSV files,
+`environment.json`, and a README-format `summary.md`.
+
 ## Primary Git-backend benchmark: Godot (2026-10-03)
 
 This compares plain Git over `file://` with `--no-local`, `git-remote-gcrypt`
