@@ -420,6 +420,17 @@ metric() {
   awk -F '\t' -v t="$transport" -v p="$phase" -v i="$iteration" -v c="$column" \
     '$1 == t && $2 == p && $3 == i { print $c; exit }' "$medians_tsv"
 }
+total_client_disk_bytes() {
+  local transport=$1 git_bytes auxiliary_bytes
+  git_bytes=$(metric "$transport" fresh_fetch all 9)
+  auxiliary_bytes=$(metric "$transport" fresh_fetch all 11)
+  if [[ -z $git_bytes || $git_bytes == - ]]; then
+    printf '-'
+    return
+  fi
+  [[ -n $auxiliary_bytes && $auxiliary_bytes != - ]] || auxiliary_bytes=0
+  awk -v git="$git_bytes" -v auxiliary="$auxiliary_bytes" 'BEGIN { printf "%.0f", git + auxiliary }'
+}
 format_initial_time() {
   if [[ -z $1 || $1 == - ]]; then printf '—'; else awk -v n="$1" 'BEGIN { printf "%.1f s", n + 0 }'; fi
 }
@@ -500,10 +511,10 @@ summary_file="$results_dir/summary.md"
     "$(format_mib "$(metric plain tiny_push "$common_pushes" 7)")" \
     "$(format_mib "$(metric gcrypt tiny_push "$common_pushes" 7)")" \
     "$(format_mib "$(metric e2ee tiny_push "$common_pushes" 7)")"
-  printf '| Client disk after fresh fetch | %s | %s | %s |\n' \
-    "$(format_mib "$(metric plain fresh_fetch all 9)")" \
-    "$(format_mib "$(metric gcrypt fresh_fetch all 9)")" \
-    "$(format_mib "$(metric e2ee fresh_fetch all 9)")"
+  printf '| Total client disk after fresh fetch (.git + auxiliary cache/state) | %s | %s | %s |\n' \
+    "$(format_mib "$(total_client_disk_bytes plain)")" \
+    "$(format_mib "$(total_client_disk_bytes gcrypt)")" \
+    "$(format_mib "$(total_client_disk_bytes e2ee)")"
   if (( common_pushes != tiny_commits )); then
     printf '\nThe remote-size row uses %s pushes because gcrypt ran %s tiny pushes.\n' "$common_pushes" "$gcrypt_tiny_commits"
   fi

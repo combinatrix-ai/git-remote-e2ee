@@ -19,6 +19,9 @@ tmpfs. The runner detects the selected filesystem and refuses tmpfs or ramfs.
 Set `TMPDIR` to a disk-backed temporary directory, or set
 `BENCH_WORK_PARENT` to a disk-backed path under `/var/tmp` or `TMPDIR`.
 
+The fresh-fetch client-disk row totals the client .git directory and any
+auxiliary cache or state.
+
 ## Primary Git-backend benchmark: Godot (2026-10-03)
 
 This compares plain Git over `file://` with `--no-local`, `git-remote-gcrypt`
