@@ -11,10 +11,10 @@ explicit, revision-verified input checkouts and a results directory.
 BENCH_TINY_COMMITS defaults to 5. BENCH_GCRYPT_TINY_COMMITS defaults to the
 same value and may be lower for a prohibitively slow full-history run.
 BENCH_ROUNDS defaults to 3. BENCH_SKIP_BUILD=1 uses existing release binaries.
-BENCH_KEEP_WORK=1 retains temporary repositories, command logs, and the
-throwaway GPG home under the temporary work directory. The results directory
-contains measurement TSV files only; keys and command logs stay under the
-temporary work directory. BENCH_TRACE=1 prints E2EE trace lines to stderr.
+BENCH_KEEP_WORK=1 retains temporary repositories and command logs under the
+work directory and throwaway GPG homes under /tmp. Results contain measurement
+TSV files only; no keys or command logs are written there. BENCH_TRACE=1 prints
+E2EE trace lines to stderr.
 BENCH_E2EE_ONLY=1 skips plain and gcrypt measurements. Set
 BENCH_CARRIER_ATTR_TREE=0 to leave attr.tree unset on the local carrier
 receiver, simulating servers that ignore the committed carrier attributes.
@@ -144,6 +144,12 @@ if (( available_kib < source_git_kib * 12 )); then
   echo "need at least 12x the Godot .git size free under the benchmark temporary directory" >&2
   exit 1
 fi
+gpg_home_root=$(cd /tmp && pwd -P)
+gpg_agent_socket_path="$gpg_home_root/git-remote-e2ee-gnupg.XXXXXX/S.gpg-agent"
+if (( ${#gpg_agent_socket_path} >= 90 )); then
+  echo "the canonical /tmp path is too long for a GnuPG agent socket: $gpg_home_root" >&2
+  exit 2
+fi
 
 if [[ ${BENCH_SKIP_BUILD:-0} != 1 ]]; then
   cargo build --release --bins --manifest-path "$project_root/Cargo.toml"
@@ -162,15 +168,34 @@ work=$(mktemp -d "$work_parent/git-remote-e2ee-bench.XXXXXX")
 work=$(cd "$work" && pwd -P)
 chmod 700 "$work"
 gpgconf_bin=$(command -v gpgconf || true)
+active_gpg_home=
+cleanup_gpg_home() {
+  local path=$1
+  case "$path" in
+    "$gpg_home_root"/git-remote-e2ee-gnupg.*)
+      if [[ $(cd "$(dirname "$path")" && pwd -P) == "$gpg_home_root" && -d $path && ! -L $path ]]; then
+        rm -rf "$path"
+      else
+        echo "refusing to remove unexpected GPG home: $path" >&2
+      fi
+      ;;
+    *) echo "refusing to remove unexpected GPG home: $path" >&2 ;;
+  esac
+}
 cleanup() {
-  if [[ -n ${GNUPGHOME:-} ]]; then
-    if [[ -n $gpgconf_bin ]]; then
-      "$gpgconf_bin" --homedir "$GNUPGHOME" --kill all >/dev/null 2>&1 || true
-    fi
+  if [[ -n $active_gpg_home && -n $gpgconf_bin ]]; then
+    "$gpgconf_bin" --homedir "$active_gpg_home" --kill all >/dev/null 2>&1 || true
   fi
   if [[ ${BENCH_KEEP_WORK:-0} == 1 ]]; then
     echo "benchmark work directory retained at $work" >&2
+    if [[ -n $active_gpg_home ]]; then
+      echo "throwaway GPG home retained at $active_gpg_home" >&2
+    fi
     return
+  fi
+  if [[ -n $active_gpg_home ]]; then
+    cleanup_gpg_home "$active_gpg_home"
+    active_gpg_home=
   fi
   case "$work" in
     "$work_parent"/git-remote-e2ee-bench.*)
@@ -321,9 +346,9 @@ run_round() {
   e2ee_fresh="$round_dir/e2ee-returning"
   cache_push="$round_dir/cache/push"
   cache_returning="$round_dir/cache/returning"
-  gpg_home="$round_dir/gnupg"
+  gpg_home=$(mktemp -d "$gpg_home_root/git-remote-e2ee-gnupg.XXXXXX")
+  active_gpg_home=$gpg_home
 
-  mkdir -m 700 "$gpg_home"
   export GNUPGHOME="$gpg_home"
   if ! "$gpg_bin" --batch --pinentry-mode loopback --passphrase '' \
     --quick-generate-key 'Benchmark <benchmark@example.invalid>' ed25519 sign 0 \
@@ -613,6 +638,12 @@ run_round() {
     "$gpgconf_bin" --homedir "$gpg_home" --kill all >/dev/null 2>&1 || true
   fi
   unset GNUPGHOME
+  if [[ ${BENCH_KEEP_WORK:-0} == 1 ]]; then
+    echo "throwaway GPG home retained at $gpg_home" >&2
+  else
+    cleanup_gpg_home "$gpg_home"
+  fi
+  active_gpg_home=
   if [[ ${BENCH_KEEP_WORK:-0} != 1 ]]; then
     case "$round_dir" in
       "$work"/[1-3])
