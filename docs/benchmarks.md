@@ -178,6 +178,36 @@ allocated size is 922,767,360 bytes. The no-flags AArch64 build selected the
 NEON backend; a stream test with tracing reported
 `chacha20_backend=aarch64-neon`.
 
+### Linux aarch64 cross-check (2026-10-06)
+
+The same `scripts/reproduce-benchmark.sh` was run from a fresh clone, with an
+empty input cache, in a Debian 13 LXC container on an Oracle Cloud
+`VM.Standard.A1.Flex` host (Ampere Altra, AArch64), limited to 2 CPUs and
+6 GiB RAM, on Btrfs. Git 2.47.3, GnuPG 2.4.7, Rust 1.99.0, e2ee `81e43c1`
+(the runner revision; protocol and crypto code identical to the macOS run).
+Three rounds, five tiny commits each. `TMPDIR=/var/tmp` was set by hand
+because that runner revision still defaulted to the container's tmpfs `/tmp`;
+later revisions default to `/var/tmp` on Linux.
+
+| | Plain Git | `git-remote-gcrypt` | `git-remote-e2ee` |
+|---|---:|---:|---:|
+| Initial encryption (to a local directory) | 82.7 s | 22.8 s | 24.2 s |
+| Initial push | 81.1 s | 82.8 s | 64.1 s |
+| Fresh fetch | 92.4 s | 145.7 s | 118.9 s |
+| Tiny commit | 0.07 s | 0.07 s | 0.07 s |
+| Tiny push | 0.04 s | 23.9 s | 0.22 s |
+| Tiny update (fetch) | 0.03 s | 43.4 s | 0.20 s |
+| Data sent per tiny push | 4.5 KB | 921 MB | 8.9 KB |
+| Peak memory, initial push | 1.11 GiB | 0.96 GiB | 1.11 GiB |
+| Peak memory, tiny push | 44 MiB | 884 MiB | 48 MiB |
+| Remote size after 5 tiny pushes | 891 MiB | 5,272 MiB | 878 MiB |
+| Total client disk after fresh fetch (.git + auxiliary cache/state) | 891 MiB | 1,780 MiB | 1,779 MiB |
+
+The ordering matches the macOS run except initial encryption, where gcrypt is
+about 6% faster on this two-core machine. The client disk total was computed
+from the run's `medians.tsv` (client `.git` plus carrier cache), because that
+runner revision's summary omitted the cache.
+
 ### Carrier receiver attribute sensitivity probe (2026-10-02)
 
 I repeated the E2EE phases once with `BENCH_ROUNDS=1 BENCH_E2EE_ONLY=1

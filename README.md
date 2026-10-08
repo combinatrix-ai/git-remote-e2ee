@@ -301,9 +301,14 @@ repository, which roughly doubles disk use, the same as gcrypt's local copy.
 Peak memory for full transfers is dominated by Git's own pack generation. Plain Git
 stays faster on small operations because a Git server understands the
 repository; an encrypted remote has to verify and decrypt on the client. These
-are local measurements without network latency. See
-[docs/benchmarks.md](docs/benchmarks.md) for the method, per-push series,
-phase breakdown, and caveats.
+are local measurements without network latency.
+
+To reproduce these numbers, run `scripts/reproduce-benchmark.sh` from a clone
+of this repository on macOS or Linux. It fetches the pinned inputs (about
+1 GB), runs three rounds, and writes this table plus raw data and environment
+details to `bench-results/`. Expect a few hours and about 12 GB of free disk.
+[docs/benchmarks.md](docs/benchmarks.md) has the method, a Linux aarch64
+cross-check, per-push series, phase breakdown, and caveats.
 
 ## FAQ
 
