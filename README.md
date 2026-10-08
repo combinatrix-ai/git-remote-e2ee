@@ -281,17 +281,17 @@ runs; tiny rows are a one-line change, repeated five times.
 
 | | Plain Git | `git-remote-gcrypt` | `git-remote-e2ee` |
 |---|---:|---:|---:|
-| Initial encryption (to a local directory) | 32.0 s | 13.4 s | 10.1 s |
-| Initial push | 32.9 s | 41.1 s | 25.8 s |
-| Fresh fetch | 30.8 s | 56.7 s | 41.1 s |
-| Tiny commit | 0.19 s | 0.19 s | 0.19 s |
-| Tiny push | 0.10 s | 7.3 s | 1.5 s |
-| Tiny update (fetch) | 0.08 s | 25.4 s | 1.0 s |
+| Initial encryption (to a local directory) | 30.3 s | 12.0 s | 8.9 s |
+| Initial push | 30.3 s | 37.6 s | 23.9 s |
+| Fresh fetch | 28.0 s | 53.5 s | 38.0 s |
+| Tiny commit | 0.16 s | 0.16 s | 0.16 s |
+| Tiny push | 0.09 s | 6.8 s | 1.2 s |
+| Tiny update (fetch) | 0.07 s | 24.3 s | 0.84 s |
 | Data sent per tiny push | 4.8 KB | 921 MB | 9.5 KB |
 | Peak memory, initial push | 1.27 GiB | 0.96 GiB | 1.27 GiB |
-| Peak memory, tiny push | 37 MiB | 887 MiB | 38 MiB |
-| Remote size after five tiny pushes | 891 MiB | 3,515 MiB | 878 MiB |
-| Client disk after fresh fetch | 891 MiB | 1,780 MiB | 1,779 MiB |
+| Peak memory, tiny push | 37 MiB | 887 MiB | 9 MiB |
+| Remote size after five tiny pushes | 891 MiB | 5,272 MiB | 878 MiB |
+| Client disk after fresh fetch (`.git` plus cache) | 891 MiB | 1,780 MiB | 1,779 MiB |
 
 With a Git backend, gcrypt sends the whole encrypted history again on every
 push, so the remote grows by about the repository size each time.
