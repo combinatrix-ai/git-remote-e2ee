@@ -121,10 +121,32 @@ update followed by client object-store growth). RSS is MiB.
 | 4 | 0.09 s / 37.3 MiB / 4,763 / 3,359 B | 25.50 s / 887.1 MiB / 921,318,660 / 9,706 B | 1.04 s / 39.0 MiB / 9,522 / 4,501 B |
 | 5 | 0.08 s / 37.3 MiB / 4,759 / 3,356 B | 25.41 s / 887.1 MiB / 921,322,283 / 9,927 B | 1.15 s / 39.1 MiB / 9,577 / 4,498 B |
 
-Gcrypt added about 921 MiB to the remote on each tiny push. E2EE's first tiny
-push used about 522 MiB peak RSS while it prepared the initial carrier state;
-later tiny pushes used about 38 MiB and added 9.3--9.6 KiB. E2EE's median
-tiny push and fetch remained below 1.5 s and 1.1 s, respectively.
+In the 2026-10-03 run, gcrypt added about 921 MiB to the remote on each tiny
+push. E2EE's first tiny push took 5.20 s and used 522.3 MiB peak RSS. Later
+pushes took 1.32 to 1.53 s, used about 38 MiB, and added 9.3 to 9.6 KiB.
+E2EE's median tiny push and fetch were below 1.5 s and 1.1 s, respectively.
+
+#### First-push follow-up (2026-10-08)
+
+Commit `f4526d8` advances the verified refs after a local publication only
+when the client's previous refs already match its verified set and the local
+repository is neither shallow nor promisor-enabled. This removes the full
+history connectivity walk from the first tiny push after an initial push.
+
+Both samples used the pinned Godot history, one round, and three tiny commits.
+The before sample ran E2EE only. The after sample ran all three backends.
+
+| Tiny push | Before fix time | Before fix peak RSS | After fix time | After fix peak RSS |
+|---|---:|---:|---:|---:|
+| 1 | 4.33 s | 528.0 MiB | 1.10 s | 8.97 MiB |
+| 2 | 1.08 s | 37.7 MiB | 1.17 s | 8.84 MiB |
+| 3 | 1.14 s | 37.7 MiB | 1.32 s | 8.81 MiB |
+
+A separate pre-fix trace spent 3,335 ms in `git_ref_connectivity_walk` on
+push 1. A post-fix trace checked zero objects in that walk and spent 71 ms
+there. The Mac's one-minute load average was 11.87 on 10 cores before the
+after run. These are single-round follow-up samples, not replacements for the
+three-round table above.
 
 #### Initial-encryption profiling and changes
 
