@@ -362,7 +362,57 @@ case $os in
     os_version=$(awk -F= '$1 == "VERSION_ID" { gsub(/^"|"$/, "", $2); print $2; exit }' /etc/os-release 2>/dev/null || true)
     [[ -n $os_name ]] || os_name=Linux
     [[ -n $os_version ]] || os_version=$(uname -r)
-    cpu_model=$(awk -F: '/^(model name|Hardware|Processor)[[:space:]]*:/ { sub(/^[[:space:]]+/, "", $2); print $2; exit }' /proc/cpuinfo 2>/dev/null || true)
+    cpu_model=
+    if command -v lscpu >/dev/null 2>&1; then
+      cpu_model=$(lscpu 2>/dev/null | awk -F: '
+        {
+          label = tolower($1)
+          value = $2
+          sub(/^[[:space:]]+/, "", label)
+          sub(/[[:space:]]+$/, "", label)
+          sub(/^[[:space:]]+/, "", value)
+          sub(/[[:space:]]+$/, "", value)
+          if (label == "model name" && model == "") model = value
+          if (label == "vendor id" && vendor == "") vendor = value
+        }
+        END {
+          if (model != "") print model
+          else if (vendor != "") print vendor
+        }
+      ' || true)
+    fi
+    if [[ -z $cpu_model ]]; then
+      cpu_model=$(awk -F: '
+        {
+          label = tolower($1)
+          value = $2
+          sub(/^[[:space:]]+/, "", label)
+          sub(/[[:space:]]+$/, "", label)
+          sub(/^[[:space:]]+/, "", value)
+          sub(/[[:space:]]+$/, "", value)
+          if (label == "model name" && model_name == "") model_name = value
+          if (label == "hardware" && hardware == "") hardware = value
+          if (label == "processor" && processor == "") processor = value
+          if (label == "cpu implementer" && implementer == "") implementer = value
+          if (label == "cpu part" && part == "") part = value
+        }
+        END {
+          if (model_name != "") {
+            print model_name
+          } else if (hardware != "") {
+            print hardware
+          } else if (implementer != "" && part != "") {
+            printf "CPU implementer %s, CPU part %s\n", implementer, part
+          } else if (processor != "") {
+            print processor
+          } else if (implementer != "") {
+            printf "CPU implementer %s\n", implementer
+          } else if (part != "") {
+            printf "CPU part %s\n", part
+          }
+        }
+      ' /proc/cpuinfo 2>/dev/null || true)
+    fi
     [[ -n $cpu_model ]] || cpu_model=$(uname -m)
     core_count=$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)
     if [[ -z $core_count ]]; then
