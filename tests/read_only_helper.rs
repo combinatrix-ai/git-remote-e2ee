@@ -166,6 +166,13 @@ fn exercise_read_only_helper<S: Storage>(
         "pulled writer content\n"
     );
 
+    // A fresh clone has no identity; CI runners have no global Git identity.
+    git(&clone, &["config", "user.name", "Read Only Test"], false);
+    git(
+        &clone,
+        &["config", "user.email", "read-only@example.invalid"],
+        false,
+    );
     commit(&clone, "local reader change\n", "reader change");
     let expected_error =
         "this device is read-only for origin; ask an administrator for the write role";
