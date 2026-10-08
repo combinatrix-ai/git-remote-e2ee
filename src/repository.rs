@@ -489,7 +489,12 @@ impl<S: Storage> EncryptedRepository<S> {
             next.clone(),
         )?;
         if let Some(state_path) = state_path.as_deref() {
-            self.pin_manifest_locked(state_path, &next_id, &next)?;
+            self.pin_manifest_locked(
+                state_path,
+                &next_id,
+                &next,
+                Some((repo, &current.manifest.refs)),
+            )?;
         }
         Ok(next_id)
     }
@@ -748,8 +753,18 @@ impl<S: Storage> EncryptedRepository<S> {
         state_path: &Path,
         head_id: &str,
         manifest: &Manifest,
+        published_from: Option<(&Path, &BTreeMap<String, String>)>,
     ) -> Result<()> {
-        let state = read_client_state(state_path)?;
+        let mut state = read_client_state(state_path)?;
+        if let Some((repo, previous_refs)) = published_from
+            && state.verified_refs == *previous_refs
+            && git::has_complete_object_graph(repo)
+        {
+            // The completed local pack walk covers new reachability only beyond
+            // refs already verified by this client. Shallow and promisor repos
+            // can omit history, so they must not advance this frontier.
+            state.verified_refs = manifest.refs.clone();
+        }
         write_published_client_state_locked(state_path, state, head_id, manifest)
     }
 
@@ -1292,7 +1307,7 @@ impl<S: Storage> EncryptedRepository<S> {
             ManifestAuthorization::Writer,
             next.clone(),
         )?;
-        self.pin_manifest_locked(&state_path, &recovered_id, &next)?;
+        self.pin_manifest_locked(&state_path, &recovered_id, &next, None)?;
         report.published_manifest = Some(recovered_id);
         report.blocked_reason = None;
         Ok(report)

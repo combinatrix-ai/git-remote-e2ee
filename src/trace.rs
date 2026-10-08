@@ -20,6 +20,12 @@ pub(crate) fn report_chacha20_backend() {
     });
 }
 
+pub(crate) fn count(name: &'static str, value: usize) {
+    if enabled() {
+        eprintln!("git-remote-e2ee trace count={name} value={value}");
+    }
+}
+
 #[allow(unexpected_cfgs)]
 fn chacha20_backend() -> &'static str {
     if cfg!(chacha20_backend = "soft") {

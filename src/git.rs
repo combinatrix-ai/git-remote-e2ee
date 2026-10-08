@@ -20,6 +20,38 @@ pub fn ensure_repository(repo: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn has_complete_object_graph(repo: &Path) -> bool {
+    let shallow = match Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--is-shallow-repository"])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return false,
+    };
+    if String::from_utf8_lossy(&shallow.stdout).trim() != "false" {
+        return false;
+    }
+
+    let partial = match Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "config",
+            "--local",
+            "--name-only",
+            "--get-regexp",
+            r"^(extensions\.partialclone|remote\..*\.promisor)$",
+        ])
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => return false,
+    };
+    partial.status.code() == Some(1) && partial.stdout.is_empty()
+}
+
 pub fn resolve_ref(repo: &Path, reference: &str) -> Result<String> {
     git_text(repo, &["rev-parse", "--verify", reference])
 }
@@ -312,12 +344,15 @@ pub fn ensure_refs_connected_since(
             String::from_utf8_lossy(&output.stderr).trim()
         )
     }
-    if String::from_utf8(output.stdout)?
-        .lines()
-        .any(|line| line.starts_with('?'))
-    {
-        bail!("fetched refs contain missing Git objects")
+    let output = String::from_utf8(output.stdout)?;
+    let mut checked_objects = 0;
+    for line in output.lines() {
+        checked_objects += 1;
+        if line.starts_with('?') {
+            bail!("fetched refs contain missing Git objects")
+        }
     }
+    trace::count("git_ref_connectivity_walk_objects", checked_objects);
     Ok(())
 }
 
@@ -444,4 +479,69 @@ fn git_text(repo: &Path, args: &[&str]) -> Result<String> {
         )
     }
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_complete_object_graph;
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn git(repo: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn complete_object_graph_rejects_shallow_and_promisor_repositories() {
+        let temporary = tempfile::tempdir().unwrap();
+        let full = temporary.path().join("full");
+        fs::create_dir_all(&full).unwrap();
+        let init = Command::new("git")
+            .args(["init", "--quiet", "--initial-branch=main"])
+            .arg(&full)
+            .output()
+            .unwrap();
+        assert!(init.status.success());
+        git(&full, &["config", "user.name", "Test"]);
+        git(&full, &["config", "user.email", "test@example.invalid"]);
+        for contents in ["first", "second"] {
+            fs::write(full.join("file"), contents).unwrap();
+            git(&full, &["add", "file"]);
+            git(&full, &["commit", "--quiet", "-m", contents]);
+        }
+        assert!(has_complete_object_graph(&full));
+
+        let shallow = temporary.path().join("shallow");
+        let source_url = format!("file://{}", full.display());
+        let clone = Command::new("git")
+            .args(["clone", "--quiet", "--depth=1", "--no-tags"])
+            .arg(source_url)
+            .arg(&shallow)
+            .output()
+            .unwrap();
+        assert!(
+            clone.status.success(),
+            "git clone: {}",
+            String::from_utf8_lossy(&clone.stderr)
+        );
+        assert!(!has_complete_object_graph(&shallow));
+
+        git(&full, &["config", "remote.origin.promisor", "true"]);
+        assert!(!has_complete_object_graph(&full));
+        git(&full, &["config", "--unset", "remote.origin.promisor"]);
+        git(&full, &["config", "extensions.partialClone", "origin"]);
+        assert!(!has_complete_object_graph(&full));
+    }
 }
