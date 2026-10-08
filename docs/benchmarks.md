@@ -230,6 +230,12 @@ about 6% faster on this two-core machine. The client disk total was computed
 from the run's `medians.tsv` (client `.git` plus carrier cache), because that
 runner revision's summary omitted the cache.
 
+In that run the first tiny push after the initial push took 9-32 s and about
+450 MiB, because the client re-walked the full history before the push; later
+pushes took about 0.2 s. After the fix in `f4526d8`, a one-round e2ee-only
+rerun on the same container measured 0.15-0.16 s and 6-7 MiB for all three
+tiny pushes, including the first.
+
 ### Carrier receiver attribute sensitivity probe (2026-10-02)
 
 I repeated the E2EE phases once with `BENCH_ROUNDS=1 BENCH_E2EE_ONLY=1
