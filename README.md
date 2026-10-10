@@ -30,13 +30,13 @@
 
 ## Why end-to-end encryption?
 
-A private repository is private from other people, not from the host. The host
-stores everything in readable form, so anyone who reaches its side can read it.
-End-to-end encryption keeps the keys on your devices: the host stores only
-ciphertext, and tampering is detected.
+A private repository is private from other people, not from the host. Even
+with TLS and encryption at rest, the host holds the keys, so you have to trust
+its servers, CI, staff, storage, and backups; a breach in any of them exposes
+everything. End-to-end encryption moves that trust boundary to your devices.
 
 <p align="center">
-  <img src="docs/art/why-e2ee.svg" alt="With a private repository the host stores readable files, so a breach, a leaked token, an insider, or a legal demand exposes them. With git-remote-e2ee the host stores only ciphertext." width="720" />
+  <img src="docs/art/why-e2ee.svg" alt="Threat model. With a private repository you must trust your devices, the Git host's servers, CI, staff, and storage, and any breach exposes everything. With git-remote-e2ee you trust only your devices; the host and storage see ciphertext, and tampering is rejected." width="720" />
 </p>
 
 - **Good fits:** notes and journals, unpublished research, client or NDA work,

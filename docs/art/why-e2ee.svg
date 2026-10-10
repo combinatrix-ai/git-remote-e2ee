@@ -1,68 +1,104 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 360" width="760" height="360" role="img" aria-labelledby="title desc">
-  <title id="title">A private repository versus an end-to-end encrypted repository</title>
-  <desc id="desc">With an ordinary private repository the host stores readable files, messages, and branches, so a breach, a leaked token, an insider, or a legal demand exposes them. With git-remote-e2ee the repository is encrypted on your device, the host stores only ciphertext, and the same threats find nothing readable.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 440" width="760" height="440" role="img" aria-labelledby="title desc">
+  <title id="title">Threat model: private repository versus git-remote-e2ee</title>
+  <desc id="desc">With a private repository you must trust your devices, the Git host's web and API servers, its CI, its staff, and its storage and backups, because the host holds the keys even when data is encrypted in transit and at rest. A breach, an insider, a legal demand, a leaked token, or a stolen backup exposes everything. With git-remote-e2ee only your devices are trusted; the host and its storage hold ciphertext, so the same attacks yield nothing readable and any tampering is rejected by your clients.</desc>
   <style>
     text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
     .h { font-size: 15px; font-weight: 600; fill: #1c1a17; }
-    .label { font-size: 12px; fill: #6b645a; }
-    .threat { font-size: 12px; fill: #8a3a1e; }
-    .ok { font-size: 13px; font-weight: 600; fill: #2f6b3a; }
+    .box { font-size: 13px; font-weight: 600; fill: #1c1a17; }
+    .sub { font-size: 11.5px; fill: #6b645a; }
+    .chip { font-size: 11px; fill: #3d3830; }
+    .trust { font-size: 11.5px; font-weight: 600; fill: #b3542e; }
+    .threat { font-size: 11.5px; fill: #a4371b; }
     .bad { font-size: 13px; font-weight: 600; fill: #a4371b; }
+    .ok { font-size: 13px; font-weight: 600; fill: #2f6b3a; }
+    .arrow { font-size: 11px; fill: #6b645a; }
   </style>
-  <rect x="0" y="0" width="760" height="360" rx="16" fill="#faf8f4"/>
+  <rect x="0" y="0" width="760" height="440" rx="16" fill="#faf8f4"/>
 
-  <!-- Row 1: private repository -->
-  <text x="24" y="38" class="h">Private repository</text>
-  <rect x="24" y="52" width="150" height="104" rx="10" fill="#ffffff" stroke="#e4ded3"/>
-  <text x="40" y="78" class="label">Your laptop</text>
-  <text x="40" y="102" class="mono" fill="#1c1a17">notes/acme.md</text>
-  <text x="40" y="122" class="mono" fill="#1c1a17">"Fix login"</text>
-  <text x="40" y="142" class="mono" fill="#1c1a17">main</text>
+  <!-- ===== Row 1: private repository ===== -->
+  <text x="24" y="36" class="h">Private repository</text>
+  <!-- trust boundary around everything -->
+  <rect x="28" y="50" width="704" height="112" rx="12" fill="none" stroke="#b3542e" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="724" y="44" text-anchor="end" class="trust">you must trust everything in here</text>
 
-  <line x1="182" y1="104" x2="262" y2="104" stroke="#8a8276" stroke-width="2"/>
-  <polygon points="262,98 274,104 262,110" fill="#8a8276"/>
-  <text x="228" y="94" text-anchor="middle" class="label">push</text>
+  <rect x="44" y="64" width="140" height="84" rx="10" fill="#ffffff" stroke="#e4ded3"/>
+  <text x="58" y="90" class="box">Your devices</text>
+  <text x="58" y="110" class="sub">plaintext</text>
 
-  <rect x="282" y="52" width="190" height="104" rx="10" fill="#fdf1ec" stroke="#e8c4b4"/>
-  <text x="298" y="78" class="label">Git host stores</text>
-  <text x="298" y="102" class="mono" fill="#1c1a17">notes/acme.md</text>
-  <text x="298" y="122" class="mono" fill="#1c1a17">"Fix login"</text>
-  <text x="298" y="142" class="mono" fill="#1c1a17">main</text>
+  <line x1="190" y1="106" x2="238" y2="106" stroke="#8a8276" stroke-width="2"/>
+  <polygon points="238,100 249,106 238,112" fill="#8a8276"/>
+  <text x="214" y="98" text-anchor="middle" class="arrow">TLS</text>
 
-  <text x="500" y="72" class="threat">breach</text>
-  <text x="500" y="92" class="threat">leaked token or app</text>
-  <text x="500" y="112" class="threat">insider</text>
-  <text x="500" y="132" class="threat">legal demand</text>
-  <line x1="494" y1="102" x2="480" y2="102" stroke="#a4371b" stroke-width="2"/>
-  <polygon points="482,96 472,102 482,108" fill="#a4371b"/>
-  <text x="652" y="108" class="bad">→ readable</text>
+  <rect x="256" y="64" width="244" height="84" rx="10" fill="#fdf1ec" stroke="#e8c4b4"/>
+  <text x="270" y="90" class="box">Git host</text>
+  <text x="340" y="90" class="sub">reads plaintext</text>
+  <rect x="270" y="104" width="66" height="28" rx="6" fill="#ffffff" stroke="#e8c4b4"/>
+  <text x="303" y="122" text-anchor="middle" class="chip">web &amp; API</text>
+  <rect x="345" y="104" width="66" height="28" rx="6" fill="#ffffff" stroke="#e8c4b4"/>
+  <text x="378" y="122" text-anchor="middle" class="chip">CI</text>
+  <rect x="420" y="104" width="66" height="28" rx="6" fill="#ffffff" stroke="#e8c4b4"/>
+  <text x="453" y="122" text-anchor="middle" class="chip">staff</text>
 
-  <line x1="24" y1="182" x2="736" y2="182" stroke="#e4ded3"/>
+  <line x1="506" y1="106" x2="548" y2="106" stroke="#8a8276" stroke-width="2"/>
+  <polygon points="548,100 559,106 548,112" fill="#8a8276"/>
 
-  <!-- Row 2: git-remote-e2ee -->
-  <text x="24" y="218" class="h">git-remote-e2ee</text>
-  <rect x="24" y="232" width="150" height="104" rx="10" fill="#ffffff" stroke="#e4ded3"/>
-  <text x="40" y="258" class="label">Your laptop + key</text>
-  <text x="40" y="282" class="mono" fill="#1c1a17">notes/acme.md</text>
-  <text x="40" y="302" class="mono" fill="#1c1a17">"Fix login"</text>
-  <text x="40" y="322" class="mono" fill="#1c1a17">main</text>
+  <rect x="566" y="64" width="152" height="84" rx="10" fill="#fdf1ec" stroke="#e8c4b4"/>
+  <text x="580" y="90" class="box">Storage</text>
+  <text x="580" y="110" class="sub">disks &amp; backups</text>
+  <text x="580" y="128" class="sub">encrypted at rest,</text>
+  <text x="580" y="142" class="sub">but the host has the key</text>
 
-  <line x1="182" y1="284" x2="262" y2="284" stroke="#b3542e" stroke-width="2.5"/>
-  <polygon points="262,277 275,284 262,291" fill="#b3542e"/>
-  <text x="228" y="274" text-anchor="middle" font-size="12" font-weight="600" fill="#b3542e">encrypt</text>
+  <!-- threats row 1 -->
+  <line x1="378" y1="190" x2="378" y2="166" stroke="#a4371b" stroke-width="1.5"/>
+  <polygon points="372,168 378,158 384,168" fill="#a4371b"/>
+  <text x="378" y="206" text-anchor="middle" class="threat">breach · insider · legal demand · leaked token</text>
+  <line x1="642" y1="190" x2="642" y2="166" stroke="#a4371b" stroke-width="1.5"/>
+  <polygon points="636,168 642,158 648,168" fill="#a4371b"/>
+  <text x="642" y="206" text-anchor="middle" class="threat">stolen backup</text>
+  <text x="44" y="206" class="bad">Any one exposes everything.</text>
 
-  <rect x="282" y="232" width="190" height="104" rx="10" fill="#eef1f5" stroke="#d5dbe4"/>
-  <text x="298" y="258" class="label">Git host stores</text>
-  <text x="298" y="282" class="mono" fill="#7a8699">3f/9a1c07…</text>
-  <text x="298" y="302" class="mono" fill="#7a8699">7c/e04b5d…</text>
-  <text x="298" y="322" class="mono" fill="#7a8699">b8/51f2aa…</text>
+  <line x1="24" y1="226" x2="736" y2="226" stroke="#e4ded3"/>
 
-  <text x="500" y="252" class="threat">breach</text>
-  <text x="500" y="272" class="threat">leaked token or app</text>
-  <text x="500" y="292" class="threat">insider</text>
-  <text x="500" y="312" class="threat">legal demand</text>
-  <line x1="494" y1="282" x2="480" y2="282" stroke="#a4371b" stroke-width="2"/>
-  <polygon points="482,276 472,282 482,288" fill="#a4371b"/>
-  <text x="652" y="288" class="ok">→ ciphertext</text>
+  <!-- ===== Row 2: git-remote-e2ee ===== -->
+  <text x="24" y="258" class="h">git-remote-e2ee</text>
+  <!-- trust boundary around devices only -->
+  <rect x="32" y="272" width="164" height="112" rx="12" fill="none" stroke="#b3542e" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="200" y="266" text-anchor="start" class="trust">trust only your devices</text>
+
+  <rect x="44" y="286" width="140" height="84" rx="10" fill="#ffffff" stroke="#e4ded3"/>
+  <text x="58" y="312" class="box">Your devices</text>
+  <text x="58" y="332" class="sub">plaintext + keys</text>
+  <text x="58" y="350" class="sub">encrypt &amp; verify</text>
+
+  <line x1="202" y1="328" x2="240" y2="328" stroke="#b3542e" stroke-width="2.5"/>
+  <polygon points="240,321 252,328 240,335" fill="#b3542e"/>
+  <text x="226" y="320" text-anchor="middle" font-size="11" font-weight="600" fill="#b3542e">E2EE</text>
+
+  <rect x="256" y="286" width="244" height="84" rx="10" fill="#eef1f5" stroke="#d5dbe4"/>
+  <text x="270" y="312" class="box">Git host</text>
+  <text x="340" y="312" class="sub">sees ciphertext</text>
+  <rect x="270" y="326" width="66" height="28" rx="6" fill="#ffffff" stroke="#d5dbe4"/>
+  <text x="303" y="344" text-anchor="middle" class="chip">web &amp; API</text>
+  <rect x="345" y="326" width="66" height="28" rx="6" fill="#ffffff" stroke="#d5dbe4"/>
+  <text x="378" y="344" text-anchor="middle" class="chip">CI</text>
+  <rect x="420" y="326" width="66" height="28" rx="6" fill="#ffffff" stroke="#d5dbe4"/>
+  <text x="453" y="344" text-anchor="middle" class="chip">staff</text>
+
+  <line x1="506" y1="328" x2="548" y2="328" stroke="#8a8276" stroke-width="2"/>
+  <polygon points="548,322 559,328 548,334" fill="#8a8276"/>
+
+  <rect x="566" y="286" width="152" height="84" rx="10" fill="#eef1f5" stroke="#d5dbe4"/>
+  <text x="580" y="312" class="box">Storage</text>
+  <text x="580" y="332" class="sub">disks &amp; backups</text>
+  <text x="580" y="350" class="sub">ciphertext only</text>
+
+  <!-- threats row 2 -->
+  <line x1="378" y1="412" x2="378" y2="388" stroke="#a4371b" stroke-width="1.5"/>
+  <polygon points="372,390 378,380 384,390" fill="#a4371b"/>
+  <text x="378" y="428" text-anchor="middle" class="threat">breach · insider · legal demand · leaked token</text>
+  <line x1="642" y1="412" x2="642" y2="388" stroke="#a4371b" stroke-width="1.5"/>
+  <polygon points="636,390 642,380 648,390" fill="#a4371b"/>
+  <text x="642" y="428" text-anchor="middle" class="threat">stolen backup</text>
+  <text x="44" y="406" class="ok">They get ciphertext.</text>
+  <text x="44" y="424" class="ok">Tampering is rejected.</text>
 </svg>
