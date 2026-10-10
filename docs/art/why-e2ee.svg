@@ -1,41 +1,12 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 360" width="760" height="360" role="img" aria-labelledby="title desc">
-  <title id="title">An attacker breaks into the remote</title>
-  <desc id="desc">Left, a private repository: the remote stores readable files and the host's own key, so an attacker who breaks in reads everything. Right, git-remote-e2ee: the remote stores only locked boxes and the key stays on your laptop, so an attacker who breaks in gets nothing readable, and anything changed is rejected by your laptop.</desc>
+  <title id="title">An intruder breaks into the remote</title>
+  <desc id="desc">Left, a private repository: the remote stores readable files and the host's own key, so an intruder who breaks in reads everything. Right, git-remote-e2ee: the remote stores only locked boxes and the key stays on your laptop, so an intruder who breaks in gets nothing readable, and anything changed is rejected by your laptop. Icons from Tabler Icons (MIT).</desc>
   <defs>
-    <!-- open document -->
-    <g id="doc">
-      <path d="M0 0 h22 l8 8 v30 h-30 z" fill="#ffffff" stroke="#c9a493" stroke-width="1.5"/>
-      <path d="M22 0 v8 h8" fill="none" stroke="#c9a493" stroke-width="1.5"/>
-      <line x1="5" y1="15" x2="25" y2="15" stroke="#a4371b" stroke-width="1.6"/>
-      <line x1="5" y1="21" x2="25" y2="21" stroke="#a4371b" stroke-width="1.6"/>
-      <line x1="5" y1="27" x2="19" y2="27" stroke="#a4371b" stroke-width="1.6"/>
-    </g>
-    <!-- locked box -->
-    <g id="locked">
-      <rect x="0" y="10" width="32" height="28" rx="5" fill="#dde3ec" stroke="#8a97ab" stroke-width="1.5"/>
-      <path d="M9 10 v-4 a7 7 0 0 1 14 0 v4" fill="none" stroke="#5f6c80" stroke-width="2.5"/>
-      <rect x="10" y="18" width="12" height="11" rx="2" fill="#5f6c80"/>
-      <circle cx="16" cy="23" r="1.6" fill="#dde3ec"/>
-    </g>
-    <!-- key -->
-    <g id="key">
-      <circle cx="7" cy="7" r="6" fill="none" stroke-width="2.5"/>
-      <line x1="13" y1="7" x2="30" y2="7" stroke-width="2.5"/>
-      <line x1="24" y1="7" x2="24" y2="13" stroke-width="2.5"/>
-      <line x1="29" y1="7" x2="29" y2="12" stroke-width="2.5"/>
-    </g>
-    <!-- laptop -->
-    <g id="laptop">
-      <rect x="6" y="0" width="60" height="40" rx="4" fill="#ffffff" stroke="#8a8276" stroke-width="1.8"/>
-      <rect x="12" y="6" width="48" height="28" rx="2" fill="#f1ede6"/>
-      <path d="M0 44 h72 l-6 6 h-60 z" fill="#d8d2c8"/>
-    </g>
-    <!-- attacker -->
-    <g id="attacker">
-      <circle cx="16" cy="12" r="11" fill="#2b2622"/>
-      <rect x="6" y="9" width="20" height="6" rx="3" fill="#a4371b"/>
-      <path d="M0 52 a16 18 0 0 1 32 0 z" fill="#2b2622"/>
-    </g>
+    <symbol id="i-spy" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11h18" /> <path d="M5 11v-4a3 3 0 0 1 3 -3h8a3 3 0 0 1 3 3v4" /> <path d="M4 17a3 3 0 1 0 6 0a3 3 0 1 0 -6 0" /> <path d="M14 17a3 3 0 1 0 6 0a3 3 0 1 0 -6 0" /> <path d="M10 17h4" /></symbol>
+    <symbol id="i-lock" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 13a2 2 0 0 1 2 -2h10a2 2 0 0 1 2 2v6a2 2 0 0 1 -2 2h-10a2 2 0 0 1 -2 -2v-6" /> <path d="M11 16a1 1 0 1 0 2 0a1 1 0 0 0 -2 0" /> <path d="M8 11v-4a4 4 0 1 1 8 0v4" /></symbol>
+    <symbol id="i-doc" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3v4a1 1 0 0 0 1 1h4" /> <path d="M17 21h-10a2 2 0 0 1 -2 -2v-14a2 2 0 0 1 2 -2h7l5 5v11a2 2 0 0 1 -2 2" /> <path d="M9 9l1 0" /> <path d="M9 13l6 0" /> <path d="M9 17l6 0" /></symbol>
+    <symbol id="i-key" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16.555 3.843l3.602 3.602a2.877 2.877 0 0 1 0 4.069l-2.643 2.643a2.877 2.877 0 0 1 -4.069 0l-.301 -.301l-6.558 6.558a2 2 0 0 1 -1.239 .578l-.175 .008h-1.172a1 1 0 0 1 -.993 -.883l-.007 -.117v-1.172a2 2 0 0 1 .467 -1.284l.119 -.13l.414 -.414h2v-2h2v-2l2.144 -2.144l-.301 -.301a2.877 2.877 0 0 1 0 -4.069l2.643 -2.643a2.877 2.877 0 0 1 4.069 0" /> <path d="M15 9h.01" /></symbol>
+    <symbol id="i-laptop" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 19l18 0" /> <path d="M5 7a1 1 0 0 1 1 -1h12a1 1 0 0 1 1 1v8a1 1 0 0 1 -1 1h-12a1 1 0 0 1 -1 -1l0 -8" /></symbol>
   </defs>
   <style>
     text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
@@ -47,25 +18,24 @@
   </style>
   <rect x="0" y="0" width="760" height="360" rx="16" fill="#faf8f4"/>
 
-  <!-- ===== Left: private repository ===== -->
+  <!-- Left: private repository -->
   <text x="28" y="40" class="h">Private repository</text>
-  <use href="#laptop" x="28" y="128"/>
-  <text x="64" y="200" text-anchor="middle" class="sub">your laptop</text>
+  <use href="#i-laptop" x="26" y="114" width="76" height="76" stroke="#6b645a"/>
+  <text x="64" y="204" text-anchor="middle" class="sub">your laptop</text>
   <line x1="108" y1="152" x2="134" y2="152" stroke="#8a8276" stroke-width="2"/>
   <polygon points="134,146 145,152 134,158" fill="#8a8276"/>
 
   <rect x="150" y="62" width="214" height="196" rx="12" fill="#fdf1ec" stroke="#e8c4b4" stroke-width="1.5"/>
   <text x="164" y="84" class="sub">remote: host, storage, backups</text>
-  <use href="#doc" x="168" y="100"/>
-  <use href="#doc" x="210" y="100"/>
-  <use href="#doc" x="252" y="100"/>
-  <use href="#key" x="300" y="112" stroke="#b3542e"/>
-  <text x="314" y="138" text-anchor="middle" class="sub">host's key</text>
-  <!-- break-in mark -->
-  <path d="M364 176 l-14 10 l10 6 l-16 12" fill="none" stroke="#a4371b" stroke-width="2.5" stroke-linecap="round"/>
-  <use href="#attacker" x="300" y="186"/>
-  <path d="M296 206 q-30 -14 -52 -36" fill="none" stroke="#a4371b" stroke-width="1.6" stroke-dasharray="4 3"/>
-  <polygon points="246,166 240,174 252,174" fill="#a4371b" transform="rotate(-40 246 170)"/>
+  <use href="#i-doc" x="164" y="96" width="40" height="40" stroke="#a4371b"/>
+  <use href="#i-doc" x="206" y="96" width="40" height="40" stroke="#a4371b"/>
+  <use href="#i-doc" x="248" y="96" width="40" height="40" stroke="#a4371b"/>
+  <use href="#i-key" x="298" y="98" width="36" height="36" stroke="#b3542e"/>
+  <text x="316" y="148" text-anchor="middle" class="sub">host's key</text>
+  <path d="M364 170 l-14 10 l10 6 l-16 12" fill="none" stroke="#a4371b" stroke-width="2.5" stroke-linecap="round"/>
+  <use href="#i-spy" x="290" y="182" width="58" height="58" stroke="#2b2622"/>
+  <path d="M290 206 q-30 -16 -50 -40" fill="none" stroke="#a4371b" stroke-width="1.6" stroke-dasharray="4 3"/>
+  <polygon points="236,160 232,170 243,168" fill="#a4371b"/>
 
   <text x="28" y="292" class="bad">An intruder reads everything.</text>
   <text x="28" y="314" class="note">Encryption at rest does not help:</text>
@@ -73,24 +43,23 @@
 
   <line x1="380" y1="28" x2="380" y2="332" stroke="#e4ded3"/>
 
-  <!-- ===== Right: git-remote-e2ee ===== -->
+  <!-- Right: git-remote-e2ee -->
   <text x="398" y="40" class="h">git-remote-e2ee</text>
-  <use href="#laptop" x="398" y="128"/>
-  <use href="#key" x="418" y="104" stroke="#2f6b3a"/>
-  <text x="434" y="200" text-anchor="middle" class="sub">your laptop + key</text>
+  <use href="#i-laptop" x="396" y="114" width="76" height="76" stroke="#6b645a"/>
+  <use href="#i-key" x="416" y="84" width="34" height="34" stroke="#2f6b3a"/>
+  <text x="434" y="204" text-anchor="middle" class="sub">your laptop + key</text>
   <line x1="478" y1="152" x2="504" y2="152" stroke="#b3542e" stroke-width="2.5"/>
   <polygon points="504,145 516,152 504,159" fill="#b3542e"/>
 
   <rect x="520" y="62" width="214" height="196" rx="12" fill="#eef1f5" stroke="#d5dbe4" stroke-width="1.5"/>
   <text x="534" y="84" class="sub">remote: host, storage, backups</text>
-  <use href="#locked" x="538" y="100"/>
-  <use href="#locked" x="580" y="100"/>
-  <use href="#locked" x="622" y="100"/>
-  <use href="#locked" x="664" y="100"/>
-  <!-- break-in mark -->
-  <path d="M734 176 l-14 10 l10 6 l-16 12" fill="none" stroke="#a4371b" stroke-width="2.5" stroke-linecap="round"/>
-  <use href="#attacker" x="670" y="186"/>
-  <text x="640" y="214" text-anchor="end" font-size="22" font-weight="700" fill="#5f6c80">?</text>
+  <use href="#i-lock" x="534" y="96" width="40" height="40" stroke="#5f6c80"/>
+  <use href="#i-lock" x="576" y="96" width="40" height="40" stroke="#5f6c80"/>
+  <use href="#i-lock" x="618" y="96" width="40" height="40" stroke="#5f6c80"/>
+  <use href="#i-lock" x="660" y="96" width="40" height="40" stroke="#5f6c80"/>
+  <path d="M734 170 l-14 10 l10 6 l-16 12" fill="none" stroke="#a4371b" stroke-width="2.5" stroke-linecap="round"/>
+  <use href="#i-spy" x="660" y="182" width="58" height="58" stroke="#2b2622"/>
+  <text x="644" y="222" text-anchor="end" font-size="24" font-weight="700" fill="#5f6c80">?</text>
 
   <text x="398" y="292" class="ok">An intruder finds only locked boxes.</text>
   <text x="398" y="314" class="note">The key never leaves your devices, and</text>
