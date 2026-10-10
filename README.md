@@ -13,8 +13,8 @@
 </p>
 
 <p align="center">
-  <a href="#how-it-compares">How it compares</a>
-  · <a href="#quick-start">Quick start</a>
+  <a href="#quick-start">Quick start</a>
+  · <a href="#how-it-compares">How it compares</a>
   · <a href="docs/design.md">Design</a>
   · <a href="docs/spec.md">Specification</a>
 </p>
@@ -104,6 +104,52 @@ It also does the rest of what an encrypted remote should:
 Under the hood, Git runs on your machine as usual. The helper encrypts the
 packs and refs Git hands it, uploads them as opaque immutable objects, and then
 atomically moves one opaque `HEAD` pointer.
+
+### At a glance
+
+Godot repository (867 MiB of history), a local bare repository as the Git
+host, Apple M1 Pro, median of three runs. Full results in
+[Performance](#performance).
+
+| | Plain Git | `git-remote-gcrypt` | `git-remote-e2ee` |
+|---|---:|---:|---:|
+| Initial push | 28.4 s | 36.6 s | 22.9 s |
+| Fresh fetch | 27.7 s | 55.0 s | 40.0 s |
+| Tiny push | 0.08 s | 6.5 s | 0.97 s |
+| Tiny update (fetch) | 0.07 s | 22.6 s | 0.77 s |
+| Data sent per tiny push | 4.5 KB | 921 MB | 8.9 KB |
+
+## Quick start
+
+Install from source (a Rust toolchain is required). This installs both
+`git-e2ee`, the setup CLI, and `git-remote-e2ee`, the helper Git calls for
+`e2ee::` URLs. Both must be on `PATH`.
+
+```console
+cargo install --git https://github.com/combinatrix-ai/git-remote-e2ee
+```
+
+Use an empty GitHub repository as encrypted storage and push an existing
+project to it:
+
+```console
+git-e2ee keygen --output ~/.config/git-e2ee/notes.key.json
+git-e2ee carrier-init \
+  --remote https://github.com/you/notes-encrypted.git \
+  --key ~/.config/git-e2ee/notes.key.json
+
+cd my-notes
+git remote add private 'e2ee::git+https://github.com/you/notes-encrypted.git'
+git config remote.private.e2ee-key ~/.config/git-e2ee/notes.key.json
+git push -u private main
+```
+
+From then on, `git pull` and `git push` work as usual. The key file stays on
+your machine; never commit it, and keep a backup somewhere safe.
+
+To use a second machine, give it its own key and authorize its public half.
+The [user guide](docs/guide.md#add-a-second-device) walks through it, as well as
+the directory backend, cloning, and revoking devices.
 
 ## How it compares
 
@@ -202,38 +248,6 @@ of selected files inside an otherwise normal repository. **Encrypted remotes**,
   want GitHub or GitLab to keep working normally for the rest.
 - **An ordinary private repository**: you trust the host and want pull
   requests, search, previews, and CI.
-
-## Quick start
-
-Install from source (a Rust toolchain is required). This installs both
-`git-e2ee`, the setup CLI, and `git-remote-e2ee`, the helper Git calls for
-`e2ee::` URLs. Both must be on `PATH`.
-
-```console
-cargo install --git https://github.com/combinatrix-ai/git-remote-e2ee
-```
-
-Use an empty GitHub repository as encrypted storage and push an existing
-project to it:
-
-```console
-git-e2ee keygen --output ~/.config/git-e2ee/notes.key.json
-git-e2ee carrier-init \
-  --remote https://github.com/you/notes-encrypted.git \
-  --key ~/.config/git-e2ee/notes.key.json
-
-cd my-notes
-git remote add private 'e2ee::git+https://github.com/you/notes-encrypted.git'
-git config remote.private.e2ee-key ~/.config/git-e2ee/notes.key.json
-git push -u private main
-```
-
-From then on, `git pull` and `git push` work as usual. The key file stays on
-your machine; never commit it, and keep a backup somewhere safe.
-
-To use a second machine, give it its own key and authorize its public half.
-The [user guide](docs/guide.md#add-a-second-device) walks through it, as well as
-the directory backend, cloning, and revoking devices.
 
 ## Security model
 
