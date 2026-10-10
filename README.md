@@ -66,7 +66,7 @@ encrypted whole repositories with GnuPG for years. `git-remote-e2ee` hides the
 whole repository like gcrypt, and fixes what makes that painful to live with:
 
 - **Fast: pushes upload only what changed.** A push uploads the new Git pack
-  plus a few KB of metadata on every backend: about 9.5 KB for a one-line
+  plus a few KB of metadata on every backend: about 9 KB for a one-line
   change in the [benchmark](#performance). With a Git or SFTP backend such as
   GitHub, gcrypt re-uploads the entire encrypted history on every push: 921 MB
   for the same change.
@@ -276,19 +276,19 @@ Small pushes and fetches upload or download only the change, even when GitHub
 or another Git host is the storage.
 
 Measured on the Godot repository (867 MiB of history), with a local bare
-repository standing in for the Git host, on an Apple M1 Max. Median of three
-runs; tiny rows are a one-line change, repeated five times.
+repository standing in for the Git host, on an Apple M1 Pro with 32 GiB RAM.
+Median of three runs; tiny rows are a one-line change, repeated five times.
 
 | | Plain Git | `git-remote-gcrypt` | `git-remote-e2ee` |
 |---|---:|---:|---:|
-| Initial encryption (to a local directory) | 30.3 s | 12.0 s | 8.9 s |
-| Initial push | 30.3 s | 37.6 s | 23.9 s |
-| Fresh fetch | 28.0 s | 53.5 s | 38.0 s |
-| Tiny commit | 0.16 s | 0.16 s | 0.16 s |
-| Tiny push | 0.09 s | 6.8 s | 1.2 s |
-| Tiny update (fetch) | 0.07 s | 24.3 s | 0.84 s |
-| Data sent per tiny push | 4.8 KB | 921 MB | 9.5 KB |
-| Peak memory, initial push | 1.27 GiB | 0.96 GiB | 1.27 GiB |
+| Initial encryption (to a local directory) | 28.6 s | 11.0 s | 8.1 s |
+| Initial push | 28.4 s | 36.6 s | 22.9 s |
+| Fresh fetch | 27.7 s | 55.0 s | 40.0 s |
+| Tiny commit | 0.09 s | 0.09 s | 0.09 s |
+| Tiny push | 0.08 s | 6.5 s | 0.97 s |
+| Tiny update (fetch) | 0.07 s | 22.6 s | 0.77 s |
+| Data sent per tiny push | 4.5 KB | 921 MB | 8.9 KB |
+| Peak memory, initial push | 1.27 GiB | 0.98 GiB | 1.27 GiB |
 | Peak memory, tiny push | 37 MiB | 887 MiB | 9 MiB |
 | Remote size after five tiny pushes | 891 MiB | 5,272 MiB | 878 MiB |
 | Client disk after fresh fetch (`.git` plus cache) | 891 MiB | 1,780 MiB | 1,779 MiB |

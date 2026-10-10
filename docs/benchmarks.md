@@ -25,9 +25,30 @@ auxiliary cache or state.
 ## Latest reproduce run (2026-10-08)
 
 The README table comes from this run of `scripts/reproduce-benchmark.sh` with
-its defaults (three rounds, five tiny commits), at e2ee `971894a` with no
-uncommitted changes, on an Apple M1 Max with 64 GiB RAM, macOS 27.0, and
-Git 2.56.0. The runner's `summary.md`:
+its defaults (three rounds, five tiny commits), at e2ee `cedc9fe` with no
+uncommitted changes, on an Apple M1 Pro (10 cores) with 32 GiB RAM,
+macOS 26.5.2, Git 2.55.0, and Homebrew Rust 1.98.0. The machine was otherwise
+lightly loaded. The runner's `summary.md`:
+
+| | Plain Git | `git-remote-gcrypt` | `git-remote-e2ee` |
+|---|---:|---:|---:|
+| Initial encryption (to a local directory) | 28.6 s | 11.0 s | 8.1 s |
+| Initial push | 28.4 s | 36.6 s | 22.9 s |
+| Fresh fetch | 27.7 s | 55.0 s | 40.0 s |
+| Tiny commit | 0.09 s | 0.09 s | 0.09 s |
+| Tiny push | 0.08 s | 6.5 s | 0.97 s |
+| Tiny update (fetch) | 0.07 s | 22.6 s | 0.77 s |
+| Data sent per tiny push | 4.5 KB | 921 MB | 8.9 KB |
+| Peak memory, initial push | 1.27 GiB | 0.98 GiB | 1.27 GiB |
+| Peak memory, tiny push | 37 MiB | 887 MiB | 9 MiB |
+| Remote size after 5 tiny pushes | 891 MiB | 5,272 MiB | 878 MiB |
+| Total client disk after fresh fetch (.git + auxiliary cache/state) | 891 MiB | 1,780 MiB | 1,779 MiB |
+
+### Second macOS machine (2026-10-08)
+
+The same runner at e2ee `971894a` on an Apple M1 Max with 64 GiB RAM,
+macOS 27.0, and Git 2.56.0. That machine was shared with other work during the
+run (load average about 7-16 on 10 cores). The ordering is identical:
 
 | | Plain Git | `git-remote-gcrypt` | `git-remote-e2ee` |
 |---|---:|---:|---:|
@@ -43,9 +64,7 @@ Git 2.56.0. The runner's `summary.md`:
 | Remote size after 5 tiny pushes | 891 MiB | 5,272 MiB | 878 MiB |
 | Total client disk after fresh fetch (.git + auxiliary cache/state) | 891 MiB | 1,780 MiB | 1,779 MiB |
 
-The machine was shared with other work during the run (load average about
-7-16 on 10 cores), so individual timings carry some noise. The sections below
-record earlier runs and the investigation that led here.
+The sections below record earlier runs and the investigation that led here.
 
 ## Primary Git-backend benchmark: Godot (2026-10-03)
 
