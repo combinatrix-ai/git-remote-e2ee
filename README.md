@@ -30,32 +30,20 @@
 
 ## Why end-to-end encryption?
 
-**"Private" on a Git host means private from other people, not from the host.**
-A private GitHub or GitLab repository is stored in a form the provider can read:
-every file, every commit message, every branch name, and who wrote what. That is
-what lets the host show you diffs and run CI, but it also means your code and
-notes are readable by anyone who gets access to the host's side: a breach, a
-leaked access token or third-party app, an insider, a legal demand, or a policy
-change you did not choose.
+A private repository is private from other people, not from the host. The host
+stores everything in readable form, so anyone who reaches its side can read it.
+End-to-end encryption keeps the keys on your devices: the host stores only
+ciphertext, and tampering is detected.
 
-**End-to-end encryption (E2EE) moves the keys to your devices.** Your repository
-is encrypted on your computer before it is uploaded, and only devices you have
-authorized can decrypt it. The host stores data it cannot read. If the host is
-breached or compelled to hand over your repository, there is nothing readable
-to hand over. If someone tampers with the stored data, your clients notice and
-refuse it.
+<p align="center">
+  <img src="docs/art/why-e2ee.svg" alt="With a private repository the host stores readable files, so a breach, a leaked token, an insider, or a legal demand exposes them. With git-remote-e2ee the host stores only ciphertext." width="720" />
+</p>
 
-With `git-remote-e2ee` this happens underneath Git. You add a remote with an
-`e2ee::` URL and keep working exactly as before.
-
-**Good fits:** personal notes and journals, research before publication, client
-or NDA work that must live on third-party storage, private configuration, and
-backups on storage you do not control.
-
-**What you give up:** because the host cannot read the repository, it cannot
-show it to you either. There are no web diffs, pull-request reviews, code
-search, or hosted CI on the plaintext. You are also responsible for your keys:
-if every authorized key is lost, the data cannot be recovered by anyone.
+- **Good fits:** notes and journals, unpublished research, client or NDA work,
+  private configuration, backups on storage you do not control.
+- **What you give up:** no web diffs, pull-request reviews, code search, or
+  hosted CI on the plaintext, and nobody can recover your data if you lose
+  every key.
 
 ## Why git-remote-e2ee
 
