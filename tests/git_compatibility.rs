@@ -186,6 +186,234 @@ fn upstream_style_push_refspecs_and_force_work() {
 }
 
 #[test]
+fn lightweight_annotated_and_followed_tags_round_trip_through_helper() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let before_tags = temporary.path().join("before-tags");
+    initialize_git(&source);
+    let (storage, key_path, key) = setup_remote(temporary.path());
+    configure_remote(&source, &storage, &key_path);
+    let first = commit_file(&source, "first", "first");
+    git(&source, &["push", "private", "main"], true);
+    clone_remote(&before_tags, &storage, &key_path);
+
+    git(&source, &["tag", "v1.0", &first], false);
+    git(&source, &["push", "private", "v1.0"], true);
+    git(
+        &source,
+        &["tag", "-a", "v1.1", "-m", "release one", &first],
+        false,
+    );
+    fs::write(source.join("tag-target.bin"), b"tagged blob object\n").unwrap();
+    let blob = git(&source, &["hash-object", "-w", "tag-target.bin"], false);
+    git(&source, &["add", "tag-target.bin"], false);
+    let tree = git(&source, &["write-tree"], false);
+    git(
+        &source,
+        &["tag", "-a", "v-blob", "-m", "blob target", &blob],
+        false,
+    );
+    git(
+        &source,
+        &["tag", "-a", "v-tree", "-m", "tree target", &tree],
+        false,
+    );
+    git(&source, &["push", "--tags", "private"], true);
+
+    git(&before_tags, &["fetch", "--tags", "origin"], true);
+    assert_eq!(
+        git(&before_tags, &["rev-parse", "refs/tags/v1.0"], false),
+        first
+    );
+    assert_eq!(
+        git(&before_tags, &["cat-file", "-t", "refs/tags/v1.1"], false),
+        "tag"
+    );
+    assert_eq!(
+        git(&before_tags, &["rev-parse", "refs/tags/v1.1^{}"], false),
+        first
+    );
+    assert_eq!(
+        git(&before_tags, &["cat-file", "-t", "refs/tags/v-blob"], false),
+        "tag"
+    );
+    assert_eq!(
+        git(&before_tags, &["rev-parse", "refs/tags/v-blob^{}"], false),
+        blob
+    );
+    git(&before_tags, &["cat-file", "-e", &blob], false);
+    assert_eq!(
+        git(&before_tags, &["rev-parse", "refs/tags/v-tree^{}"], false),
+        tree
+    );
+    assert_eq!(git(&before_tags, &["cat-file", "-t", &tree], false), "tree");
+
+    let second = commit_file(&source, "second", "second");
+    git(
+        &source,
+        &["tag", "-a", "v2.0", "-m", "release two", &second],
+        false,
+    );
+    git(&source, &["push", "--follow-tags", "private", "main"], true);
+
+    let repository = EncryptedRepository::new(FilesystemStorage::new(&storage), key);
+    let manifest = repository.verify().unwrap();
+    assert_eq!(manifest.refs["refs/tags/v1.0"], first);
+    assert_eq!(
+        manifest.refs["refs/tags/v1.1"],
+        git(&source, &["rev-parse", "refs/tags/v1.1"], false)
+    );
+    assert_eq!(
+        manifest.refs["refs/tags/v2.0"],
+        git(&source, &["rev-parse", "refs/tags/v2.0"], false)
+    );
+
+    let fresh = temporary.path().join("fresh-clone");
+    clone_remote(
+        &fresh,
+        &storage,
+        &temporary.path().join("repository.key.json"),
+    );
+    assert_eq!(
+        git(&fresh, &["cat-file", "-t", "refs/tags/v1.1"], false),
+        "tag"
+    );
+    assert_eq!(
+        git(&fresh, &["cat-file", "-t", "refs/tags/v2.0"], false),
+        "tag"
+    );
+    assert_eq!(
+        git(&fresh, &["rev-parse", "refs/tags/v2.0^{}"], false),
+        second
+    );
+}
+
+#[test]
+fn moving_an_existing_tag_requires_force() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    initialize_git(&source);
+    let (storage, key_path, key) = setup_remote(temporary.path());
+    configure_remote(&source, &storage, &key_path);
+    let first = commit_file(&source, "first", "first");
+    git(&source, &["push", "private", "main"], true);
+    git(&source, &["tag", "v1.0", &first], false);
+    git(&source, &["push", "private", "v1.0"], true);
+
+    let second = commit_file(&source, "second", "second");
+    git(&source, &["push", "private", "main"], true);
+    git(&source, &["tag", "-f", "v1.0", &second], false);
+    let repository = EncryptedRepository::new(FilesystemStorage::new(&storage), key);
+    let before = repository.verify().unwrap();
+    let rejected = git_output(&source, &["push", "private", "v1.0"], true);
+    assert!(!rejected.status.success());
+    let message = format!(
+        "{}{}",
+        String::from_utf8_lossy(&rejected.stdout),
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert!(message.contains("already exists"), "{message}");
+    let after_rejection = repository.verify().unwrap();
+    assert_eq!(after_rejection.generation, before.generation);
+    assert_eq!(after_rejection.refs["refs/tags/v1.0"], first);
+
+    git(&source, &["push", "--force", "private", "v1.0"], true);
+    assert_eq!(repository.verify().unwrap().refs["refs/tags/v1.0"], second);
+}
+
+#[test]
+fn deletions_publish_without_packs_and_prune_on_returning_and_fresh_clones() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let returning = temporary.path().join("returning-clone");
+    initialize_git(&source);
+    let (storage, key_path, key) = setup_remote(temporary.path());
+    configure_remote(&source, &storage, &key_path);
+    let main = commit_file(&source, "main", "main");
+    git(&source, &["push", "private", "main"], true);
+    git(&source, &["branch", "doomed", &main], false);
+    git(&source, &["push", "private", "doomed"], true);
+    git(&source, &["tag", "v-delete", &main], false);
+    git(&source, &["push", "private", "v-delete"], true);
+    clone_remote(&returning, &storage, &key_path);
+
+    let repository = EncryptedRepository::new(FilesystemStorage::new(&storage), key);
+    let before = repository.verify().unwrap();
+    let default_delete = git_output(&source, &["push", "--delete", "private", "main"], true);
+    assert!(!default_delete.status.success());
+    let default_error = format!(
+        "{}{}",
+        String::from_utf8_lossy(&default_delete.stdout),
+        String::from_utf8_lossy(&default_delete.stderr)
+    );
+    assert!(
+        default_error.contains("remote default branch"),
+        "{default_error}"
+    );
+    assert_eq!(repository.verify().unwrap().generation, before.generation);
+
+    git(&source, &["push", "--delete", "private", "doomed"], true);
+    let after_branch_delete = repository.verify().unwrap();
+    assert!(!after_branch_delete.refs.contains_key("refs/heads/doomed"));
+    assert_eq!(
+        after_branch_delete.total_pack_count,
+        before.total_pack_count
+    );
+
+    git(&source, &["push", "private", ":refs/tags/v-delete"], true);
+    let after_tag_delete = repository.verify().unwrap();
+    assert!(!after_tag_delete.refs.contains_key("refs/tags/v-delete"));
+    assert_eq!(after_tag_delete.total_pack_count, before.total_pack_count);
+
+    git(
+        &returning,
+        &["fetch", "--prune", "--prune-tags", "origin"],
+        true,
+    );
+    assert!(
+        git_output(
+            &returning,
+            &["show-ref", "--verify", "refs/remotes/origin/doomed"],
+            false
+        )
+        .status
+        .code()
+        .is_some_and(|code| code != 0)
+    );
+    assert!(
+        git_output(
+            &returning,
+            &["show-ref", "--verify", "refs/tags/v-delete"],
+            false
+        )
+        .status
+        .code()
+        .is_some_and(|code| code != 0)
+    );
+
+    let fresh = temporary.path().join("fresh-clone");
+    clone_remote(&fresh, &storage, &key_path);
+    assert!(
+        !git_output(
+            &fresh,
+            &["show-ref", "--verify", "refs/remotes/origin/doomed"],
+            false
+        )
+        .status
+        .success()
+    );
+    assert!(
+        !git_output(
+            &fresh,
+            &["show-ref", "--verify", "refs/tags/v-delete"],
+            false
+        )
+        .status
+        .success()
+    );
+}
+
+#[test]
 fn unsupported_upstream_operations_fail_without_publication() {
     let temporary = tempfile::tempdir().unwrap();
     let source = temporary.path().join("source");
@@ -204,10 +432,19 @@ fn unsupported_upstream_operations_fail_without_publication() {
     assert_eq!(after_delete.generation, generation);
     assert_eq!(after_delete.refs["refs/heads/main"], head);
 
-    git(&source, &["tag", "v1"], false);
-    let tag = git_output(&source, &["push", "private", "v1"], true);
-    assert!(!tag.status.success());
-    let after_tag = repository.verify().unwrap();
-    assert_eq!(after_tag.generation, generation);
-    assert!(!after_tag.refs.contains_key("refs/tags/v1"));
+    let namespace = git_output(
+        &source,
+        &["push", "private", "HEAD:refs/notes/review"],
+        true,
+    );
+    assert!(!namespace.status.success());
+    let message = format!(
+        "{}{}",
+        String::from_utf8_lossy(&namespace.stdout),
+        String::from_utf8_lossy(&namespace.stderr)
+    );
+    assert!(message.contains("unsupported ref namespace"), "{message}");
+    let after_namespace = repository.verify().unwrap();
+    assert_eq!(after_namespace.generation, generation);
+    assert!(!after_namespace.refs.contains_key("refs/notes/review"));
 }

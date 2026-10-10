@@ -1,10 +1,12 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use anyhow::{Context, Result, bail};
+
+use crate::trace;
 
 pub fn ensure_repository(repo: &Path) -> Result<()> {
     let output = Command::new("git")
@@ -18,8 +20,75 @@ pub fn ensure_repository(repo: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn has_complete_object_graph(repo: &Path) -> bool {
+    let shallow = match Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--is-shallow-repository"])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return false,
+    };
+    if String::from_utf8_lossy(&shallow.stdout).trim() != "false" {
+        return false;
+    }
+
+    let partial = match Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "config",
+            "--local",
+            "--name-only",
+            "--get-regexp",
+            r"^(extensions\.partialclone|remote\..*\.promisor)$",
+        ])
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => return false,
+    };
+    partial.status.code() == Some(1) && partial.stdout.is_empty()
+}
+
 pub fn resolve_ref(repo: &Path, reference: &str) -> Result<String> {
     git_text(repo, &["rev-parse", "--verify", reference])
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InnerRefKind {
+    Branch,
+    Tag,
+}
+
+pub fn validate_inner_ref(repo: &Path, reference: &str) -> Result<InnerRefKind> {
+    let kind = if reference.starts_with("refs/heads/") {
+        InnerRefKind::Branch
+    } else if reference.starts_with("refs/tags/") {
+        InnerRefKind::Tag
+    } else {
+        bail!(
+            "unsupported ref namespace for {reference}; only refs/heads/* and refs/tags/* are supported"
+        )
+    };
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["check-ref-format", reference])
+        .output()?;
+    if !output.status.success() {
+        bail!("invalid Git ref name {reference}")
+    }
+    Ok(kind)
+}
+
+pub fn ensure_branch_target(repo: &Path, reference: &str, object: &str) -> Result<()> {
+    let target = resolve_tag_chain(repo, reference, object, "pushed")?;
+    if target.kind != "commit" {
+        bail!("branch ref {reference} must resolve to a commit")
+    }
+    Ok(())
 }
 
 pub fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
@@ -53,6 +122,7 @@ pub struct PackSource {
     stdout: Option<ChildStdout>,
     stderr: File,
     finished: bool,
+    _timer: trace::Span,
 }
 
 impl Read for PackSource {
@@ -93,6 +163,7 @@ pub fn start_incremental_pack(
     new_refs: &BTreeMap<String, String>,
     old_refs: &BTreeMap<String, String>,
 ) -> Result<PackSource> {
+    let timer = trace::Span::new("git_pack_objects_stream_lifetime");
     let stderr = tempfile::tempfile().context("create pack-objects stderr file")?;
     let mut child = Command::new("git")
         .arg("-C")
@@ -124,6 +195,7 @@ pub fn start_incremental_pack(
         stdout: Some(stdout),
         stderr,
         finished: false,
+        _timer: timer,
     })
 }
 
@@ -132,6 +204,7 @@ pub struct PackImporter {
     stdin: Option<ChildStdin>,
     stderr: File,
     finished: bool,
+    _timer: trace::Span,
 }
 
 impl Write for PackImporter {
@@ -176,6 +249,7 @@ impl Drop for PackImporter {
 }
 
 pub fn start_pack_import(repo: &Path) -> Result<PackImporter> {
+    let timer = trace::Span::new("git_index_pack");
     let stderr = tempfile::tempfile().context("create index-pack stderr file")?;
     let mut child = Command::new("git")
         .arg("-C")
@@ -191,6 +265,7 @@ pub fn start_pack_import(repo: &Path) -> Result<PackImporter> {
         stdin: Some(stdin),
         stderr,
         finished: false,
+        _timer: timer,
     })
 }
 
@@ -203,29 +278,64 @@ fn read_process_error(file: &mut File) -> String {
     message.trim().to_owned()
 }
 
-pub fn ensure_refs_connected(repo: &Path, refs: &BTreeMap<String, String>) -> Result<()> {
+pub fn ensure_refs_connected_since(
+    repo: &Path,
+    refs: &BTreeMap<String, String>,
+    verified_refs: &BTreeMap<String, String>,
+) -> Result<()> {
+    let _timer = trace::Span::new("git_ref_connectivity_walk");
     if refs.is_empty() {
         return Ok(());
     }
+    let mut commit_roots = Vec::new();
+    let mut verified_commit_roots = Vec::new();
     for (reference, object) in refs {
-        let expression = format!("{object}^{{commit}}");
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(["cat-file", "-e", &expression])
-            .output()?;
-        if !output.status.success() {
-            bail!("fetched ref {reference} does not resolve to a complete commit")
+        let ref_kind = validate_inner_ref(repo, reference)?;
+        let target = resolve_tag_chain(repo, reference, object, "fetched")?;
+        match target.kind.as_str() {
+            "commit" => commit_roots.push(target.oid),
+            "tree" if ref_kind == InnerRefKind::Tag => {
+                ensure_tree_connected(repo, reference, &target.oid)?
+            }
+            "blob" if ref_kind == InnerRefKind::Tag => {}
+            _ => bail!("fetched ref {reference} does not resolve to a supported Git object"),
         }
     }
 
+    // A successful prior connectivity check makes every object reachable from
+    // these tips a trusted frontier. Git objects are immutable and
+    // content-addressed, so a later fetch only needs to walk objects newly
+    // reachable beyond that frontier. Still require the frontier tips to be
+    // present locally so corruption or an unexpected local prune fails closed.
+    for (reference, object) in verified_refs {
+        let ref_kind = validate_inner_ref(repo, reference)?;
+        let target = resolve_tag_chain(repo, reference, object, "verified")?;
+        match target.kind.as_str() {
+            "commit" => verified_commit_roots.push(target.oid),
+            "tree" if ref_kind == InnerRefKind::Tag => {
+                ensure_tree_connected(repo, reference, &target.oid)?
+            }
+            "blob" if ref_kind == InnerRefKind::Tag => {}
+            _ => bail!("verified ref {reference} does not resolve to a supported Git object"),
+        }
+    }
+
+    if commit_roots.is_empty() {
+        return Ok(());
+    }
     let mut command = Command::new("git");
     command
         .arg("-C")
         .arg(repo)
         .args(["rev-list", "--objects", "--missing=print"]);
-    for object in refs.values() {
+    for object in &commit_roots {
         command.arg(object);
+    }
+    if !verified_commit_roots.is_empty() {
+        command.arg("--not");
+        for object in &verified_commit_roots {
+            command.arg(object);
+        }
     }
     let output = command.output()?;
     if !output.status.success() {
@@ -234,11 +344,108 @@ pub fn ensure_refs_connected(repo: &Path, refs: &BTreeMap<String, String>) -> Re
             String::from_utf8_lossy(&output.stderr).trim()
         )
     }
-    if String::from_utf8(output.stdout)?
-        .lines()
-        .any(|line| line.starts_with('?'))
+    let output = String::from_utf8(output.stdout)?;
+    let mut checked_objects = 0;
+    for line in output.lines() {
+        checked_objects += 1;
+        if line.starts_with('?') {
+            bail!("fetched refs contain missing Git objects")
+        }
+    }
+    trace::count("git_ref_connectivity_walk_objects", checked_objects);
+    Ok(())
+}
+
+struct RefTarget {
+    oid: String,
+    kind: String,
+}
+
+fn resolve_tag_chain(repo: &Path, reference: &str, object: &str, label: &str) -> Result<RefTarget> {
+    let mut current = object.to_owned();
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(current.clone()) {
+            bail!("{label} ref {reference} contains a cyclic tag chain")
+        }
+        let kind = match cat_file_type(repo, &current) {
+            Ok(kind) => kind,
+            Err(_) if label == "verified" => {
+                bail!("verified ref {reference} is missing locally")
+            }
+            Err(_) => {
+                bail!("fetched ref {reference} does not resolve to a complete Git object graph")
+            }
+        };
+        if kind != "tag" {
+            return Ok(RefTarget { oid: current, kind });
+        }
+        let body = git_text(repo, &["cat-file", "-p", &current])?;
+        let mut target = None;
+        let mut target_kind = None;
+        for line in body.lines().take_while(|line| !line.is_empty()) {
+            if let Some(value) = line.strip_prefix("object ") {
+                if target.is_some() {
+                    bail!("annotated tag {reference} has duplicate target objects")
+                }
+                target = Some(value);
+            } else if let Some(value) = line.strip_prefix("type ") {
+                if target_kind.is_some() {
+                    bail!("annotated tag {reference} has duplicate target types")
+                }
+                target_kind = Some(value);
+            }
+        }
+        let target = target.context("annotated tag is missing its target object")?;
+        let expected_kind = target_kind.context("annotated tag is missing its target type")?;
+        if cat_file_type(repo, target)? != expected_kind {
+            bail!("annotated tag {reference} has a mismatched target type")
+        }
+        current = target.to_owned();
+    }
+}
+
+fn cat_file_type(repo: &Path, object: &str) -> Result<String> {
+    git_text(repo, &["cat-file", "-t", object])
+}
+
+fn ensure_tree_connected(repo: &Path, reference: &str, tree: &str) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["ls-tree", "-r", "-t", "-z", "--full-tree", tree])
+        .output()?;
+    if !output.status.success() {
+        bail!("fetched tag {reference} contains an incomplete tree")
+    }
+    for entry in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
     {
-        bail!("fetched refs contain missing Git objects")
+        let header = entry
+            .split(|byte| *byte == b'\t')
+            .next()
+            .context("Git ls-tree returned a malformed entry")?;
+        let header = std::str::from_utf8(header)?;
+        let mut fields = header.split_ascii_whitespace();
+        let mode = fields
+            .next()
+            .context("Git ls-tree returned an entry without a mode")?;
+        let _kind = fields
+            .next()
+            .context("Git ls-tree returned an entry without an object type")?;
+        let object = fields
+            .next()
+            .context("Git ls-tree returned an entry without an object ID")?;
+        if mode == "160000" {
+            // A gitlink names a submodule commit that belongs to another
+            // object database and is not part of this tree's connectivity.
+            continue;
+        }
+        if cat_file_type(repo, object).is_err() {
+            bail!("fetched tag {reference} contains missing Git object {object}")
+        }
     }
     Ok(())
 }
@@ -272,4 +479,69 @@ fn git_text(repo: &Path, args: &[&str]) -> Result<String> {
         )
     }
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_complete_object_graph;
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn git(repo: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn complete_object_graph_rejects_shallow_and_promisor_repositories() {
+        let temporary = tempfile::tempdir().unwrap();
+        let full = temporary.path().join("full");
+        fs::create_dir_all(&full).unwrap();
+        let init = Command::new("git")
+            .args(["init", "--quiet", "--initial-branch=main"])
+            .arg(&full)
+            .output()
+            .unwrap();
+        assert!(init.status.success());
+        git(&full, &["config", "user.name", "Test"]);
+        git(&full, &["config", "user.email", "test@example.invalid"]);
+        for contents in ["first", "second"] {
+            fs::write(full.join("file"), contents).unwrap();
+            git(&full, &["add", "file"]);
+            git(&full, &["commit", "--quiet", "-m", contents]);
+        }
+        assert!(has_complete_object_graph(&full));
+
+        let shallow = temporary.path().join("shallow");
+        let source_url = format!("file://{}", full.display());
+        let clone = Command::new("git")
+            .args(["clone", "--quiet", "--depth=1", "--no-tags"])
+            .arg(source_url)
+            .arg(&shallow)
+            .output()
+            .unwrap();
+        assert!(
+            clone.status.success(),
+            "git clone: {}",
+            String::from_utf8_lossy(&clone.stderr)
+        );
+        assert!(!has_complete_object_graph(&shallow));
+
+        git(&full, &["config", "remote.origin.promisor", "true"]);
+        assert!(!has_complete_object_graph(&full));
+        git(&full, &["config", "--unset", "remote.origin.promisor"]);
+        git(&full, &["config", "extensions.partialClone", "origin"]);
+        assert!(!has_complete_object_graph(&full));
+    }
 }

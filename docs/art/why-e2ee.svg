@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 368" width="760" height="368" role="img" aria-labelledby="title desc">
+  <title id="title">An intruder breaks into the remote</title>
+  <desc id="desc">Left, a private repository: the remote stores readable files and the host's own key, so an intruder who breaks in reads everything. Right, git-remote-e2ee: the remote stores only locked boxes and the key stays on your laptop, so an intruder who breaks in gets nothing readable, and anything changed is rejected by your laptop. Icons from Tabler Icons (MIT).</desc>
+  <defs>
+    <symbol id="i-spy" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11h18" /> <path d="M5 11v-4a3 3 0 0 1 3 -3h8a3 3 0 0 1 3 3v4" /> <path d="M4 17a3 3 0 1 0 6 0a3 3 0 1 0 -6 0" /> <path d="M14 17a3 3 0 1 0 6 0a3 3 0 1 0 -6 0" /> <path d="M10 17h4" /></symbol>
+    <symbol id="i-lock" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 13a2 2 0 0 1 2 -2h10a2 2 0 0 1 2 2v6a2 2 0 0 1 -2 2h-10a2 2 0 0 1 -2 -2v-6" /> <path d="M11 16a1 1 0 1 0 2 0a1 1 0 0 0 -2 0" /> <path d="M8 11v-4a4 4 0 1 1 8 0v4" /></symbol>
+    <symbol id="i-doc" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3v4a1 1 0 0 0 1 1h4" /> <path d="M17 21h-10a2 2 0 0 1 -2 -2v-14a2 2 0 0 1 2 -2h7l5 5v11a2 2 0 0 1 -2 2" /> <path d="M9 9l1 0" /> <path d="M9 13l6 0" /> <path d="M9 17l6 0" /></symbol>
+    <symbol id="i-key" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16.555 3.843l3.602 3.602a2.877 2.877 0 0 1 0 4.069l-2.643 2.643a2.877 2.877 0 0 1 -4.069 0l-.301 -.301l-6.558 6.558a2 2 0 0 1 -1.239 .578l-.175 .008h-1.172a1 1 0 0 1 -.993 -.883l-.007 -.117v-1.172a2 2 0 0 1 .467 -1.284l.119 -.13l.414 -.414h2v-2h2v-2l2.144 -2.144l-.301 -.301a2.877 2.877 0 0 1 0 -4.069l2.643 -2.643a2.877 2.877 0 0 1 4.069 0" /> <path d="M15 9h.01" /></symbol>
+    <symbol id="i-laptop" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 19l18 0" /> <path d="M5 7a1 1 0 0 1 1 -1h12a1 1 0 0 1 1 1v8a1 1 0 0 1 -1 1h-12a1 1 0 0 1 -1 -1l0 -8" /></symbol>
+  </defs>
+  <style>
+    text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .h { font-size: 16px; font-weight: 600; fill: #1c1a17; }
+    .sub { font-size: 11.5px; fill: #6b645a; }
+    .bad { font-size: 14px; font-weight: 600; fill: #a4371b; }
+    .ok { font-size: 14px; font-weight: 600; fill: #2f6b3a; }
+    .note { font-size: 12px; fill: #3d3830; }
+  </style>
+  <rect x="0" y="0" width="760" height="368" rx="16" fill="#faf8f4"/>
+
+  <!-- Left: private repository -->
+  <text x="28" y="40" class="h">Private repository</text>
+  <use href="#i-laptop" x="26" y="114" width="76" height="76" stroke="#6b645a"/>
+  <text x="64" y="204" text-anchor="middle" class="sub">your laptop</text>
+  <line x1="108" y1="152" x2="134" y2="152" stroke="#8a8276" stroke-width="2"/>
+  <polygon points="134,146 145,152 134,158" fill="#8a8276"/>
+
+  <rect x="150" y="62" width="214" height="196" rx="12" fill="#fdf1ec" stroke="#e8c4b4" stroke-width="1.5"/>
+  <text x="164" y="84" class="sub">remote: host, storage, backups</text>
+  <use href="#i-doc" x="164" y="96" width="40" height="40" stroke="#a4371b"/>
+  <use href="#i-doc" x="206" y="96" width="40" height="40" stroke="#a4371b"/>
+  <use href="#i-doc" x="248" y="96" width="40" height="40" stroke="#a4371b"/>
+  <use href="#i-key" x="298" y="98" width="36" height="36" stroke="#b3542e"/>
+  <text x="316" y="148" text-anchor="middle" class="sub">host's key</text>
+  <use href="#i-spy" x="282" y="172" width="58" height="58" stroke="#2b2622"/>
+  <line x1="311" y1="282" x2="311" y2="236" stroke="#a4371b" stroke-width="2"/>
+  <polygon points="305,240 311,229 317,240" fill="#a4371b"/>
+  <text x="320" y="278" font-size="11" font-weight="600" fill="#a4371b">break-in</text>
+  <path d="M282 196 q-26 -10 -44 -32" fill="none" stroke="#a4371b" stroke-width="1.6" stroke-dasharray="4 3"/>
+  <polygon points="234,158 230,168 241,166" fill="#a4371b"/>
+
+  <text x="28" y="304" class="bad">An intruder reads everything.</text>
+  <text x="28" y="324" class="note">Encryption at rest does not help:</text>
+  <text x="28" y="342" class="note">the host's key sits right next to the data.</text>
+
+  <line x1="380" y1="28" x2="380" y2="344" stroke="#e4ded3"/>
+
+  <!-- Right: git-remote-e2ee -->
+  <text x="398" y="40" class="h">git-remote-e2ee</text>
+  <use href="#i-laptop" x="396" y="114" width="76" height="76" stroke="#6b645a"/>
+  <use href="#i-key" x="416" y="84" width="34" height="34" stroke="#2f6b3a"/>
+  <text x="434" y="204" text-anchor="middle" class="sub">your laptop + key</text>
+  <line x1="478" y1="152" x2="504" y2="152" stroke="#b3542e" stroke-width="2.5"/>
+  <polygon points="504,145 516,152 504,159" fill="#b3542e"/>
+
+  <rect x="520" y="62" width="214" height="196" rx="12" fill="#eef1f5" stroke="#d5dbe4" stroke-width="1.5"/>
+  <text x="534" y="84" class="sub">remote: host, storage, backups</text>
+  <use href="#i-lock" x="534" y="96" width="40" height="40" stroke="#5f6c80"/>
+  <use href="#i-lock" x="576" y="96" width="40" height="40" stroke="#5f6c80"/>
+  <use href="#i-lock" x="618" y="96" width="40" height="40" stroke="#5f6c80"/>
+  <use href="#i-lock" x="660" y="96" width="40" height="40" stroke="#5f6c80"/>
+  <use href="#i-spy" x="652" y="172" width="58" height="58" stroke="#2b2622"/>
+  <line x1="681" y1="282" x2="681" y2="236" stroke="#a4371b" stroke-width="2"/>
+  <polygon points="675,240 681,229 687,240" fill="#a4371b"/>
+  <text x="690" y="278" font-size="11" font-weight="600" fill="#a4371b">break-in</text>
+  <text x="638" y="212" text-anchor="end" font-size="24" font-weight="700" fill="#5f6c80">?</text>
+
+  <text x="398" y="304" class="ok">An intruder finds only locked boxes.</text>
+  <text x="398" y="324" class="note">The key never leaves your devices, and</text>
+  <text x="398" y="342" class="note">anything the intruder changes is rejected.</text>
+</svg>

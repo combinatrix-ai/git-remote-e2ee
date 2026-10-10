@@ -1,9 +1,9 @@
 # Protocol specification
 
 > [!WARNING]
-> This document specifies the experimental v4 format implemented by the current
-> prototype. The format is incompatible with v2 and v3. There is no automatic
-> migration; keep an independent plaintext copy and every device key.
+> This document specifies the experimental v5 format implemented by the current
+> prototype. The format is incompatible with v2, v3, and v4. There is no
+> automatic migration; keep an independent plaintext copy and every device key.
 
 ## 1. Requirements
 
@@ -20,9 +20,11 @@ It is designed to satisfy all of the following:
    key or plaintext.
 3. A publication never rewrites or retransmits historical Git packs.
 4. Pack ciphertext is stored once, independent of reader count. Only small key
-   envelopes scale with the active-reader set.
+   envelopes scale with the padded reader count; a policy transition also
+   carries its encrypted policy body.
 5. A newly admitted reader receives full history by default.
-6. Concurrent publications have exactly one visible winner.
+6. Concurrent publications have exactly one visible winner, provided storage
+   honors the compare-and-swap contract.
 
 The protocol provides confidentiality, authenticity, integrity, and continuity
 from state pinned by the same client. It does not provide global freshness or
@@ -43,20 +45,32 @@ prevent an authorized reader from exporting plaintext.
   subkey derived from `K_t`.
 - **Policy**: the signed device registry and role assignment.
 - **Manifest**: the signed generation transition, containing an encrypted body.
+- **Sealed header**: Kₜ-encrypted manifest metadata, including policy selection,
+  signer, transition type, pack count, envelope audit, and signature.
+- **Padded reader count**: the number of envelopes after padding to the next
+  power of two, with a minimum of four.
 - **Repository root**: the stable identity derived from the genesis owner's
   Ed25519 and HPKE public keys.
 - **Device ID**: a domain-separated digest of one device's two public keys.
 
 ## 3. Cryptographic construction
 
-The v4 format uses:
+The v5 format uses:
 
 - Ed25519 signatures;
 - X25519/HKDF-SHA-256/ChaCha20-Poly1305 HPKE Base mode;
-- HKDF-SHA-256 for object subkeys;
+- HKDF-SHA-256 for object subkeys, including a distinct sealed-header subkey;
 - XChaCha20-Poly1305 for manifest and predecessor-link encryption;
 - XChaCha20-Poly1305 STREAM with a big-endian 32-bit counter for packs;
 - SHA-256 for content IDs and generation-key commitments.
+
+The v5 domain strings are `git-remote-e2ee subkey derivation v5\0`,
+`git-remote-e2ee generation key commitment v5\0`,
+`git-remote-e2ee manifest v5\0`, and `git-remote-e2ee policy v5\0`.
+`sign_domain` signs `domain || SHA-256(exact_bytes)` with Ed25519. Symmetric
+XChaCha20-Poly1305 envelopes are encoded as
+`E2EES05\0 || nonce_24 || ciphertext`. Subkey kind values are
+`manifest-body=1`, `pack=2`, `predecessor-link=3`, and `sealed-header=4`.
 
 Every successful publisher samples `K_t` independently from the operating
 system CSPRNG. Repository content, commit IDs, previous keys, timestamps, or a
@@ -68,27 +82,38 @@ The publisher derives distinct subkeys using an injective, fixed-width context:
 ```text
 HKDF-SHA-256(
   input_key = K_t,
-  salt = protocol-specific v4 domain,
+  salt = protocol-specific v5 domain,
   info = repository_root || generation_u64_le || kind_u8 || ordinal_u64_le
 )
 ```
 
-The defined kinds are `manifest-body`, `pack`, and `predecessor-link`. A key is
-used for one logical message only. Manifest and predecessor-link envelopes each
-carry a fresh random 24-byte nonce. Pack streams carry a fresh random 19-byte
-nonce prefix; the STREAM counter and final-segment marker complete the nonce.
-Associated data binds the v4 domain, repository root, generation, object kind,
-ordinal or parent manifest ID as applicable, and the complete pack-stream
-header.
+The defined kinds are `manifest-body`, `pack`, `predecessor-link`, and
+`sealed-header`. A key is used for one logical message only. Manifest,
+predecessor-link, and sealed-header envelopes each carry a fresh random 24-byte
+nonce. Pack streams carry a fresh random 19-byte nonce prefix; the STREAM
+counter and final-segment marker complete the nonce. Associated data binds the
+v5 domain, repository root, generation, object kind, ordinal or parent manifest
+ID as applicable, and the complete pack-stream header. Sealed-header AAD is the
+exact plaintext header bytes.
 
-The signed header contains the full, untruncated commitment:
+The signed manifest header contains the full, untruncated commitment:
 
 ```text
-C_t = SHA-256("git-remote-e2ee generation key commitment v4" || K_t)
+C_t = SHA-256("git-remote-e2ee generation key commitment v5\0" || K_t)
 ```
 
-Commitments are compared in constant time before the corresponding key is used
-for AEAD decryption. XChaCha20-Poly1305 itself is not treated as key-committing.
+Generation envelopes use HPKE Base mode with info
+`git-remote-e2ee generation key v5`. Their AAD binds the repository root,
+format version, generation, `C_t`, and recipient device ID. The recipient ID
+and AAD are not transmitted. AAD encoding is the v5 envelope domain string,
+then a little-endian `u32` length and bytes for repository root, format version
+as little-endian `u32`, generation as little-endian `u64`, then a length and
+bytes for the ASCII `C_t` and ASCII recipient device ID. Each real envelope uses an independent random
+32-byte seed to initialize `rand_chacha` 0.9.0 `ChaCha20Rng`; this seeded RNG is
+passed to HPKE 0.13 `single_shot_seal`. The seed is recorded only in the sealed
+header audit. Commitments are compared in constant time before the corresponding
+key is used for AEAD decryption. XChaCha20-Poly1305 itself is not treated as
+key-committing.
 
 ## 4. Backward key chain
 
@@ -115,7 +140,7 @@ Consequences:
   compromise of a device private key that remains an active recipient.
 - A new reader given `K_t` can traverse to genesis and therefore always gets
   full history.
-- Future-only onboarding is not supported by v4 because the predecessor link is
+- Future-only onboarding is not supported by v5 because the predecessor link is
   available to every reader of the current generation.
 
 ## 5. Stored objects
@@ -125,25 +150,27 @@ stored bytes:
 
 ```text
 objects/<hash>       encrypted incremental Git packs
-manifests/<hash>     signed header plus inline encrypted delta body
-policies/<hash>      signed plaintext device registry and roles
+manifests/<hash>     plaintext discovery header plus encrypted sealed header and body
 HEAD                 opaque newest-manifest ID
 ```
 
 Private device keys and decrypted generation keys are never stored remotely or
-in client continuity pins.
+in client continuity pins. A policy is included in the encrypted body of the
+manifest that introduces it; there are no separate `policies/` objects.
 
-Policies and manifest headers are plaintext-structured to avoid a key-discovery
-cycle. This intentionally exposes reader count, repository-specific public
-keys, roles, policy changes, ciphertext size, and update timing. Inner refs,
-Git object IDs, paths, authors, messages, pack contents, generation keys, and
-predecessor-link plaintext remain encrypted.
+The plaintext manifest header contains only format version, repository root,
+generation, previous manifest ID, `C_t`, the anonymous padded envelope list, and
+digests for the encrypted body and sealed-header content. Policy data, device
+public keys and IDs, roles, signer, authorization type, pack count, audit, and
+signature are encrypted. Inner refs, Git object IDs, paths, authors, messages,
+pack contents, generation keys, and predecessor-link plaintext remain
+encrypted.
 
 ## 6. Policy
 
 A policy contains:
 
-- format version, repository root, generation, and previous policy ID;
+- format version 5, repository root, generation, and previous policy ID;
 - administrator threshold and signature array;
 - immutable historical device records with public keys, roles, and optional
   revocation generation.
@@ -157,41 +184,71 @@ Roles are:
 
 Every active writer and administrator MUST also be an active reader because a
 publisher needs the current generation key to construct the next predecessor
-link. A policy must retain at least one active reader and administrator.
+link. A policy must retain at least one active reader and administrator. The
+complete signed policy bytes are carried inside the encrypted manifest body
+that introduces them: genesis and each add, revoke, or rotate transition.
+Ordinary manifests do not repeat the policy; their sealed header names its
+policy ID and generation.
 
 Genesis has exactly one active owner with all three roles and is self-signed.
 Every child policy is signed by an administrator in its direct parent, never
-solely by authority introduced in the child. v4 supports threshold 1 and one
+solely by authority introduced in the child. v5 supports threshold 1 and one
 signature; other thresholds fail closed. A future M-of-N format must count
 distinct parent administrators under the parent's threshold.
 
 ## 7. Manifest
 
-### 7.1 Signed plaintext header
+### 7.1 Plaintext and sealed headers
 
-The header binds at least:
+The plaintext header contains only:
 
-- format version and repository root;
-- generation and exact previous manifest ID;
-- selected policy ID and policy generation;
-- cumulative pack count;
+- format version 5, repository root, generation, and exact previous manifest
+  ID;
 - `C_t`;
-- the complete, sorted generation-envelope list;
-- signer device ID and transition type.
+- the generation-envelope list, with no recipient IDs;
+- the SHA-256 digest of the encrypted body;
+- the SHA-256 digest of the sealed-header content without its signature.
 
-The Ed25519 signature covers the exact stored header bytes and the SHA-256
-digest of the exact encrypted body bytes. Verifiers never sign or verify a
+The envelope list length MUST be a power of two from 4 through 4096. Publishers
+wrap `K_t` once for each active reader, add indistinguishable dummy entries
+(each a genuine HPKE Base-mode seal of a fresh random 32-byte key, under a
+random AAD, to a freshly generated throwaway X25519 recipient; uniformly random
+bytes MUST NOT be used because a real encapsulated key is an X25519 public key
+with its top bit clear) until the list
+reaches the next power of two, with a minimum of four, then sort by raw
+encapsulated-key bytes. Encapsulated keys and ciphertexts MUST have their
+protocol-defined lengths. Duplicate or non-increasing encapsulated keys are
+invalid. If padding would exceed 4096 entries, publication fails.
+
+A reader tries its private key against each envelope in the current head until
+HPKE opens a 32-byte key matching `C_t`. This is the only trial-decryption pass;
+older keys come from predecessor links. If no envelope opens to a key matching
+`C_t`, the client MUST report that it is not an active reader of the current
+generation, which may mean revoked, never added, or a malformed envelope.
+
+The sealed header is encrypted under a `K_t`-derived `sealed-header` subkey.
+Its content contains policy ID and generation, signer device ID, transition
+type, cumulative pack count, and one audit entry per envelope. The entry is
+either `(recipient device ID, 32-byte encapsulation seed)` or a dummy marker.
+The sealed header also contains the Ed25519 signature. Every real entry's seed
+MUST be sampled freshly from the operating system CSPRNG and MUST NOT be reused.
+Audit entries correspond position-for-position to the sorted envelope list.
+
+The signature covers the exact plaintext header bytes, the exact sealed-header
+content bytes without the signature, and the encrypted body digest. The signed
+encoding length-prefixes each value. The encrypted body digest and sealed
+content digest MUST match their exact bytes. Verifiers MUST NOT verify a
 re-serialized interpretation.
 
-The envelope for one recipient uses HPKE AAD that binds the repository root,
-format, generation, policy ID, recipient device ID, and `C_t`. HPKE Base mode
-does not authenticate the sender by itself; sender authenticity comes from the
-manifest signature covering the complete envelope list.
-
-Every verifier MUST compare the envelope device-ID set with the selected
-policy's active-reader set. The relationship is bijective: no omissions,
-extras, or duplicates. A recipient unwraps its envelope and checks `C_t` before
-decrypting the body.
+After opening its own envelope, every verifier MUST validate the complete
+sealed audit. For each real entry it initializes `rand_chacha` 0.9.0
+`ChaCha20Rng` from the 32-byte seed, deterministically seals `K_t` to that
+device's HPKE public key using the v5 envelope AAD, and requires byte equality
+with the corresponding stored envelope. Real audit device IDs MUST equal the
+policy's active-reader set exactly: no missing, duplicate, extra, or revoked
+readers. Dummy entries MUST have no reader mapping. HPKE Base mode does not
+authenticate the sender itself; signer authorization and the signature provide
+that property.
 
 ### 7.2 Encrypted delta body
 
@@ -199,7 +256,14 @@ The body contains:
 
 - complete current inner refs;
 - only pack descriptors introduced by this generation;
-- exactly one predecessor-key link, except at genesis.
+- exactly one predecessor-key link, except at genesis;
+- the complete signed policy bytes when this manifest introduces a policy.
+
+Genesis and policy-transition manifests MUST contain exactly one introduced
+policy. Ordinary writer manifests MUST contain none. The policy ID in the
+sealed header is SHA-256 of the exact policy object bytes. Verifiers MUST check
+that the introduced policy matches this ID and validate its signature and
+direct-parent relationship before accepting the manifest.
 
 A pack descriptor contains ciphertext ID, plaintext size, creation generation,
 and a dense generation-local ordinal beginning at zero. Its subkey and AAD bind
@@ -214,7 +278,7 @@ historical descriptors, avoiding quadratic cumulative-inventory metadata.
 Each pack is encoded as:
 
 ```text
-"E2EEPK4\0" || chunk_size_u32_le || nonce_prefix_19 || segments...
+"E2EEPK5\0" || chunk_size_u32_le || nonce_prefix_19 || segments...
 ```
 
 `chunk_size` MUST equal 1,048,576 bytes. Every non-final plaintext segment is
@@ -229,8 +293,10 @@ bytes, and verify SHA-256 of the complete stored stream against the descriptor
 ID. A malformed header, size mismatch, counter overflow, short read, reordered
 or duplicated segment, authentication failure, trailing byte, or hash mismatch
 is fatal. Plaintext may stream into `git index-pack` before the final object hash
-is known, but no ref or continuity pin may move until all cryptographic,
-content-address, process, and Git-connectivity checks succeed.
+is known, but no imported-state pin or remote ref may move until all
+cryptographic, content-address, process, and Git-connectivity checks succeed.
+Listing an authenticated manifest does not advance the continuity floor. A
+publisher advances its own floor only after its compare-and-swap succeeds.
 
 Immutable writes MUST be staged within the storage backend and become visible
 under their ciphertext ID only after the complete streamed hash matches that
@@ -270,9 +336,12 @@ genesis policy, contains empty refs and no packs, and has no predecessor link.
    genesis.
 2. Enforce Git fast-forward rules locally unless force was explicit.
 3. Create only the incremental Git pack needed for the update.
-4. Sample `K_t`, derive the pack and body subkeys, and encrypt the new data.
+4. Sample `K_t`, derive the pack, body, and sealed-header subkeys, and encrypt
+   the new data.
 5. Encrypt the previous generation key under the predecessor-link subkey.
-6. HPKE-wrap `K_t` once to every active reader.
+6. HPKE-wrap `K_t` once to every active reader using a fresh audit seed, add
+   dummy envelopes sealed to throwaway recipients up to the padded count, sort by encapsulated-key bytes,
+   and put the corresponding audit entries in the sealed header.
 7. Upload the immutable pack and manifest.
 8. Compare-and-swap `HEAD` from the observed parent ID to the new manifest ID.
 
@@ -303,6 +372,23 @@ Rotation is one administrative transition that adds the replacement device and
 revokes the old record. Other users keep their device private keys. No pack is
 rewritten.
 
+### 8.5 Inner Git refs
+
+The remote helper advertises refs in `refs/heads/*` and `refs/tags/*`. All other
+namespaces MUST be rejected before publication. Branch refs MUST resolve to
+commits and retain the fast-forward check unless the writer explicitly forces
+the update. Lightweight and annotated tags MAY point to any Git object; their
+complete object graphs, including annotated tag objects, MUST be included in
+the encrypted pack and verified by receiving clients. An existing tag MUST
+remain unchanged unless the update is forced.
+
+Deleting an existing branch or tag publishes a signed writer manifest with the
+complete ref map minus that ref. A deletion introduces no pack and does not
+increase the cumulative pack count. The helper advertises `refs/heads/main` as
+the remote `HEAD` when present and MUST refuse to delete it while it is
+advertised as the default branch. Returning clones can remove stale local
+tracking refs with Git's `--prune` and `--prune-tags` fetch options.
+
 ## 9. Delta traversal and Git connectivity
 
 A fresh clone traverses manifest and key links from `HEAD` to genesis,
@@ -319,6 +405,87 @@ refs, pinning the new head, or publishing a successor. A signed ref advance
 whose required pack delta is absent is invalid even when every cryptographic
 check succeeds.
 
+Authenticating a manifest alone MUST NOT advance the continuity floor. A
+helper client's head, generation, repository root, and policy-generation floor
+advances only when the complete-ref connectivity check succeeds for that
+manifest's refs, either after pack import or, during listing, because every
+advertised ref is already connected locally; or after that client successfully
+publishes its own successor with compare-and-swap. A client MUST NOT rely on
+receiving a fetch command to pin a state, because Git omits it when no objects
+need to be transferred. A failed or incomplete
+import leaves the previous floor intact, so an authenticated but unusable
+publication cannot make a later valid successor look like rollback.
+
+Client-state updates for one repository and remote MUST serialize their
+read-modify-write operation across helper processes. The merge MUST preserve
+the greatest recorded manifest and policy generations and MUST reject a
+same-generation head-ID conflict. The durable state-file replacement remains
+atomic; the lock is held while an import or publication checks and advances
+the floor.
+
+A client MAY satisfy that requirement incrementally. After a successful full
+or incremental connectivity check, it records the exact checked ref tips as a
+verified frontier. On a later fetch it first requires every frontier tip to
+still exist locally, then walks the current tips while excluding objects
+reachable from the verified frontier. Content-addressed Git objects reachable
+from that frontier were already checked and cannot be changed in place, so an
+inductive check of only the newly reachable range establishes completeness of
+the new state. The frontier advances only after pack authentication, import,
+and the incremental connectivity check all succeed.
+
+A missing frontier in a v5 client state requires a full connectivity walk. A
+client state from another wire version is not accepted. The incremental rule assumes the trusted
+client's existing object database has not been corrupted outside this
+protocol; explicit full verification remains available to check local storage.
+
+### Explicit recovery
+
+`git-e2ee recover` MUST default to a read-only report. It MUST classify the
+observed storage head as valid, invalid, unverifiable, unsupported, unavailable,
+or discontinuous. Recovery publication is permitted only for an invalid head.
+Unverifiable, unsupported, unavailable, and discontinuous heads MUST never be
+overridden. In particular, a device that cannot open the current envelope
+MUST NOT recover from an older floor, because the head may be a valid
+revocation. A signer ID extracted before successful signature verification
+MUST be labelled as a claim, not as the signer.
+
+On carrier Git, discovery MUST inspect bounded outer history and MUST refuse
+to proceed if that history contains any merge commit: every legitimate
+publication is a single-parent fast-forward, and a merge can hide a legitimate
+state behind a non-first parent. Discovery MUST deduplicate manifest IDs and
+validate candidates against the authenticated policy and predecessor chain. The byte, outer-commit, candidate, and
+cryptographic-operation budgets MUST be fixed. Exhaustion MUST fail closed.
+Discovery MUST report authenticated descendants and replays. If authenticated
+descendants conflict, recovery MUST refuse to choose a fork. A replayed older
+manifest MUST NOT be treated as a newer candidate. Directory storage has no
+outer history and MUST offer only the pinned floor.
+
+The default base MUST be the newest validated descendant of the floor, or the
+floor when no descendant is available. Selecting an older offered base MUST
+require an explicit history-discard confirmation. Directory publication MUST
+require explicit acknowledgement that updates and revocations after the floor
+may be omitted and that subsequently published content may be disclosed to
+devices excluded by a newer policy.
+
+Before publication, the device MUST be an active writer under the selected
+base's policy. Recovery MUST publish a normal signed writer successor whose
+previous ID and generation are the selected base and its generation plus one,
+whose refs and policy are copied from that base, and whose predecessor link
+opens to the base key. It MUST compare-and-swap from the observed storage token
+while keeping that token separate from the selected manifest base. Required
+base-chain ciphertext MUST be available and checked against content IDs. A
+carrier publication MUST restore required historical ciphertext byte-for-byte,
+publish a child of the observed outer tip, and use a normal fast-forward push.
+Before publishing, the selected refs MUST resolve to complete local Git object
+graphs. A lost CAS MUST fail without a blind retry.
+
+Recovery MUST record invalid rejected heads as bounded diagnostic evidence
+separate from client continuity state. That evidence MUST NOT lower the floor
+or make an unverifiable or unavailable head ineligible for a later valid
+operation. A successful recovery advances the floor only after its own CAS
+succeeds. Recovery MUST NOT run from remote-helper `list` or `list for-push`,
+and an ordinary `git push` MUST NOT trigger it.
+
 Force pushes append a normal pack delta and new ref state. Older packs remain
 in historical manifests and may become unreachable in the inner Git graph.
 
@@ -326,7 +493,10 @@ in historical manifests and may become unreachable in the inner Git graph.
 
 The server does not inspect encrypted inner commit parents. Two writers read
 the same opaque `HEAD`, create immutable candidates, and attempt the same CAS.
-Exactly one wins.
+Against storage that honors the CAS contract, exactly one wins. Malicious or
+noncompliant storage can report outcomes inconsistently; that is outside the
+guarantees, and a noncooperating writer to directory storage can also cause an
+ABA change of the compared `HEAD` value.
 
 - Filesystem storage uses locking. `HEAD` is published by rename inside the
   storage root. Immutable objects are hard-linked from `.staging` into
@@ -343,9 +513,14 @@ Unreachable losing objects require later GC.
 
 ## 11. Continuity and invitations
 
-Returning clients pin at least repository root, manifest ID and generation,
-and policy ID and generation. They reject rollback, a non-descendant manifest,
-policy rollback/sideways movement, root substitution, and generation gaps.
+Returning clients pin repository root, manifest ID and generation, and policy
+generation. The policy ID is not stored separately: the pinned manifest ID
+binds it through the manifest's sealed header. Helper continuity pins advance
+only after the complete-ref connectivity check succeeds (after import, or
+during listing when the advertised refs are already connected locally) or
+after a successful own publication, never from authentication alone. They reject rollback, a non-descendant manifest, policy
+rollback/sideways movement, root substitution, and generation gaps. Local
+client-state updates are serialized and monotonic across concurrent helpers.
 
 A fresh device should receive an administrator-authorized invitation checkpoint
 through an authenticated channel containing:
@@ -368,18 +543,20 @@ prove global freshness; gossip or transparency anchoring is a separate layer.
 
 ## 12. Cost model
 
-Let `N` be active readers, `G` one small HPKE envelope, and `S` newly encrypted
-pack bytes.
+Let `N` be active readers, `P` the padded envelope count, `G` one small HPKE
+envelope, and `S` newly encrypted pack bytes. `P` is the next power of two at
+least `max(N, 4)`.
 
 | Operation | Upload delta | Remote storage delta |
 | --- | ---: | ---: |
-| Content push | `S + N*G + O(1)` | `S + N*G + O(1)` |
-| Add/revoke/rotate | `N*G + O(1)` | `N*G + O(1)` |
+| Content push | `S + P*G + O(1)` | `S + P*G + O(1)` |
+| Add/revoke/rotate | `P*G + O(policy size)` | `P*G + O(policy size)` |
 
 Large-content storage is `sum(pack ciphertext sizes)`, independent of `N`.
-Envelope metadata is still linear in readers per generation and accumulates as
-approximately `O(generations * readers * G)`. Fresh clone work is linear in
-manifest generations until checkpoint compaction exists.
+Envelope metadata is linear in the padded reader count per generation and
+accumulates as approximately `O(generations * P * G)`. A membership transition
+also carries the signed policy history inside its encrypted body. Fresh clone
+work is linear in manifest generations until checkpoint compaction exists.
 
 ## 13. Security limits
 
@@ -388,22 +565,24 @@ manifest generations until checkpoint compaction exists.
   pack. It exposes no later generation.
 - Compromise of an active device private key is stronger: the attacker can
   unwrap later generation keys while the device remains active.
-- Old immutable headers retain envelopes. Later device-key compromise can
-  retroactively expose every generation addressed to that device. v4 has no
+- Old immutable headers retain anonymous envelopes. Later device-key compromise
+  can retroactively expose every generation addressed to that device. v5 has no
   forward secrecy for stored history.
 - Full-history onboarding is mandatory; future-only access requires a new
   format or an explicit compartment.
-- Storage observes sizes, timing, generation count, reader count, public keys,
-  roles, and membership changes.
+- Storage observes padded reader count, object sizes, upload timing, generation
+  count, total growth, and opaque repository root. It does not directly observe
+  device public keys or IDs, roles, signer identity, or membership changes,
+  although size patterns may reveal a membership transition.
 - Storage can delete, freeze, or deny service.
 - Writers can author destructive Git history; force remains explicit.
 - Global rollback/equivocation detection requires an external anchor.
 
 ## 14. Migration and future work
 
-v4 is intentionally wire-incompatible with v2 and v3. Migration must occur on
-a trusted client able to decrypt the older repository and republish under a new
-v4 repository boundary. Automatic migration is not implemented. The local key
+v5 is intentionally wire-incompatible with v2, v3, and v4. Migration must occur
+on a trusted client able to decrypt the older repository and republish under a
+new v5 repository boundary. Automatic migration is not implemented. The local key
 file remains format 3 because its stable repository/device identity material did
 not change; manifest, policy, signature, KDF, HPKE, and AEAD domains changed and
 therefore fail closed across wire versions.
@@ -413,6 +592,5 @@ Planned extensions:
 1. checkpoint/compaction and garbage collection with explicit authority;
 2. M-of-N administrator authorization and recovery;
 3. automatic stale-push retry with explicit merge behavior;
-4. persistent partial-clone carrier cache;
-5. S3 backend with conditional-write compatibility tests;
-6. optional gossip or transparency-log anchoring.
+4. S3 backend with conditional-write compatibility tests;
+5. optional gossip or transparency-log anchoring.
