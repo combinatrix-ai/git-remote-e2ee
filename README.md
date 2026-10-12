@@ -97,16 +97,16 @@ atomically moves one opaque `HEAD` pointer.
 ### At a glance
 
 Godot repository (867 MiB of history), a local bare repository as the Git
-host, Apple M1 Pro, median of three runs. Full results in
-[Performance](#performance).
+host, Apple M1 Pro, median of three runs. Bold marks where `git-remote-e2ee`
+beats `git-remote-gcrypt`. Full results in [Performance](#performance).
 
 | | Plain Git | `git-remote-gcrypt` | `git-remote-e2ee` |
 |---|---:|---:|---:|
-| Initial push | 28.4 s | 36.6 s | 22.9 s |
-| Fresh fetch | 27.7 s | 55.0 s | 40.0 s |
-| Tiny push | 0.08 s | 6.5 s | 0.97 s |
-| Tiny update (fetch) | 0.07 s | 22.6 s | 0.77 s |
-| Data sent per tiny push | 4.5 KB | 921 MB | 8.9 KB |
+| Initial push | 28.4 s | 36.6 s | **22.9 s** |
+| Fresh fetch | 27.7 s | 55.0 s | **40.0 s** |
+| Tiny push | 0.08 s | 6.5 s | **0.97 s** |
+| Tiny update (fetch) | 0.07 s | 22.6 s | **0.77 s** |
+| Data sent per tiny push | 4.5 KB | 921 MB | **8.9 KB** |
 
 ## Quick start
 
@@ -296,19 +296,20 @@ or another Git host is the storage.
 Measured on the Godot repository (867 MiB of history), with a local bare
 repository standing in for the Git host, on an Apple M1 Pro with 32 GiB RAM.
 Median of three runs; tiny rows are a one-line change, repeated five times.
+Bold marks where `git-remote-e2ee` beats `git-remote-gcrypt`.
 
 | | Plain Git | `git-remote-gcrypt` | `git-remote-e2ee` |
 |---|---:|---:|---:|
-| Initial encryption (to a local directory) | 28.6 s | 11.0 s | 8.1 s |
-| Initial push | 28.4 s | 36.6 s | 22.9 s |
-| Fresh fetch | 27.7 s | 55.0 s | 40.0 s |
+| Initial encryption (to a local directory) | 28.6 s | 11.0 s | **8.1 s** |
+| Initial push | 28.4 s | 36.6 s | **22.9 s** |
+| Fresh fetch | 27.7 s | 55.0 s | **40.0 s** |
 | Tiny commit | 0.09 s | 0.09 s | 0.09 s |
-| Tiny push | 0.08 s | 6.5 s | 0.97 s |
-| Tiny update (fetch) | 0.07 s | 22.6 s | 0.77 s |
-| Data sent per tiny push | 4.5 KB | 921 MB | 8.9 KB |
+| Tiny push | 0.08 s | 6.5 s | **0.97 s** |
+| Tiny update (fetch) | 0.07 s | 22.6 s | **0.77 s** |
+| Data sent per tiny push | 4.5 KB | 921 MB | **8.9 KB** |
 | Peak memory, initial push | 1.27 GiB | 0.98 GiB | 1.27 GiB |
-| Peak memory, tiny push | 37 MiB | 887 MiB | 9 MiB |
-| Remote size after five tiny pushes | 891 MiB | 5,272 MiB | 878 MiB |
+| Peak memory, tiny push | 37 MiB | 887 MiB | **9 MiB** |
+| Remote size after five tiny pushes | 891 MiB | 5,272 MiB | **878 MiB** |
 | Client disk after fresh fetch (`.git` plus cache) | 891 MiB | 1,780 MiB | 1,779 MiB |
 
 With a Git backend, gcrypt sends the whole encrypted history again on every
