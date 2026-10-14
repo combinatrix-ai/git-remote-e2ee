@@ -143,6 +143,56 @@ fn copy_tree(source: &Path, destination: &Path) {
 }
 
 #[test]
+fn shallow_push_is_rejected_before_publication_and_unshallow_recovers() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let shallow = temporary.path().join("shallow");
+    let destination = temporary.path().join("destination");
+    let storage = temporary.path().join("encrypted");
+    initialize_git(&source);
+    let first = commit(&source, "first\n", "first");
+    let second = commit(&source, "second\n", "second");
+    git(
+        temporary.path(),
+        &[
+            "clone",
+            "--quiet",
+            "--depth=1",
+            &format!("file://{}", source.display()),
+            shallow.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        git(&shallow, &["rev-parse", "--is-shallow-repository"]),
+        "true"
+    );
+    let key = KeyFile::generate();
+    let encrypted = EncryptedRepository::new(FilesystemStorage::new(&storage), key);
+    encrypted.initialize().unwrap();
+    let head_before = fs::read(storage.join("HEAD")).unwrap();
+    let error = encrypted
+        .push_ref(&shallow, "refs/heads/main", false)
+        .unwrap_err();
+    assert!(error.to_string().contains("shallow"), "{error:#}");
+    assert_eq!(fs::read(storage.join("HEAD")).unwrap(), head_before);
+    assert!(encrypted.verify().unwrap().refs.is_empty());
+    git(&shallow, &["fetch", "--unshallow"]);
+    encrypted
+        .push_ref(&shallow, "refs/heads/main", false)
+        .unwrap();
+    initialize_git(&destination);
+    encrypted.fetch_into(&destination, "encrypted").unwrap();
+    assert_eq!(
+        git(&destination, &["rev-parse", "refs/remotes/encrypted/main"]),
+        second
+    );
+    assert_eq!(
+        git(&destination, &["rev-parse", "refs/remotes/encrypted/main^"]),
+        first
+    );
+}
+
+#[test]
 fn pushes_incrementally_and_fetches_into_another_repository() {
     let temporary = tempfile::tempdir().unwrap();
     let source = temporary.path().join("source");
@@ -501,54 +551,6 @@ fn local_publication_advances_verified_frontier_before_observation() {
     assert_eq!(
         client_state(&source, "origin")["verified_refs"]["refs/heads/main"],
         second
-    );
-}
-
-#[test]
-fn shallow_publication_does_not_advance_verified_frontier() {
-    let temporary = tempfile::tempdir().unwrap();
-    let full_source = temporary.path().join("full-source");
-    let shallow_source = temporary.path().join("shallow-source");
-    let remote = temporary.path().join("remote");
-    initialize_git(&full_source);
-    commit(&full_source, "first\n", "first");
-    commit(&full_source, "second\n", "second");
-
-    let source_url = format!("file://{}", full_source.display());
-    let clone = Command::new("git")
-        .args(["clone", "--quiet", "--depth=1", "--no-tags"])
-        .arg(&source_url)
-        .arg(&shallow_source)
-        .output()
-        .unwrap();
-    assert!(
-        clone.status.success(),
-        "git clone: {}",
-        String::from_utf8_lossy(&clone.stderr)
-    );
-    assert_eq!(
-        git(&shallow_source, &["rev-parse", "--is-shallow-repository"]),
-        "true"
-    );
-
-    let key = KeyFile::generate();
-    let repository = EncryptedRepository::new(FilesystemStorage::new(&remote), key);
-    repository.initialize().unwrap();
-    repository
-        .push_update_for_remote(
-            &shallow_source,
-            "origin",
-            "refs/heads/main",
-            "refs/heads/main",
-            false,
-        )
-        .unwrap();
-
-    assert!(
-        client_state(&shallow_source, "origin")["verified_refs"]
-            .as_object()
-            .unwrap()
-            .is_empty()
     );
 }
 

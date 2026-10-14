@@ -244,8 +244,10 @@ your local remote-tracking refs.
 - Recovery discovery has fixed limits of 2,048 carrier commits, 256 distinct
   heads, 64 MiB of manifest data, and 1,000,000 estimated cryptographic
   operations. It fails closed if any limit is exhausted.
-- Shallow and partial clones are not supported. A fresh clone downloads and
-  verifies the complete history.
+- Shallow and partial clones are not supported. Pushing from a shallow
+  repository is refused before anything is published; run
+  `git fetch --unshallow` first. A fresh clone downloads and verifies the
+  complete history.
 
 ## Storage contract
 
