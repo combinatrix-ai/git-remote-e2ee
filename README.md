@@ -55,7 +55,7 @@ encrypted whole repositories with GnuPG for years. `git-remote-e2ee` hides the
 whole repository like gcrypt, and fixes what makes that painful to live with:
 
 <p align="center">
-  <img src="docs/art/pillars.svg" alt="Fast: a one-line push sends 4.5 KB with plain Git, 921 MB with gcrypt, and 8.9 KB with git-remote-e2ee. Safe: when two devices push at once, one wins and the other is rejected. No master key: every push gets a fresh key for each device, and a revoked device gets none for later pushes." width="860" />
+  <img src="docs/art/pillars.svg" alt="Fast: a one-line push sends 4.5 KB with plain Git, 921 MB with gcrypt, and 8.9 KB with git-remote-e2ee; bar charts compare push, fetch, and memory on the Godot repository. Safe: when two devices push at once, one wins and the other is rejected. No master key: every push gets a fresh key for each device, and a revoked device gets none for later pushes." width="860" />
 </p>
 
 - **Fast: pushes upload only what changed.** A one-line change sends about
