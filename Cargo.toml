@@ -26,7 +26,7 @@ clap = { version = "4.5", features = ["derive"] }
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 fs2 = "0.4"
 hex = "0.4"
-hpke = { version = "0.13", features = ["x25519"] }
+hpke = { version = "0.13", default-features = false, features = ["alloc", "x25519"] }
 hkdf = "0.12"
 rand = "0.8"
 rand_09 = { package = "rand", version = "0.9", features = ["os_rng", "std_rng"], default-features = false }
