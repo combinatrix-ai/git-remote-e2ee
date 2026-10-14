@@ -60,8 +60,8 @@ whole repository like gcrypt, and fixes what makes that painful to live with:
 
 - **Fast: pushes upload only what changed.** A one-line change sends about
   9 KB. With a Git or SFTP backend such as GitHub, gcrypt re-uploads the entire
-  encrypted history on every push, so the remote grows by about the repository
-  size each time. Plain Git is still faster on small operations, because an
+  encrypted history on every push: it publishes each state as a new parentless
+  commit, so Git cannot skip the packs the host already has. Plain Git is still faster on small operations, because an
   encrypted remote has to verify and decrypt on the client, and the client
   keeps a local cache of the encrypted carrier, which roughly doubles disk use.
   [docs/benchmarks.md](docs/benchmarks.md) has every measurement, the method,
