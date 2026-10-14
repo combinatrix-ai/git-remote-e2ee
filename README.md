@@ -54,10 +54,18 @@ Encrypting Git is not new. File-level tools such as
 encrypted whole repositories with GnuPG for years. `git-remote-e2ee` hides the
 whole repository like gcrypt, and fixes what makes that painful to live with:
 
+<p align="center">
+  <img src="docs/art/pillars.svg" alt="Fast: a one-line push sends 4.5 KB with plain Git, 921 MB with gcrypt, and 8.9 KB with git-remote-e2ee. Safe: when two devices push at once, one wins and the other is rejected. No master key: every push gets a fresh key for each device, and a revoked device gets none for later pushes." width="860" />
+</p>
+
 - **Fast: pushes upload only what changed.** A one-line change sends about
-  9 KB on every backend. With a Git or SFTP backend such as GitHub, gcrypt
-  re-uploads the entire encrypted history on every push: 921 MB for the same
-  change in the [benchmark](#performance).
+  9 KB. With a Git or SFTP backend such as GitHub, gcrypt re-uploads the entire
+  encrypted history on every push, so the remote grows by about the repository
+  size each time. Plain Git is still faster on small operations, because an
+  encrypted remote has to verify and decrypt on the client, and the client
+  keeps a local cache of the encrypted carrier, which roughly doubles disk use.
+  [docs/benchmarks.md](docs/benchmarks.md) has every measurement, the method,
+  and `scripts/reproduce-benchmark.sh` to rerun it.
 - **Safe: no silent force pushes.** Fast-forward checks run on the client, and
   the storage moves `HEAD` only by compare-and-swap. When two people push at
   once, one wins and the other gets an ordinary rejection. With gcrypt every
@@ -165,48 +173,6 @@ separately, for example with branch protection on GitHub.
 
 [docs/security-model.md](docs/security-model.md) lists the exact guarantees and
 limits. [SECURITY.md](SECURITY.md) explains how to report an issue.
-
-## Performance
-
-Committing is ordinary Git: encryption happens only when you push or fetch.
-Small pushes and fetches upload or download only the change, even when GitHub
-or another Git host is the storage.
-
-Measured on the Godot repository (867 MiB of history), with a local bare
-repository standing in for the Git host, on an Apple M1 Pro with 32 GiB RAM.
-Median of three runs; tiny rows are a one-line change, repeated five times.
-Bold marks where `git-remote-e2ee` beats `git-remote-gcrypt`.
-
-| | Plain Git | `git-remote-gcrypt` | `git-remote-e2ee` |
-|---|---:|---:|---:|
-| Initial encryption (to a local directory) | 28.6 s | 11.0 s | **8.1 s** |
-| Initial push | 28.4 s | 36.6 s | **22.9 s** |
-| Fresh fetch | 27.7 s | 55.0 s | **40.0 s** |
-| Tiny commit | 0.09 s | 0.09 s | 0.09 s |
-| Tiny push | 0.08 s | 6.5 s | **0.97 s** |
-| Tiny update (fetch) | 0.07 s | 22.6 s | **0.77 s** |
-| Data sent per tiny push | 4.5 KB | 921 MB | **8.9 KB** |
-| Peak memory, initial push | 1.27 GiB | 0.98 GiB | 1.27 GiB |
-| Peak memory, tiny push | 37 MiB | 887 MiB | **9 MiB** |
-| Remote size after five tiny pushes | 891 MiB | 5,272 MiB | **878 MiB** |
-| Client disk after fresh fetch (`.git` plus cache) | 891 MiB | 1,780 MiB | 1,779 MiB |
-
-With a Git backend, gcrypt sends the whole encrypted history again on every
-push, so the remote grows by about the repository size each time.
-`git-remote-e2ee` sends the new pack plus a few KB of metadata. On the client,
-`git-remote-e2ee` keeps a local cache of the encrypted carrier next to your
-repository, which roughly doubles disk use, the same as gcrypt's local copy.
-Peak memory for full transfers is dominated by Git's own pack generation. Plain Git
-stays faster on small operations because a Git server understands the
-repository; an encrypted remote has to verify and decrypt on the client. These
-are local measurements without network latency.
-
-To reproduce these numbers, run `scripts/reproduce-benchmark.sh` from a clone
-of this repository on macOS or Linux. It fetches the pinned inputs (about
-1 GB), runs three rounds, and writes this table plus raw data and environment
-details to `bench-results/`. Expect a few hours and about 12 GB of free disk.
-[docs/benchmarks.md](docs/benchmarks.md) has the method, a Linux aarch64
-cross-check, per-push series, phase breakdown, and caveats.
 
 ## FAQ
 
