@@ -238,6 +238,14 @@ fn carrier_git_supports_native_push_and_clone_without_plaintext() {
         false,
     );
     git(&source, &["push", "private", "main"], true);
+    assert_eq!(
+        git(
+            &carrier,
+            &["show", "refs/heads/git-remote-e2ee:.gitattributes"],
+            false,
+        ),
+        "e2ee/** -delta"
+    );
 
     let mut clone_command = Command::new("git");
     clone_command
@@ -476,9 +484,10 @@ fn carrier_cache_fetches_only_new_objects() {
     drop(cached);
     let remote_after = reachable_object_count(&carrier);
     assert!(remote_after > remote_before);
+    let after_push = reachable_object_count(&cache);
+    assert_eq!(after_push, remote_after);
 
     let updated = GitStorage::open(carrier.to_str().unwrap()).unwrap();
-    let after_push = reachable_object_count(&cache);
     assert_eq!(after_push - before_push, remote_after - remote_before);
     assert_eq!(after_push, remote_after);
     drop(updated);

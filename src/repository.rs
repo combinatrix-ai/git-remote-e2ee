@@ -22,6 +22,7 @@ use crate::manifest::{
 };
 use crate::policy::{DeviceRecord, DeviceRoles, PolicyState};
 use crate::storage::{HeadObservation, ObjectKind, Storage};
+use crate::trace;
 
 const MAX_RECOVERY_OUTER_COMMITS: usize = 2048;
 const MAX_RECOVERY_CANDIDATES: usize = 256;
@@ -436,6 +437,7 @@ impl<S: Storage> EncryptedRepository<S> {
                 SubkeyKind::Pack,
                 ordinal,
             )?;
+            let pack_timer = trace::Span::new("inner_pack_encrypt_and_store");
             let mut pack_source = git::start_incremental_pack(repo, &pack_refs, &exclusions)?;
             let mut pack_stage = self.storage.begin_object(ObjectKind::Pack)?;
             let sealed = seal_pack_stream(
@@ -445,7 +447,10 @@ impl<S: Storage> EncryptedRepository<S> {
                 &pack_aad(&current.manifest.repository_root, generation, ordinal),
             )?;
             pack_source.finish()?;
+            let stage_finish_timer = trace::Span::new("inner_pack_stage_finish");
             pack_stage.finish(&sealed.object_id)?;
+            drop(stage_finish_timer);
+            drop(pack_timer);
             new_packs.push(PackDescriptor {
                 id: sealed.object_id,
                 plaintext_size: sealed.plaintext_size,
@@ -484,7 +489,12 @@ impl<S: Storage> EncryptedRepository<S> {
             next.clone(),
         )?;
         if let Some(state_path) = state_path.as_deref() {
-            self.pin_manifest_locked(state_path, &next_id, &next)?;
+            self.pin_manifest_locked(
+                state_path,
+                &next_id,
+                &next,
+                Some((repo, &current.manifest.refs)),
+            )?;
         }
         Ok(next_id)
     }
@@ -702,6 +712,7 @@ impl<S: Storage> EncryptedRepository<S> {
                     descriptor.ordinal,
                 )?;
                 let mut importer = git::start_pack_import(repo)?;
+                let decrypt_timer = trace::Span::new("pack_decrypt_to_index_pack");
                 open_pack_stream(
                     &pack_key,
                     encrypted,
@@ -714,11 +725,14 @@ impl<S: Storage> EncryptedRepository<S> {
                     descriptor.plaintext_size,
                     &descriptor.id,
                 )?;
+                drop(decrypt_timer);
                 importer.finish()?;
                 imported.insert(descriptor.id.clone());
             }
         }
+        let connectivity_timer = trace::Span::new("inner_ref_connectivity_check");
         git::ensure_refs_connected_since(repo, &current.manifest.refs, &state.verified_refs)?;
+        drop(connectivity_timer);
         write_client_state_locked(
             state_path,
             &imported,
@@ -739,8 +753,18 @@ impl<S: Storage> EncryptedRepository<S> {
         state_path: &Path,
         head_id: &str,
         manifest: &Manifest,
+        published_from: Option<(&Path, &BTreeMap<String, String>)>,
     ) -> Result<()> {
-        let state = read_client_state(state_path)?;
+        let mut state = read_client_state(state_path)?;
+        if let Some((repo, previous_refs)) = published_from
+            && state.verified_refs == *previous_refs
+            && git::has_complete_object_graph(repo)
+        {
+            // The completed local pack walk covers new reachability only beyond
+            // refs already verified by this client. Shallow and promisor repos
+            // can omit history, so they must not advance this frontier.
+            state.verified_refs = manifest.refs.clone();
+        }
         write_published_client_state_locked(state_path, state, head_id, manifest)
     }
 
@@ -1283,7 +1307,7 @@ impl<S: Storage> EncryptedRepository<S> {
             ManifestAuthorization::Writer,
             next.clone(),
         )?;
-        self.pin_manifest_locked(&state_path, &recovered_id, &next)?;
+        self.pin_manifest_locked(&state_path, &recovered_id, &next, None)?;
         report.published_manifest = Some(recovered_id);
         report.blocked_reason = None;
         Ok(report)
@@ -1397,6 +1421,7 @@ impl<S: Storage> EncryptedRepository<S> {
     }
 
     fn current_chain(&self) -> Result<Vec<OpenedState>> {
+        let _timer = trace::Span::new("manifest_chain_authentication");
         let head = self
             .storage
             .read_head()?
@@ -1550,6 +1575,7 @@ impl<S: Storage> EncryptedRepository<S> {
         authorization: ManifestAuthorization,
         manifest: Manifest,
     ) -> Result<String> {
+        let manifest_timer = trace::Span::new("manifest_seal_and_self_verify");
         match head.previous {
             Some(previous) => {
                 manifest.validate_successor(&previous.id, &previous.manifest, policy)?
@@ -1579,6 +1605,8 @@ impl<S: Storage> EncryptedRepository<S> {
         if opened.header.generation != manifest.generation {
             bail!("new manifest self-check changed generation")
         }
+        drop(manifest_timer);
+        let cas_timer = trace::Span::new("manifest_compare_and_swap_publish");
         if let Some(observation) = head.observation {
             self.storage
                 .compare_and_swap_observed_head(observation, &id)?;
@@ -1586,6 +1614,7 @@ impl<S: Storage> EncryptedRepository<S> {
             self.storage
                 .compare_and_swap_head(head.previous.map(|state| state.id.as_str()), &id)?;
         }
+        drop(cas_timer);
         Ok(id)
     }
 }

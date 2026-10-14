@@ -427,6 +427,131 @@ fn missing_verified_frontier_tip_fails_closed() {
     assert!(error.contains("verified ref refs/heads/main is missing locally"));
 }
 
+#[test]
+fn local_publication_advances_verified_frontier_before_observation() {
+    const CHILD_ENV: &str = "E2EE_TEST_FRONTIER_TRACE_CHILD";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "local_publication_advances_verified_frontier_before_observation",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .env("GIT_REMOTE_E2EE_TRACE", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "frontier trace child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let trace = String::from_utf8_lossy(&output.stderr);
+        let counters: Vec<_> = trace
+            .lines()
+            .filter(|line| line.contains("count=git_ref_connectivity_walk_objects"))
+            .collect();
+        assert_eq!(counters.len(), 1, "expected one connectivity walk: {trace}");
+        assert!(
+            counters[0].ends_with("value=0"),
+            "the observation re-walked published history: {}",
+            counters[0]
+        );
+        return;
+    }
+
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let remote = temporary.path().join("remote");
+    initialize_git(&source);
+
+    let key = KeyFile::generate();
+    let repository = EncryptedRepository::new(FilesystemStorage::new(&remote), key);
+    repository.initialize().unwrap();
+
+    let first = commit(&source, "first\n", "first");
+    repository
+        .push_update_for_remote(
+            &source,
+            "origin",
+            "refs/heads/main",
+            "refs/heads/main",
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        client_state(&source, "origin")["verified_refs"]["refs/heads/main"],
+        first
+    );
+
+    let observed = repository.observe_manifest(&source, "origin").unwrap();
+    assert_eq!(observed.refs.get("refs/heads/main"), Some(&first));
+
+    let second = commit(&source, "second\n", "second");
+    repository
+        .push_update_for_remote(
+            &source,
+            "origin",
+            "refs/heads/main",
+            "refs/heads/main",
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        client_state(&source, "origin")["verified_refs"]["refs/heads/main"],
+        second
+    );
+}
+
+#[test]
+fn shallow_publication_does_not_advance_verified_frontier() {
+    let temporary = tempfile::tempdir().unwrap();
+    let full_source = temporary.path().join("full-source");
+    let shallow_source = temporary.path().join("shallow-source");
+    let remote = temporary.path().join("remote");
+    initialize_git(&full_source);
+    commit(&full_source, "first\n", "first");
+    commit(&full_source, "second\n", "second");
+
+    let source_url = format!("file://{}", full_source.display());
+    let clone = Command::new("git")
+        .args(["clone", "--quiet", "--depth=1", "--no-tags"])
+        .arg(&source_url)
+        .arg(&shallow_source)
+        .output()
+        .unwrap();
+    assert!(
+        clone.status.success(),
+        "git clone: {}",
+        String::from_utf8_lossy(&clone.stderr)
+    );
+    assert_eq!(
+        git(&shallow_source, &["rev-parse", "--is-shallow-repository"]),
+        "true"
+    );
+
+    let key = KeyFile::generate();
+    let repository = EncryptedRepository::new(FilesystemStorage::new(&remote), key);
+    repository.initialize().unwrap();
+    repository
+        .push_update_for_remote(
+            &shallow_source,
+            "origin",
+            "refs/heads/main",
+            "refs/heads/main",
+            false,
+        )
+        .unwrap();
+
+    assert!(
+        client_state(&shallow_source, "origin")["verified_refs"]
+            .as_object()
+            .unwrap()
+            .is_empty()
+    );
+}
+
 fn read_stored_object(root: &Path, kind: &str, id: &str) -> Vec<u8> {
     fs::read(root.join(kind).join(&id[..2]).join(id)).unwrap()
 }
