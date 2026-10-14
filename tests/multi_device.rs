@@ -341,6 +341,49 @@ fn non_admin_device_cannot_change_policy() {
     );
 }
 
+#[test]
+fn read_only_device_cannot_add_or_revoke_devices() {
+    let temp = tempfile::tempdir().unwrap();
+    let remote = temp.path().join("remote");
+    let owner_key = KeyFile::generate();
+    let reader_key = KeyFile::generate_for_repository(owner_key.repository_root.clone()).unwrap();
+    let candidate_key =
+        KeyFile::generate_for_repository(owner_key.repository_root.clone()).unwrap();
+    let admin_pin = temp.path().join("owner-admin-state.json");
+    let owner = EncryptedRepository::new(FilesystemStorage::new(&remote), owner_key);
+    owner.initialize().unwrap();
+    owner.pin_admin_state(&admin_pin).unwrap();
+    owner
+        .add_device(
+            reader_key.public_device().unwrap(),
+            DeviceRoles::reader(),
+            &admin_pin,
+        )
+        .unwrap();
+
+    let reader = EncryptedRepository::new(FilesystemStorage::new(&remote), reader_key.clone());
+    let before = snapshot_files(&remote);
+    assert!(
+        reader
+            .add_device(
+                candidate_key.public_device().unwrap(),
+                DeviceRoles::collaborator(),
+                &admin_pin,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("not an active administrator")
+    );
+    assert!(
+        reader
+            .revoke_device(&reader_key.device_id().unwrap(), &admin_pin)
+            .unwrap_err()
+            .to_string()
+            .contains("not an active administrator")
+    );
+    assert_eq!(snapshot_files(&remote), before);
+}
+
 fn copy_directory(source: &Path, destination: &Path) {
     fs::create_dir_all(destination).unwrap();
     for entry in fs::read_dir(source).unwrap() {
