@@ -55,6 +55,7 @@ fn run_protocol<S: Storage>(repository: EncryptedRepository<S>, remote_name: Str
                 writeln!(output, "push")?;
                 writeln!(output, "option")?;
                 writeln!(output, "refspec refs/heads/*:refs/remotes/{remote_name}/*")?;
+                writeln!(output, "refspec refs/tags/*:refs/tags/*")?;
                 writeln!(output)?;
                 output.flush()?;
             }
@@ -144,11 +145,13 @@ fn process_push_batch<S: git_remote_e2ee::storage::Storage>(
         let (source, destination) = spec
             .split_once(':')
             .context("push refspec must contain ':'")?;
-        if source.is_empty() {
-            writeln!(output, "error {destination} ref deletion is not supported")?;
-            continue;
-        }
-        let result = if dry_run {
+        let result = if source.is_empty() && dry_run {
+            repository
+                .validate_delete_ref_for_remote(local_repository, remote_name, destination)
+                .map(|_| String::new())
+        } else if source.is_empty() {
+            repository.delete_ref_for_remote(local_repository, remote_name, destination)
+        } else if dry_run {
             repository
                 .validate_push_update_for_remote(
                     local_repository,

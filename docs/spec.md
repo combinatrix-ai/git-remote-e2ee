@@ -369,6 +369,23 @@ Rotation is one administrative transition that adds the replacement device and
 revokes the old record. Other users keep their device private keys. No pack is
 rewritten.
 
+### 8.5 Inner Git refs
+
+The remote helper advertises refs in `refs/heads/*` and `refs/tags/*`. All other
+namespaces MUST be rejected before publication. Branch refs MUST resolve to
+commits and retain the fast-forward check unless the writer explicitly forces
+the update. Lightweight and annotated tags MAY point to any Git object; their
+complete object graphs, including annotated tag objects, MUST be included in
+the encrypted pack and verified by receiving clients. An existing tag MUST
+remain unchanged unless the update is forced.
+
+Deleting an existing branch or tag publishes a signed writer manifest with the
+complete ref map minus that ref. A deletion introduces no pack and does not
+increase the cumulative pack count. The helper advertises `refs/heads/main` as
+the remote `HEAD` when present and MUST refuse to delete it while it is
+advertised as the default branch. Returning clones can remove stale local
+tracking refs with Git's `--prune` and `--prune-tags` fetch options.
+
 ## 9. Delta traversal and Git connectivity
 
 A fresh clone traverses manifest and key links from `HEAD` to genesis,
