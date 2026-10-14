@@ -510,11 +510,6 @@ format_sent_bytes() {
   if [[ -z $1 || $1 == - ]]; then printf '—'; else awk -v n="$1" 'BEGIN { if (n >= 1000000) printf "%.0f MB", n / 1000000; else printf "%.1f KB", n / 1000 }'; fi
 }
 
-if [[ $e2ee_only == 1 ]]; then
-  common_pushes=$tiny_commits
-else
-  common_pushes=$gcrypt_tiny_commits
-fi
 summary_file="$results_dir/summary.md"
 {
   printf '# Benchmark summary\n\n'
@@ -557,21 +552,10 @@ summary_file="$results_dir/summary.md"
     "$(format_mib "$(metric plain tiny_push all 5)")" \
     "$(format_mib "$(metric gcrypt tiny_push all 5)")" \
     "$(format_mib "$(metric e2ee tiny_push all 5)")"
-  tiny_push_label="tiny pushes"
-  if (( common_pushes == 1 )); then
-    tiny_push_label="tiny push"
-  fi
-  printf '| Remote size after %s %s | %s | %s | %s |\n' "$common_pushes" "$tiny_push_label" \
-    "$(format_mib "$(metric plain tiny_push "$common_pushes" 7)")" \
-    "$(format_mib "$(metric gcrypt tiny_push "$common_pushes" 7)")" \
-    "$(format_mib "$(metric e2ee tiny_push "$common_pushes" 7)")"
   printf '| Total client disk after fresh fetch (.git + auxiliary cache/state) | %s | %s | %s |\n' \
     "$(format_mib "$(total_client_disk_bytes plain)")" \
     "$(format_mib "$(total_client_disk_bytes gcrypt)")" \
     "$(format_mib "$(total_client_disk_bytes e2ee)")"
-  if (( common_pushes != tiny_commits )); then
-    printf '\nThe remote-size row uses %s pushes because gcrypt ran %s tiny pushes.\n' "$common_pushes" "$gcrypt_tiny_commits"
-  fi
 } >"$summary_file"
 
 run_complete=true

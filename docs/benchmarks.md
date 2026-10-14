@@ -41,7 +41,6 @@ lightly loaded. The runner's `summary.md`:
 | Data sent per tiny push | 4.5 KB | 921 MB | 8.9 KB |
 | Peak memory, initial push | 1.27 GiB | 0.98 GiB | 1.27 GiB |
 | Peak memory, tiny push | 37 MiB | 887 MiB | 9 MiB |
-| Remote size after 5 tiny pushes | 891 MiB | 5,272 MiB | 878 MiB |
 | Total client disk after fresh fetch (.git + auxiliary cache/state) | 891 MiB | 1,780 MiB | 1,779 MiB |
 
 ### Second macOS machine (2026-10-08)
@@ -61,7 +60,6 @@ run (load average about 7-16 on 10 cores). The ordering is identical:
 | Data sent per tiny push | 4.8 KB | 921 MB | 9.5 KB |
 | Peak memory, initial push | 1.27 GiB | 0.96 GiB | 1.27 GiB |
 | Peak memory, tiny push | 37 MiB | 887 MiB | 9 MiB |
-| Remote size after 5 tiny pushes | 891 MiB | 5,272 MiB | 878 MiB |
 | Total client disk after fresh fetch (.git + auxiliary cache/state) | 891 MiB | 1,780 MiB | 1,779 MiB |
 
 The sections below record earlier runs and the investigation that led here.
@@ -165,8 +163,10 @@ update followed by client object-store growth). RSS is MiB.
 | 4 | 0.09 s / 37.3 MiB / 4,763 / 3,359 B | 25.50 s / 887.1 MiB / 921,318,660 / 9,706 B | 1.04 s / 39.0 MiB / 9,522 / 4,501 B |
 | 5 | 0.08 s / 37.3 MiB / 4,759 / 3,356 B | 25.41 s / 887.1 MiB / 921,322,283 / 9,927 B | 1.15 s / 39.1 MiB / 9,577 / 4,498 B |
 
-In the 2026-10-03 run, gcrypt added about 921 MiB to the remote on each tiny
-push. E2EE's first tiny push took 5.20 s and used 522.3 MiB peak RSS. Later
+In the 2026-10-03 run, gcrypt sent about 921 MiB on each tiny push. The
+receiver kept every pack because of `receive.unpackLimit=0`; with Git's
+defaults a host may discard the duplicate objects, so this is transfer, not
+lasting storage growth. E2EE's first tiny push took 5.20 s and used 522.3 MiB peak RSS. Later
 pushes took 1.32 to 1.53 s, used about 38 MiB, and added 9.3 to 9.6 KiB.
 E2EE's median tiny push and fetch were below 1.5 s and 1.1 s, respectively.
 
@@ -266,7 +266,6 @@ later revisions default to `/var/tmp` on Linux.
 | Data sent per tiny push | 4.5 KB | 921 MB | 8.9 KB |
 | Peak memory, initial push | 1.11 GiB | 0.96 GiB | 1.11 GiB |
 | Peak memory, tiny push | 44 MiB | 884 MiB | 48 MiB |
-| Remote size after 5 tiny pushes | 891 MiB | 5,272 MiB | 878 MiB |
 | Total client disk after fresh fetch (.git + auxiliary cache/state) | 891 MiB | 1,780 MiB | 1,779 MiB |
 
 The ordering matches the macOS run except initial encryption, where gcrypt is
