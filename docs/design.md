@@ -122,7 +122,18 @@ administrative CAS is never automatically rebased.
 - Packs are decrypted segment by segment directly into `git index-pack`
   oldest-first.
 - After import, every advertised ref must resolve to a complete local Git
-  object graph before pins or remote-tracking refs move.
+  object graph before the continuity floor or remote-tracking refs move.
+- Authentication alone never advances the continuity floor. The floor advances
+  after a successful import and connectivity check, after the client's own
+  publication wins compare-and-swap, or during listing when every advertised
+  ref already resolves to a complete local object graph. The last case matters
+  because Git skips the helper's fetch command when nothing needs to be
+  transferred, as after a membership change, a deletion, or a tag pointing at
+  an existing object; without it, such a state would never be pinned and a
+  later replay of the previous state would be accepted.
+- Per-repository/remote client-state updates hold an advisory file lock across
+  validation and read-modify-write. The state replacement remains durable and
+  atomic, and its manifest and policy generations never move backward.
 - The helper advertises `refs/heads/*` and `refs/tags/*`; every other ref
   namespace is rejected before publication.
 - Branch updates require fast-forward ancestry unless force is explicit. Tags
@@ -213,7 +224,23 @@ motivates future garbage collection.
 
 Returning clients pin repository root, manifest ID/generation, and policy
 generation. They reject rollback, non-descendant state, policy rollback, and
-root substitution.
+root substitution. A signed manifest seen by list is not yet a pin: helper
+state advances after all required packs are imported and every advertised ref
+passes the complete-object-graph check, or after the client's own publication
+successfully wins compare-and-swap. A missing or unusable pack therefore cannot
+raise the continuity floor.
+
+Each local repository/remote pair has one stable lock file beside its client
+state. Helpers hold the exclusive lock while checking the current floor and
+performing an import or publication update. State writes merge monotonically
+and use the existing flushed temporary-file, rename, and parent-directory
+sync path. Administrator pins use the same serialized, monotonic state update
+rules after initialization or a successful policy transition.
+
+State files written by earlier builds are not lowered automatically. Their
+head pin may have come from listing, but it is indistinguishable from a valid
+pin made after the client's own publication; lowering it could weaken rollback
+detection.
 
 Storage alone still cannot prevent:
 
@@ -226,6 +253,131 @@ Storage alone still cannot prevent:
 Old manifest headers retain device envelopes. Later compromise of a device
 private key can retroactively expose every generation addressed to that device.
 There is no forward secrecy for stored history.
+
+## Recovering from an unverifiable HEAD
+
+Anyone with storage write access can point `HEAD` at something conforming
+clients reject: bytes that fail to parse, a manifest signed by a reader-only
+device, or a manifest that fails any other check. Clients already refuse such
+a state and stop. Recovery lets an honest writer continue afterwards without
+trusting anything the rejected state claims. It is an explicit operation,
+`git-e2ee recover`; nothing recovers automatically.
+
+### Principle
+
+Recovery never derives a base, refs, policy, keys, or pack inventory from the
+rejected state. The default base is the client's continuity floor: the newest
+state it accepted after a complete connectivity check or its own successful
+publication. A fully validated descendant of the floor may be chosen
+explicitly. Anything else storage offers, including a rejected manifest's
+`previous` pointer, is only a discovery hint and is validated independently.
+
+The danger is an update this client never saw. If a legitimate state `L`
+followed the floor and storage later replaced it, continuing from the floor
+would drop `L`, and if `L` revoked a device, would deliver new keys to that
+device again. The client cannot rule this out from the floor alone, so
+recovery shows the user what it found and never chooses silently.
+
+### Classifying the head
+
+| Class | Meaning | Recovery allowed |
+|---|---|---|
+| valid | authenticated, authorized, continuous with the floor | not needed |
+| invalid | demonstrably bad: unparseable, bad signature, signer not authorized under the authenticated policy, broken audit, commitment, or predecessor link | yes |
+| unverifiable | this device cannot open any envelope | never: a valid revocation looks exactly like this to the revoked device |
+| unsupported | unknown format version or transition type, even if the parser reports it as a parse error | never: an old client must not erase a newer client's state |
+| unavailable | objects missing or a storage error, including failure to read a historical object | never |
+| discontinuous | authenticated but older than, or diverging from, the floor | never: this is detected rollback or equivocation and is reported as such |
+
+These restrictions bind `recover` as well; it cannot override them. A signer ID
+read from a sealed header is reported as the claimed signer until its signature
+verifies against a device record in the authenticated policy.
+
+### `git-e2ee recover`
+
+1. **Discover, read-only.** Classify the head. On the carrier backend, walk the
+   outer commit history back to the floor's manifest within a fixed budget and
+   list every authenticated manifest that descends from the floor, with its
+   generation, outer commit, verified signer, and whether candidates conflict.
+   A replay of an older manifest found in outer history is reported, never
+   treated as newer. Exhausting the budget is an error, not a choice.
+2. **Refuse ambiguity.** If authenticated descendants conflict, report a fork
+   and stop.
+3. **Select explicitly.** The default offer is the newest validated descendant
+   of the floor, or the floor itself if none exists. Choosing an older base
+   than one found is a deliberate history-discarding choice and requires a
+   separate confirmation. On the directory backend, which has no `HEAD`
+   history, only the floor can be offered, with the confirmation: "Updates
+   after this floor may be omitted. This may also omit revocations and
+   disclose subsequently published content to devices excluded by a newer
+   policy."
+4. **Publish.** The device must be an active writer under the base's policy.
+   Build `R` with `R.previous = base`, `R.generation = base.generation + 1`,
+   the predecessor link to the base key, refs and policy from the base, and
+   compare-and-swap from the observed storage token, which is the current outer
+   tip on the carrier. The verified base and the CAS token are separate values.
+   On the carrier the new outer commit is a child of the current tip, so the
+   push is still a fast-forward. Rebuild the `e2ee/` tree from the ciphertext
+   objects the base chain requires, restored byte for byte from the carrier's
+   history or the local cache and checked against their content IDs; if any is
+   missing, fail as unavailable. A lost CAS fails; the operator must start a
+   new `recover` invocation and review its fresh discovery report.
+
+Git does not pass a push of unchanged refs to the helper, so a plain `git push`
+cannot perform recovery; `recover` is the only entry point. It must never
+publish during `list for-push`.
+
+Fresh clones have no floor. Unless they hold an authenticated invitation
+checkpoint, `recover` states that freshness and fork identity are unverified.
+
+### Possible automatic recovery later
+
+Automatic recovery is safe only if the client can prove nothing legitimate
+came between its floor and the junk. Comparing the parent's inner `HEAD` value
+with the floor is not enough: storage writers can append a legitimate `L`, then
+a replay of the floor, then junk, and the junk's parent would still match. A
+future automatic mode would have to anchor to the exact outer commit at which
+this client established its floor, never move that anchor on a replay, and
+require the current tip to be a single-parent child of it.
+
+### Implementation requirements
+
+- Validate every accepted ancestor under the policy in force at that point of
+  the chain; never import policy authority from a rejected manifest.
+- Bound discovery by outer commits, candidates, bytes read, and cryptographic
+  operations, deduplicating repeated IDs.
+- Record rejected heads as bounded diagnostic evidence next to the client
+  state, separate from the floor. Do not blacklist unverifiable or unavailable
+  states.
+- Never lower the floor. A successful recovery advances it to `R`.
+
+### Current implementation
+
+`git-e2ee recover` accepts `--remote <carrier-url>` or `--storage <directory>`,
+plus `--key`, `--repo`, and `--remote-name`. The repository defaults to `.`
+and the remote name defaults to `origin`; the continuity floor is read from
+`.git/git-remote-e2ee/<remote-name>/state.json`. Without `--publish`, the command
+only reports. Publishing an older offer requires `--discard-newer`. Directory
+publication requires `--accept-stale-floor` and prints the warning above.
+
+Discovery scans the available carrier history and refuses any history that
+contains a merge commit, since legitimate publications are always
+single-parent and a merge could hide a legitimate state behind its second
+parent. It works within
+budgets of 2,048 outer commits, 256 distinct heads, 64 MiB of manifest bytes,
+and 1,000,000 estimated cryptographic operations. It scans past replays of the
+floor so a legitimate descendant hidden behind a replay can still be offered.
+An exhausted budget fails closed. A CAS loss is returned to the operator;
+there is no automatic retry with an old selection. This implements the
+restart-at-discovery requirement as a fresh command invocation, matching the
+requirement that a losing recovery fail without retrying blindly.
+
+Before publication, required manifests and packs are restored into the
+disposable carrier checkout, unneeded ciphertext objects are removed from that
+checkout's `e2ee/` tree, and all base-chain packs are imported into a temporary
+bare Git repository to verify complete ref connectivity. The temporary
+repository is deleted when the command exits; the persistent carrier cache
+continues to contain ciphertext Git objects only.
 
 ## Anonymous recipients (v5)
 

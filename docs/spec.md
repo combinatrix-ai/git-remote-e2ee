@@ -23,7 +23,8 @@ It is designed to satisfy all of the following:
    envelopes scale with the padded reader count; a policy transition also
    carries its encrypted policy body.
 5. A newly admitted reader receives full history by default.
-6. Concurrent publications have exactly one visible winner.
+6. Concurrent publications have exactly one visible winner, provided storage
+   honors the compare-and-swap contract.
 
 The protocol provides confidentiality, authenticity, integrity, and continuity
 from state pinned by the same client. It does not provide global freshness or
@@ -292,8 +293,10 @@ bytes, and verify SHA-256 of the complete stored stream against the descriptor
 ID. A malformed header, size mismatch, counter overflow, short read, reordered
 or duplicated segment, authentication failure, trailing byte, or hash mismatch
 is fatal. Plaintext may stream into `git index-pack` before the final object hash
-is known, but no ref or continuity pin may move until all cryptographic,
-content-address, process, and Git-connectivity checks succeed.
+is known, but no imported-state pin or remote ref may move until all
+cryptographic, content-address, process, and Git-connectivity checks succeed.
+Listing an authenticated manifest does not advance the continuity floor. A
+publisher advances its own floor only after its compare-and-swap succeeds.
 
 Immutable writes MUST be staged within the storage backend and become visible
 under their ciphertext ID only after the complete streamed hash matches that
@@ -402,6 +405,24 @@ refs, pinning the new head, or publishing a successor. A signed ref advance
 whose required pack delta is absent is invalid even when every cryptographic
 check succeeds.
 
+Authenticating a manifest alone MUST NOT advance the continuity floor. A
+helper client's head, generation, repository root, and policy-generation floor
+advances only when the complete-ref connectivity check succeeds for that
+manifest's refs, either after pack import or, during listing, because every
+advertised ref is already connected locally; or after that client successfully
+publishes its own successor with compare-and-swap. A client MUST NOT rely on
+receiving a fetch command to pin a state, because Git omits it when no objects
+need to be transferred. A failed or incomplete
+import leaves the previous floor intact, so an authenticated but unusable
+publication cannot make a later valid successor look like rollback.
+
+Client-state updates for one repository and remote MUST serialize their
+read-modify-write operation across helper processes. The merge MUST preserve
+the greatest recorded manifest and policy generations and MUST reject a
+same-generation head-ID conflict. The durable state-file replacement remains
+atomic; the lock is held while an import or publication checks and advances
+the floor.
+
 A client MAY satisfy that requirement incrementally. After a successful full
 or incremental connectivity check, it records the exact checked ref tips as a
 verified frontier. On a later fetch it first requires every frontier tip to
@@ -417,6 +438,54 @@ client state from another wire version is not accepted. The incremental rule ass
 client's existing object database has not been corrupted outside this
 protocol; explicit full verification remains available to check local storage.
 
+### Explicit recovery
+
+`git-e2ee recover` MUST default to a read-only report. It MUST classify the
+observed storage head as valid, invalid, unverifiable, unsupported, unavailable,
+or discontinuous. Recovery publication is permitted only for an invalid head.
+Unverifiable, unsupported, unavailable, and discontinuous heads MUST never be
+overridden. In particular, a device that cannot open the current envelope
+MUST NOT recover from an older floor, because the head may be a valid
+revocation. A signer ID extracted before successful signature verification
+MUST be labelled as a claim, not as the signer.
+
+On carrier Git, discovery MUST inspect bounded outer history and MUST refuse
+to proceed if that history contains any merge commit: every legitimate
+publication is a single-parent fast-forward, and a merge can hide a legitimate
+state behind a non-first parent. Discovery MUST deduplicate manifest IDs and
+validate candidates against the authenticated policy and predecessor chain. The byte, outer-commit, candidate, and
+cryptographic-operation budgets MUST be fixed. Exhaustion MUST fail closed.
+Discovery MUST report authenticated descendants and replays. If authenticated
+descendants conflict, recovery MUST refuse to choose a fork. A replayed older
+manifest MUST NOT be treated as a newer candidate. Directory storage has no
+outer history and MUST offer only the pinned floor.
+
+The default base MUST be the newest validated descendant of the floor, or the
+floor when no descendant is available. Selecting an older offered base MUST
+require an explicit history-discard confirmation. Directory publication MUST
+require explicit acknowledgement that updates and revocations after the floor
+may be omitted and that subsequently published content may be disclosed to
+devices excluded by a newer policy.
+
+Before publication, the device MUST be an active writer under the selected
+base's policy. Recovery MUST publish a normal signed writer successor whose
+previous ID and generation are the selected base and its generation plus one,
+whose refs and policy are copied from that base, and whose predecessor link
+opens to the base key. It MUST compare-and-swap from the observed storage token
+while keeping that token separate from the selected manifest base. Required
+base-chain ciphertext MUST be available and checked against content IDs. A
+carrier publication MUST restore required historical ciphertext byte-for-byte,
+publish a child of the observed outer tip, and use a normal fast-forward push.
+Before publishing, the selected refs MUST resolve to complete local Git object
+graphs. A lost CAS MUST fail without a blind retry.
+
+Recovery MUST record invalid rejected heads as bounded diagnostic evidence
+separate from client continuity state. That evidence MUST NOT lower the floor
+or make an unverifiable or unavailable head ineligible for a later valid
+operation. A successful recovery advances the floor only after its own CAS
+succeeds. Recovery MUST NOT run from remote-helper `list` or `list for-push`,
+and an ordinary `git push` MUST NOT trigger it.
+
 Force pushes append a normal pack delta and new ref state. Older packs remain
 in historical manifests and may become unreachable in the inner Git graph.
 
@@ -424,7 +493,10 @@ in historical manifests and may become unreachable in the inner Git graph.
 
 The server does not inspect encrypted inner commit parents. Two writers read
 the same opaque `HEAD`, create immutable candidates, and attempt the same CAS.
-Exactly one wins.
+Against storage that honors the CAS contract, exactly one wins. Malicious or
+noncompliant storage can report outcomes inconsistently; that is outside the
+guarantees, and a noncooperating writer to directory storage can also cause an
+ABA change of the compared `HEAD` value.
 
 - Filesystem storage uses locking. `HEAD` is published by rename inside the
   storage root. Immutable objects are hard-linked from `.staging` into
@@ -441,9 +513,14 @@ Unreachable losing objects require later GC.
 
 ## 11. Continuity and invitations
 
-Returning clients pin at least repository root, manifest ID and generation,
-and policy ID and generation. They reject rollback, a non-descendant manifest,
-policy rollback/sideways movement, root substitution, and generation gaps.
+Returning clients pin repository root, manifest ID and generation, and policy
+generation. The policy ID is not stored separately: the pinned manifest ID
+binds it through the manifest's sealed header. Helper continuity pins advance
+only after the complete-ref connectivity check succeeds (after import, or
+during listing when the advertised refs are already connected locally) or
+after a successful own publication, never from authentication alone. They reject rollback, a non-descendant manifest, policy
+rollback/sideways movement, root substitution, and generation gaps. Local
+client-state updates are serialized and monotonic across concurrent helpers.
 
 A fresh device should receive an administrator-authorized invitation checkpoint
 through an authenticated channel containing:
