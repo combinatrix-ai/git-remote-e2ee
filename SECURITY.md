@@ -5,7 +5,7 @@ Please report vulnerabilities privately to
 
 `git-remote-e2ee` is an early prototype and has not been independently
 audited. Its intended guarantees and known limits are listed in the
-[README](README.md#security-model) and specified in [docs/design.md](docs/design.md) and
+[security model](docs/security-model.md) and specified in [docs/design.md](docs/design.md) and
 [docs/spec.md](docs/spec.md). Reports are especially welcome about:
 
 - plaintext, refs, paths, or other inner metadata reaching storage;

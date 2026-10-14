@@ -1,0 +1,130 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 722" width="960" height="722" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" role="img" aria-labelledby="title desc">
+  <title id="title">Fast, safe, and no master key</title>
+  <desc id="desc">Fast, measured on the Godot repository (867 MiB of history) with a Git backend, median of three runs, comparing plain Git, git-remote-gcrypt, and git-remote-e2ee. Data sent per one-line push: 4.5 KB, 921 MB, 8.9 KB. Small change: push 0.08 s, 6.5 s, 0.97 s; fetch 0.07 s, 22.6 s, 0.77 s. Whole history: initial push 28.4 s, 36.6 s, 22.9 s; fresh fetch 27.7 s, 55.0 s, 40.0 s. Peak memory: small push 37 MiB, 887 MiB, 9 MiB; initial push 1.27 GiB, 0.98 GiB, 1.27 GiB. Safe: when two devices push at once, storage accepts one through compare-and-swap and rejects the other, while gcrypt would let the second push erase the first. No master key: every push gets a fresh key wrapped for each device; a revoked device gets no key for later pushes, while git-crypt shares one key with everyone. Icons from Tabler Icons (MIT).</desc>
+  <defs>
+    <symbol id="i-key" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16.555 3.843l3.602 3.602a2.877 2.877 0 0 1 0 4.069l-2.643 2.643a2.877 2.877 0 0 1 -4.069 0l-.301 -.301l-6.558 6.558a2 2 0 0 1 -1.239 .578l-.175 .008h-1.172a1 1 0 0 1 -.993 -.883l-.007 -.117v-1.172a2 2 0 0 1 .467 -1.284l.119 -.13l.414 -.414h2v-2h2v-2l2.144 -2.144l-.301 -.301a2.877 2.877 0 0 1 0 -4.069l2.643 -2.643a2.877 2.877 0 0 1 4.069 0" /> <path d="M15 9h.01" /></symbol>
+    <symbol id="i-laptop" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 19l18 0" /> <path d="M5 7a1 1 0 0 1 1 -1h12a1 1 0 0 1 1 1v8a1 1 0 0 1 -1 1h-12a1 1 0 0 1 -1 -1l0 -8" /></symbol>
+    <symbol id="i-lock" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 13a2 2 0 0 1 2 -2h10a2 2 0 0 1 2 2v6a2 2 0 0 1 -2 2h-10a2 2 0 0 1 -2 -2v-6" /> <path d="M11 16a1 1 0 1 0 2 0a1 1 0 0 0 -2 0" /> <path d="M8 11v-4a4 4 0 1 1 8 0v4" /></symbol>
+    <marker id="arrow-ok" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#2f6b3a"/></marker>
+    <marker id="arrow-no" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#a4371b"/></marker>
+  </defs>
+  <rect width="960" height="722" rx="16" fill="#faf8f4"/>
+  <rect x="16" y="16" width="928" height="336" rx="12" fill="#fffdf9" stroke="#e4ded3"/>
+  <text x="36" y="50" font-size="20" font-weight="700" fill="#1c1a17">Fast</text>
+  <text x="36" y="72" font-size="13" fill="#6b645a">Pushes upload only what changed</text>
+  <text x="36" y="106" font-size="13" font-weight="700" fill="#1c1a17">Data sent per small push</text>
+  <text x="36" y="122" font-size="11" fill="#8a8276">log scale</text>
+  <text x="36" y="148" font-size="12" font-weight="600" fill="#3d3830">One-line change</text>
+  <rect x="36" y="156" width="15.2" height="16" rx="2" fill="#d3ccc0"/>
+  <text x="57.2" y="168.5" font-size="11.5" fill="#3d3830">4.5 KB</text>
+  <rect x="36" y="176" width="139.2" height="16" rx="2" fill="#9a9286"/>
+  <text x="181.2" y="188.5" font-size="11.5" fill="#3d3830">921 MB</text>
+  <rect x="36" y="196" width="22.2" height="16" rx="2" fill="#2f6b3a"/>
+  <text x="64.2" y="208.5" font-size="11.5" font-weight="600" fill="#2f6b3a">8.9 KB</text>
+  <text x="36" y="242" font-size="11.5" fill="#3d3830">gcrypt re-uploads the whole</text>
+  <text x="36" y="258" font-size="11.5" fill="#3d3830">encrypted history on every push</text>
+  <text x="36" y="274" font-size="11.5" fill="#3d3830">to a Git host.</text>
+  <line x1="248" y1="94" x2="248" y2="300" stroke="#efeae1"/>
+  <text x="260" y="106" font-size="13" font-weight="700" fill="#1c1a17">Small change</text>
+  <text x="260" y="122" font-size="11" fill="#8a8276">seconds</text>
+  <text x="260" y="148" font-size="12" font-weight="600" fill="#3d3830">Push</text>
+  <rect x="260" y="156" width="2" height="16" rx="2" fill="#d3ccc0"/>
+  <text x="268" y="168.5" font-size="11.5" fill="#3d3830">0.08 s</text>
+  <rect x="260" y="176" width="40.3" height="16" rx="2" fill="#9a9286"/>
+  <text x="306.3" y="188.5" font-size="11.5" fill="#3d3830">6.5 s</text>
+  <rect x="260" y="196" width="6.0" height="16" rx="2" fill="#2f6b3a"/>
+  <text x="272.0" y="208.5" font-size="11.5" font-weight="600" fill="#2f6b3a">0.97 s</text>
+  <text x="260" y="238" font-size="12" font-weight="600" fill="#3d3830">Fetch</text>
+  <rect x="260" y="246" width="2" height="16" rx="2" fill="#d3ccc0"/>
+  <text x="268" y="258.5" font-size="11.5" fill="#3d3830">0.07 s</text>
+  <rect x="260" y="266" width="140.0" height="16" rx="2" fill="#9a9286"/>
+  <text x="406.0" y="278.5" font-size="11.5" fill="#3d3830">22.6 s</text>
+  <rect x="260" y="286" width="4.8" height="16" rx="2" fill="#2f6b3a"/>
+  <text x="270.8" y="298.5" font-size="11.5" font-weight="600" fill="#2f6b3a">0.77 s</text>
+  <line x1="472" y1="94" x2="472" y2="300" stroke="#efeae1"/>
+  <text x="484" y="106" font-size="13" font-weight="700" fill="#1c1a17">Whole history</text>
+  <text x="484" y="122" font-size="11" fill="#8a8276">seconds</text>
+  <text x="484" y="148" font-size="12" font-weight="600" fill="#3d3830">Initial push</text>
+  <rect x="484" y="156" width="72.3" height="16" rx="2" fill="#d3ccc0"/>
+  <text x="562.3" y="168.5" font-size="11.5" fill="#3d3830">28.4 s</text>
+  <rect x="484" y="176" width="93.2" height="16" rx="2" fill="#9a9286"/>
+  <text x="583.2" y="188.5" font-size="11.5" fill="#3d3830">36.6 s</text>
+  <rect x="484" y="196" width="58.3" height="16" rx="2" fill="#2f6b3a"/>
+  <text x="548.3" y="208.5" font-size="11.5" font-weight="600" fill="#2f6b3a">22.9 s</text>
+  <text x="484" y="238" font-size="12" font-weight="600" fill="#3d3830">Fresh fetch</text>
+  <rect x="484" y="246" width="70.5" height="16" rx="2" fill="#d3ccc0"/>
+  <text x="560.5" y="258.5" font-size="11.5" fill="#3d3830">27.7 s</text>
+  <rect x="484" y="266" width="140.0" height="16" rx="2" fill="#9a9286"/>
+  <text x="630.0" y="278.5" font-size="11.5" fill="#3d3830">55.0 s</text>
+  <rect x="484" y="286" width="101.8" height="16" rx="2" fill="#2f6b3a"/>
+  <text x="591.8" y="298.5" font-size="11.5" font-weight="600" fill="#2f6b3a">40.0 s</text>
+  <line x1="696" y1="94" x2="696" y2="300" stroke="#efeae1"/>
+  <text x="708" y="106" font-size="13" font-weight="700" fill="#1c1a17">Peak memory</text>
+  <text x="708" y="122" font-size="11" fill="#8a8276">MiB or GiB</text>
+  <text x="708" y="148" font-size="12" font-weight="600" fill="#3d3830">Small push</text>
+  <rect x="708" y="156" width="4.0" height="16" rx="2" fill="#d3ccc0"/>
+  <text x="718.0" y="168.5" font-size="11.5" fill="#3d3830">37 MiB</text>
+  <rect x="708" y="176" width="95.5" height="16" rx="2" fill="#9a9286"/>
+  <text x="809.5" y="188.5" font-size="11.5" fill="#3d3830">887 MiB</text>
+  <rect x="708" y="196" width="2" height="16" rx="2" fill="#2f6b3a"/>
+  <text x="716" y="208.5" font-size="11.5" font-weight="600" fill="#2f6b3a">9 MiB</text>
+  <text x="708" y="238" font-size="12" font-weight="600" fill="#3d3830">Initial push</text>
+  <rect x="708" y="246" width="140.0" height="16" rx="2" fill="#d3ccc0"/>
+  <text x="854.0" y="258.5" font-size="11.5" fill="#3d3830">1.27 GiB</text>
+  <rect x="708" y="266" width="108.1" height="16" rx="2" fill="#9a9286"/>
+  <text x="822.1" y="278.5" font-size="11.5" fill="#3d3830">0.98 GiB</text>
+  <rect x="708" y="286" width="140.0" height="16" rx="2" fill="#2f6b3a"/>
+  <text x="854.0" y="298.5" font-size="11.5" font-weight="600" fill="#2f6b3a">1.27 GiB</text>
+  <line x1="36" y1="310" x2="924" y2="310" stroke="#e4ded3"/>
+  <rect x="36" y="322" width="12" height="12" rx="2" fill="#d3ccc0"/><text x="54" y="332.5" font-size="12" fill="#3d3830">Plain Git</text>
+  <rect x="141" y="322" width="12" height="12" rx="2" fill="#9a9286"/><text x="159" y="332.5" font-size="12" fill="#3d3830">git-remote-gcrypt</text>
+  <rect x="302" y="322" width="12" height="12" rx="2" fill="#2f6b3a"/><text x="320" y="332.5" font-size="12" fill="#3d3830">git-remote-e2ee</text>
+  <text x="924" y="332.5" font-size="11" fill="#8a8276" text-anchor="end">Godot, 867 MiB of history, Git backend, Apple M1 Pro, median of 3 runs</text>
+  <rect x="16" y="366" width="460" height="340" rx="12" fill="#fffdf9" stroke="#e4ded3"/>
+  <g transform="translate(-314 350)"><text x="350" y="50" font-size="20" font-weight="700" fill="#1c1a17">Safe</text></g>
+  <g transform="translate(-314 350)"><text x="350" y="72" font-size="13" fill="#6b645a">No silent force pushes</text></g>
+  <g transform="translate(-234 350)"><text x="390" y="104" font-size="12" font-weight="600" fill="#3d3830" text-anchor="middle">Device A</text></g>
+  <g transform="translate(-234 350)"><use href="#i-laptop" x="368" y="106" width="44" height="44" stroke="#6b645a"/></g>
+  <g transform="translate(-234 350)"><text x="570" y="104" font-size="12" font-weight="600" fill="#3d3830" text-anchor="middle">Device B</text></g>
+  <g transform="translate(-234 350)"><use href="#i-laptop" x="548" y="106" width="44" height="44" stroke="#6b645a"/></g>
+  <g transform="translate(-234 350)"><line x1="394" y1="152" x2="452" y2="190" stroke="#2f6b3a" stroke-width="2" marker-end="url(#arrow-ok)"/></g>
+  <g transform="translate(-234 350)"><line x1="566" y1="152" x2="508" y2="190" stroke="#a4371b" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#arrow-no)"/></g>
+  <g transform="translate(-234 350)"><circle cx="414" cy="166" r="10" fill="#2f6b3a"/></g>
+  <g transform="translate(-234 350)"><path d="M409 166l3.5 3.5l6 -7" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></g>
+  <g transform="translate(-234 350)"><circle cx="546" cy="166" r="10" fill="#a4371b"/></g>
+  <g transform="translate(-234 350)"><path d="M542 162l8 8M550 162l-8 8" stroke="#ffffff" stroke-width="2" stroke-linecap="round"/></g>
+  <g transform="translate(-234 350)"><rect x="425" y="194" width="110" height="40" rx="8" fill="#eef1f5" stroke="#5f6c80"/></g>
+  <g transform="translate(-234 350)"><use href="#i-lock" x="436" y="203" width="22" height="22" stroke="#5f6c80"/></g>
+  <g transform="translate(-234 350)"><text x="464" y="219" font-size="13" font-weight="600" fill="#1c1a17">HEAD</text></g>
+  <g transform="translate(-234 350)"><text x="480" y="252" font-size="11" fill="#6b645a" text-anchor="middle">compare-and-swap</text></g>
+  <g transform="translate(-234 350)"><text x="480" y="274" font-size="12" fill="#3d3830" text-anchor="middle">One push wins; the other gets an</text></g>
+  <g transform="translate(-234 350)"><text x="480" y="290" font-size="12" fill="#3d3830" text-anchor="middle">ordinary rejection and pulls first.</text></g>
+  <g transform="translate(-314 350)"><text x="350" y="322" font-size="11" fill="#8a8276">gcrypt: every push is a force push,</text></g>
+  <g transform="translate(-314 350)"><text x="350" y="337" font-size="11" fill="#8a8276">so B can erase A's work.</text></g>
+  <line x1="36" y1="650" x2="456" y2="650" stroke="#e4ded3"/>
+  <rect x="484" y="366" width="460" height="340" rx="12" fill="#fffdf9" stroke="#e4ded3"/>
+  <g transform="translate(-160 350)"><text x="664" y="50" font-size="20" font-weight="700" fill="#1c1a17">No master key</text></g>
+  <g transform="translate(-160 350)"><text x="664" y="72" font-size="13" fill="#6b645a">A fresh key per push, per device</text></g>
+  <g transform="translate(-80 350)"><text x="764" y="106" font-size="11" fill="#8a8276" text-anchor="middle">push 1</text></g>
+  <g transform="translate(-80 350)"><text x="824" y="106" font-size="11" fill="#8a8276" text-anchor="middle">push 2</text></g>
+  <g transform="translate(-80 350)"><text x="900" y="106" font-size="11" fill="#8a8276" text-anchor="middle">push 3</text></g>
+  <g transform="translate(-80 350)"><text x="664" y="141" font-size="12" fill="#3d3830">Laptop</text></g>
+  <g transform="translate(-80 350)"><text x="664" y="181" font-size="12" fill="#3d3830">CI (read)</text></g>
+  <g transform="translate(-80 350)"><text x="664" y="221" font-size="12" fill="#3d3830">Old phone</text></g>
+  <g transform="translate(-80 350)"><use href="#i-key" x="753" y="125" width="22" height="22" stroke="#5f6c80"/></g>
+  <g transform="translate(-80 350)"><use href="#i-key" x="813" y="125" width="22" height="22" stroke="#b3542e"/></g>
+  <g transform="translate(-80 350)"><use href="#i-key" x="889" y="125" width="22" height="22" stroke="#2f6b3a"/></g>
+  <g transform="translate(-80 350)"><use href="#i-key" x="753" y="165" width="22" height="22" stroke="#5f6c80"/></g>
+  <g transform="translate(-80 350)"><use href="#i-key" x="813" y="165" width="22" height="22" stroke="#b3542e"/></g>
+  <g transform="translate(-80 350)"><use href="#i-key" x="889" y="165" width="22" height="22" stroke="#2f6b3a"/></g>
+  <g transform="translate(-80 350)"><use href="#i-key" x="753" y="205" width="22" height="22" stroke="#5f6c80"/></g>
+  <g transform="translate(-80 350)"><use href="#i-key" x="813" y="205" width="22" height="22" stroke="#b3542e"/></g>
+  <g transform="translate(-80 350)"><circle cx="900" cy="216" r="10" fill="none" stroke="#c9c1b4" stroke-dasharray="3 3"/></g>
+  <g transform="translate(-80 350)"><line x1="895" y1="216" x2="905" y2="216" stroke="#c9c1b4" stroke-width="2" stroke-linecap="round"/></g>
+  <g transform="translate(-80 350)"><line x1="862" y1="114" x2="862" y2="236" stroke="#a4371b" stroke-width="1.5" stroke-dasharray="4 3"/></g>
+  <g transform="translate(-80 350)"><text x="862" y="252" font-size="11" font-weight="600" fill="#a4371b" text-anchor="middle">revoke Old phone</text></g>
+  <g transform="translate(-160 350)"><text x="664" y="282" font-size="12" fill="#3d3830">Revoke one device, no history rewrite.</text></g>
+  <g transform="translate(-160 350)"><text x="664" y="322" font-size="11" fill="#8a8276">git-crypt: one repository key that</text></g>
+  <g transform="translate(-160 350)"><text x="664" y="337" font-size="11" fill="#8a8276">everyone shares, and no revocation.</text></g>
+  <line x1="504" y1="650" x2="924" y2="650" stroke="#e4ded3"/>
+</svg>
