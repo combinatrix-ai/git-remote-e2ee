@@ -15,9 +15,9 @@
   <text x="36" y="106" font-size="13" font-weight="700" fill="#1c1a17">Data sent per small push</text>
   <text x="36" y="122" font-size="11" fill="#8a8276">log scale</text>
   <text x="36" y="148" font-size="12" font-weight="600" fill="#3d3830">One-line change</text>
-  <rect x="36" y="156" width="15.2" height="16" rx="2" fill="#8a8276"/>
+  <rect x="36" y="156" width="15.2" height="16" rx="2" fill="#d3ccc0"/>
   <text x="57.2" y="168.5" font-size="11.5" fill="#3d3830">4.5 KB</text>
-  <rect x="36" y="176" width="139.2" height="16" rx="2" fill="#a4371b"/>
+  <rect x="36" y="176" width="139.2" height="16" rx="2" fill="#9a9286"/>
   <text x="181.2" y="188.5" font-size="11.5" fill="#3d3830">921 MB</text>
   <rect x="36" y="196" width="22.2" height="16" rx="2" fill="#2f6b3a"/>
   <text x="64.2" y="208.5" font-size="11.5" font-weight="600" fill="#2f6b3a">8.9 KB</text>
@@ -28,16 +28,16 @@
   <text x="260" y="106" font-size="13" font-weight="700" fill="#1c1a17">Small change</text>
   <text x="260" y="122" font-size="11" fill="#8a8276">seconds</text>
   <text x="260" y="148" font-size="12" font-weight="600" fill="#3d3830">Push</text>
-  <rect x="260" y="156" width="2" height="16" rx="2" fill="#8a8276"/>
+  <rect x="260" y="156" width="2" height="16" rx="2" fill="#d3ccc0"/>
   <text x="268" y="168.5" font-size="11.5" fill="#3d3830">0.08 s</text>
-  <rect x="260" y="176" width="40.3" height="16" rx="2" fill="#a4371b"/>
+  <rect x="260" y="176" width="40.3" height="16" rx="2" fill="#9a9286"/>
   <text x="306.3" y="188.5" font-size="11.5" fill="#3d3830">6.5 s</text>
   <rect x="260" y="196" width="6.0" height="16" rx="2" fill="#2f6b3a"/>
   <text x="272.0" y="208.5" font-size="11.5" font-weight="600" fill="#2f6b3a">0.97 s</text>
   <text x="260" y="238" font-size="12" font-weight="600" fill="#3d3830">Fetch</text>
-  <rect x="260" y="246" width="2" height="16" rx="2" fill="#8a8276"/>
+  <rect x="260" y="246" width="2" height="16" rx="2" fill="#d3ccc0"/>
   <text x="268" y="258.5" font-size="11.5" fill="#3d3830">0.07 s</text>
-  <rect x="260" y="266" width="140.0" height="16" rx="2" fill="#a4371b"/>
+  <rect x="260" y="266" width="140.0" height="16" rx="2" fill="#9a9286"/>
   <text x="406.0" y="278.5" font-size="11.5" fill="#3d3830">22.6 s</text>
   <rect x="260" y="286" width="4.8" height="16" rx="2" fill="#2f6b3a"/>
   <text x="270.8" y="298.5" font-size="11.5" font-weight="600" fill="#2f6b3a">0.77 s</text>
@@ -45,16 +45,16 @@
   <text x="484" y="106" font-size="13" font-weight="700" fill="#1c1a17">Whole history</text>
   <text x="484" y="122" font-size="11" fill="#8a8276">seconds</text>
   <text x="484" y="148" font-size="12" font-weight="600" fill="#3d3830">Initial push</text>
-  <rect x="484" y="156" width="72.3" height="16" rx="2" fill="#8a8276"/>
+  <rect x="484" y="156" width="72.3" height="16" rx="2" fill="#d3ccc0"/>
   <text x="562.3" y="168.5" font-size="11.5" fill="#3d3830">28.4 s</text>
-  <rect x="484" y="176" width="93.2" height="16" rx="2" fill="#a4371b"/>
+  <rect x="484" y="176" width="93.2" height="16" rx="2" fill="#9a9286"/>
   <text x="583.2" y="188.5" font-size="11.5" fill="#3d3830">36.6 s</text>
   <rect x="484" y="196" width="58.3" height="16" rx="2" fill="#2f6b3a"/>
   <text x="548.3" y="208.5" font-size="11.5" font-weight="600" fill="#2f6b3a">22.9 s</text>
   <text x="484" y="238" font-size="12" font-weight="600" fill="#3d3830">Fresh fetch</text>
-  <rect x="484" y="246" width="70.5" height="16" rx="2" fill="#8a8276"/>
+  <rect x="484" y="246" width="70.5" height="16" rx="2" fill="#d3ccc0"/>
   <text x="560.5" y="258.5" font-size="11.5" fill="#3d3830">27.7 s</text>
-  <rect x="484" y="266" width="140.0" height="16" rx="2" fill="#a4371b"/>
+  <rect x="484" y="266" width="140.0" height="16" rx="2" fill="#9a9286"/>
   <text x="630.0" y="278.5" font-size="11.5" fill="#3d3830">55.0 s</text>
   <rect x="484" y="286" width="101.8" height="16" rx="2" fill="#2f6b3a"/>
   <text x="591.8" y="298.5" font-size="11.5" font-weight="600" fill="#2f6b3a">40.0 s</text>
@@ -62,22 +62,22 @@
   <text x="708" y="106" font-size="13" font-weight="700" fill="#1c1a17">Peak memory</text>
   <text x="708" y="122" font-size="11" fill="#8a8276">MiB or GiB</text>
   <text x="708" y="148" font-size="12" font-weight="600" fill="#3d3830">Small push</text>
-  <rect x="708" y="156" width="4.0" height="16" rx="2" fill="#8a8276"/>
+  <rect x="708" y="156" width="4.0" height="16" rx="2" fill="#d3ccc0"/>
   <text x="718.0" y="168.5" font-size="11.5" fill="#3d3830">37 MiB</text>
-  <rect x="708" y="176" width="95.5" height="16" rx="2" fill="#a4371b"/>
+  <rect x="708" y="176" width="95.5" height="16" rx="2" fill="#9a9286"/>
   <text x="809.5" y="188.5" font-size="11.5" fill="#3d3830">887 MiB</text>
   <rect x="708" y="196" width="2" height="16" rx="2" fill="#2f6b3a"/>
   <text x="716" y="208.5" font-size="11.5" font-weight="600" fill="#2f6b3a">9 MiB</text>
   <text x="708" y="238" font-size="12" font-weight="600" fill="#3d3830">Initial push</text>
-  <rect x="708" y="246" width="140.0" height="16" rx="2" fill="#8a8276"/>
+  <rect x="708" y="246" width="140.0" height="16" rx="2" fill="#d3ccc0"/>
   <text x="854.0" y="258.5" font-size="11.5" fill="#3d3830">1.27 GiB</text>
-  <rect x="708" y="266" width="108.1" height="16" rx="2" fill="#a4371b"/>
+  <rect x="708" y="266" width="108.1" height="16" rx="2" fill="#9a9286"/>
   <text x="822.1" y="278.5" font-size="11.5" fill="#3d3830">0.98 GiB</text>
   <rect x="708" y="286" width="140.0" height="16" rx="2" fill="#2f6b3a"/>
   <text x="854.0" y="298.5" font-size="11.5" font-weight="600" fill="#2f6b3a">1.27 GiB</text>
   <line x1="36" y1="310" x2="924" y2="310" stroke="#e4ded3"/>
-  <rect x="36" y="322" width="12" height="12" rx="2" fill="#8a8276"/><text x="54" y="332.5" font-size="12" fill="#3d3830">Plain Git</text>
-  <rect x="141" y="322" width="12" height="12" rx="2" fill="#a4371b"/><text x="159" y="332.5" font-size="12" fill="#3d3830">git-remote-gcrypt</text>
+  <rect x="36" y="322" width="12" height="12" rx="2" fill="#d3ccc0"/><text x="54" y="332.5" font-size="12" fill="#3d3830">Plain Git</text>
+  <rect x="141" y="322" width="12" height="12" rx="2" fill="#9a9286"/><text x="159" y="332.5" font-size="12" fill="#3d3830">git-remote-gcrypt</text>
   <rect x="302" y="322" width="12" height="12" rx="2" fill="#2f6b3a"/><text x="320" y="332.5" font-size="12" fill="#3d3830">git-remote-e2ee</text>
   <text x="924" y="332.5" font-size="11" fill="#8a8276" text-anchor="end">Godot, 867 MiB of history, Git backend, Apple M1 Pro, median of 3 runs</text>
   <rect x="16" y="366" width="460" height="340" rx="12" fill="#fffdf9" stroke="#e4ded3"/>
