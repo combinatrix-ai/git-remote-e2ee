@@ -62,7 +62,7 @@ fn run_protocol<S: Storage>(repository: EncryptedRepository<S>, remote_name: Str
                 output.flush()?;
             }
             "list" | "list for-push" => {
-                let manifest = repository.observe_manifest(local_repository, &remote_name)?;
+                let manifest = repository.observe_manifest(local_repository)?;
                 if manifest.refs.contains_key("refs/heads/main") {
                     writeln!(output, "@refs/heads/main HEAD")?;
                 }
@@ -94,7 +94,7 @@ fn run_protocol<S: Storage>(repository: EncryptedRepository<S>, remote_name: Str
             }
             command if command.starts_with("fetch ") => {
                 consume_batch(&mut lines, "fetch ")?;
-                repository.import_packs(local_repository, &remote_name)?;
+                repository.import_packs(local_repository)?;
                 writeln!(output)?;
                 output.flush()?;
             }

@@ -23,6 +23,15 @@ fn git(repo: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
+fn state_dir(repo: &Path) -> std::path::PathBuf {
+    let entries: Vec<_> = fs::read_dir(repo.join(".git/git-remote-e2ee"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    entries.into_iter().next().unwrap()
+}
+
 fn initialize_git(repo: &Path) {
     fs::create_dir_all(repo).unwrap();
     git(repo, &["init", "-q", "-b", "main"]);
@@ -256,16 +265,16 @@ fn connected_membership_observation_pins_and_rejects_replay() {
             &admin_pin,
         )
         .unwrap();
-    let observed = repository.observe_manifest(&client, "e2ee").unwrap();
+    let observed = repository.observe_manifest(&client).unwrap();
     assert_eq!(observed.generation, 2);
-    let state_path = client.join(".git/git-remote-e2ee/e2ee/state.json");
+    let state_path = state_dir(&client).join("state.json");
     let state: serde_json::Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
     assert_eq!(state["generation"], 2);
     assert_eq!(state["policy_generation"], 1);
     let after_membership = fs::read_to_string(remote.join("HEAD")).unwrap();
 
     fs::write(remote.join("HEAD"), &before_membership).unwrap();
-    let error = repository.observe_manifest(&client, "e2ee").unwrap_err();
+    let error = repository.observe_manifest(&client).unwrap_err();
     assert!(format!("{error:#}").contains("rolled back"), "{error:#}");
     let state: serde_json::Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
     assert_eq!(state["generation"], 2);

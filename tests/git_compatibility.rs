@@ -531,3 +531,35 @@ fn stale_push_is_reported_as_an_ordinary_git_rejection() {
         published
     );
 }
+
+#[test]
+fn remote_rename_keeps_the_rollback_pin() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let clone = temporary.path().join("clone");
+    let snapshot = temporary.path().join("storage-snapshot");
+    initialize_git(&source);
+    let (storage, key_path, _) = setup_remote(temporary.path());
+    configure_remote(&source, &storage, &key_path);
+    commit_file(&source, "first", "first");
+    git(&source, &["push", "private", "main"], true);
+    let copied = Command::new("cp")
+        .arg("-R")
+        .arg(&storage)
+        .arg(&snapshot)
+        .status()
+        .unwrap();
+    assert!(copied.success());
+    let second = commit_file(&source, "second", "second");
+    git(&source, &["push", "private", "main"], true);
+    clone_remote(&clone, &storage, &key_path);
+
+    fs::remove_dir_all(&storage).unwrap();
+    fs::rename(&snapshot, &storage).unwrap();
+    git(&clone, &["remote", "rename", "origin", "backup"], false);
+    let rejected = git_output(&clone, &["fetch", "backup"], true);
+    assert!(!rejected.status.success());
+    let stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert!(stderr.contains("rolled back"), "{stderr}");
+    assert_eq!(git(&clone, &["rev-parse", "backup/main"], false), second);
+}

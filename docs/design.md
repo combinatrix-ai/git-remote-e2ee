@@ -384,9 +384,9 @@ require the current tip to be a single-parent child of it.
 ### Current implementation
 
 `git-e2ee recover` accepts `--remote <carrier-url>` or `--storage <directory>`,
-plus `--key`, `--repo`, and `--remote-name`. The repository defaults to `.`
-and the remote name defaults to `origin`; the continuity floor is read from
-`.git/git-remote-e2ee/<remote-name>/state.json`. Without `--publish`, the command
+plus `--key` and `--repo`. The repository defaults to `.`; the continuity floor
+is read from `.git/git-remote-e2ee/<repository-root>/state.json`, where the root
+comes from the key file. Without `--publish`, the command
 only reports. Publishing an older offer requires `--discard-newer`. Directory
 publication requires `--accept-stale-floor` and prints the warning above.
 

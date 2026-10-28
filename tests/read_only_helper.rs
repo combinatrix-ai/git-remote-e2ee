@@ -287,7 +287,6 @@ fn read_only_device_cannot_publish_recovery() {
     let report = read_only
         .recover(
             &reader_repo,
-            "origin",
             RecoveryOptions {
                 publish: true,
                 base: None,

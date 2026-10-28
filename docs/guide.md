@@ -31,8 +31,17 @@ repository is its administrator. The key path is stored only in local Git
 configuration. The key file is never written to the encrypted remote and must
 never be committed.
 
-The CLI keeps an administrative continuity pin next to an administrator key,
-named `<key-file>.admin-state.json`. Back up that file together with the key.
+The CLI keeps an administrative continuity pin per repository root at
+`$XDG_STATE_HOME/git-e2ee/<repository-root>/admin-state.json` (by default under
+`~/.local/state`). Moving or renaming the key file keeps the pin. Back up that
+file together with the key.
+
+Inside a Git repository, the continuity pin is likewise kept per repository
+root at `.git/git-remote-e2ee/<repository-root>/state.json`, not per Git remote
+name. Renaming a remote or adding a second remote for the same encrypted
+repository keeps rollback protection. Every remote for one repository root
+shares one floor, so a mirror that lags behind the newest state you have seen
+is reported as rolled back.
 
 ## Git host as storage (carrier-Git backend)
 
@@ -177,14 +186,13 @@ not publish or advance the continuity floor:
 git-e2ee recover \
   --remote https://git.example/user/encrypted-carrier.git \
   --key /safe/place/carrier.key.json \
-  --repo /work/my-clone \
-  --remote-name private
+  --repo /work/my-clone
 ```
 
 For a directory backend, use `--storage <directory>` instead of `--remote`.
 The local floor is read from
-`<repo>/.git/git-remote-e2ee/<remote-name>/state.json`; use the same repository
-and remote name that previously fetched or pushed. A fresh clone has no floor,
+`<repo>/.git/git-remote-e2ee/<repository-root>/state.json`; use a repository
+that previously fetched or pushed. The remote name does not matter. A fresh clone has no floor,
 so recovery reports that freshness and fork identity are unverified and will
 not publish.
 
@@ -202,7 +210,6 @@ git-e2ee recover \
   --remote https://git.example/user/encrypted-carrier.git \
   --key /safe/place/carrier.key.json \
   --repo /work/my-clone \
-  --remote-name private \
   --publish
 ```
 
