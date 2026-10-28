@@ -125,7 +125,11 @@ impl PolicyState {
         let body = PolicyBody {
             format_version: POLICY_FORMAT_VERSION,
             repository_root: parent.body.repository_root.clone(),
-            generation: parent.body.generation + 1,
+            generation: parent
+                .body
+                .generation
+                .checked_add(1)
+                .context("policy generation overflow")?,
             previous: Some(parent.id.clone()),
             admin_threshold: 1,
             devices,
@@ -201,7 +205,7 @@ impl PolicyState {
         if self.body.repository_root != parent.body.repository_root {
             bail!("policy repository root changed")
         }
-        if self.body.generation != parent.body.generation + 1 {
+        if parent.body.generation.checked_add(1) != Some(self.body.generation) {
             bail!("policy generation is not consecutive")
         }
         if self.body.previous.as_deref() != Some(parent.id.as_str()) {
@@ -613,5 +617,16 @@ mod tests {
             .unwrap()
             .validate_successor(&genesis)
             .unwrap();
+    }
+
+    #[test]
+    fn generation_overflow_is_a_validation_error() {
+        let owner = KeyFile::generate();
+        let (mut parent, _) = PolicyState::genesis(&owner, "owner").unwrap();
+        let (child, _) =
+            PolicyState::successor(&parent, parent.body.devices.clone(), &owner).unwrap();
+        parent.body.generation = u64::MAX;
+        assert!(PolicyState::successor(&parent, parent.body.devices.clone(), &owner).is_err());
+        assert!(child.validate_successor(&parent).is_err());
     }
 }
