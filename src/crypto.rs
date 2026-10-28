@@ -686,7 +686,11 @@ fn device_id_for_public_keys(signing: &[u8], wrapping: &[u8]) -> String {
 }
 
 fn validate_root(root: &str) -> Result<()> {
-    if root.len() != 64 || !root.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if root.len() != 64
+        || !root
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
         bail!("repository root must be a 32-byte lowercase hexadecimal value")
     }
     Ok(())
@@ -956,5 +960,11 @@ mod tests {
     fn pack_stream_rejects_empty_plaintext() {
         let mut ciphertext = Vec::new();
         assert!(seal_pack_stream(&random_key(), &[][..], &mut ciphertext, b"test-pack").is_err());
+    }
+
+    #[test]
+    fn repository_root_must_be_lowercase_hex() {
+        validate_root(&"ab".repeat(32)).unwrap();
+        assert!(validate_root(&"AB".repeat(32)).is_err());
     }
 }

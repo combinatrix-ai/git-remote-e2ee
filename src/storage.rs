@@ -376,16 +376,15 @@ impl Storage for FilesystemStorage {
 
     fn read_head(&self) -> Result<Option<String>> {
         self.check_format()?;
-        let path = self.root.join("HEAD");
-        match fs::read_to_string(path) {
-            Ok(value) => {
-                let value = value.trim().to_owned();
-                validate_id(&value)?;
-                Ok(Some(value))
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error.into()),
-        }
+        let Some(bytes) = read_bounded_head_file(&self.root.join("HEAD"))? else {
+            return Ok(None);
+        };
+        let value = std::str::from_utf8(&bytes)
+            .context("invalid opaque object id")?
+            .trim()
+            .to_owned();
+        validate_id(&value)?;
+        Ok(Some(value))
     }
 
     fn compare_and_swap_head(&self, expected: Option<&str>, next: &str) -> Result<()> {
@@ -434,12 +433,11 @@ impl Storage for FilesystemStorage {
         validate_id(next)?;
         let lock = self.lock_file()?;
         lock.lock_exclusive()?;
-        let actual = match fs::read(self.root.join("HEAD")) {
-            Ok(bytes) => Some(bytes),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        let actual = match read_bounded_head_file(&self.root.join("HEAD")) {
+            Ok(actual) => actual,
             Err(error) => {
                 fs2::FileExt::unlock(&lock)?;
-                return Err(error.into());
+                return Err(error);
             }
         };
         if actual != observed.head_bytes {
@@ -478,10 +476,16 @@ fn write_filesystem_head_locked(root: &Path, next: &str) -> Result<()> {
         .write(true)
         .create_new(true)
         .open(&temporary)?;
-    writeln!(file, "{next}")?;
-    file.sync_all()?;
-    crate::persist::durability_checkpoint(crate::persist::STAGE_AFTER_FILE_FLUSH);
-    fs::rename(&temporary, root.join("HEAD"))?;
+    let published = (|| -> std::io::Result<()> {
+        writeln!(file, "{next}")?;
+        file.sync_all()?;
+        crate::persist::durability_checkpoint(crate::persist::STAGE_AFTER_FILE_FLUSH);
+        fs::rename(&temporary, root.join("HEAD"))
+    })();
+    if let Err(error) = published {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
     crate::persist::durability_checkpoint(crate::persist::STAGE_AFTER_NAME_PUBLISH);
     crate::persist::sync_directory(root)
         .with_context(|| format!("sync directory {}", root.display()))?;
@@ -496,32 +500,54 @@ fn write_file_durable(root: &Path, name: &str, bytes: &[u8]) -> Result<()> {
         .write(true)
         .create_new(true)
         .open(&temporary)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    fs::rename(&temporary, root.join(name))?;
+    let published = (|| -> std::io::Result<()> {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, root.join(name))
+    })();
+    if let Err(error) = published {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
     crate::persist::sync_directory(root)
         .with_context(|| format!("sync directory {}", root.display()))?;
     Ok(())
 }
 
+/// Opening a FIFO for reading blocks until a writer appears, so the type is
+/// checked on the path before opening and again on the opened handle.
 fn read_bounded_head_file(path: &Path) -> Result<Option<Vec<u8>>> {
-    let mut file = match File::open(path) {
+    match fs::metadata(path) {
+        Ok(metadata) if !metadata.is_file() => bail!("storage HEAD is not a regular file"),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    if file.metadata()?.len() > MAX_STORAGE_HEAD_BYTES {
+    if !file.metadata()?.is_file() {
+        bail!("storage HEAD is not a regular file")
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_STORAGE_HEAD_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_STORAGE_HEAD_BYTES {
         bail!(BudgetExhausted(
             "recovery outer-head byte budget exhausted".to_owned()
         ))
     }
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
     Ok(Some(bytes))
 }
 
 fn validate_id(id: &str) -> Result<()> {
-    if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if id.len() != 64
+        || !id
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
         bail!("invalid opaque object id")
     }
     Ok(())
@@ -2295,5 +2321,93 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("00000000")).unwrap();
         assert!(validated_chunk_paths(directory.path()).is_err());
+    }
+
+    fn initialized_storage() -> (tempfile::TempDir, FilesystemStorage) {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(directory.path());
+        storage
+            .compare_and_swap_head(None, &object_id(b"first"))
+            .unwrap();
+        (directory, storage)
+    }
+
+    fn finishes_within<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(work());
+        });
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .ok()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_head_reads_refuse_a_fifo() {
+        let (directory, storage) = initialized_storage();
+        let observed = storage.observe_head().unwrap();
+        let head = directory.path().join("HEAD");
+        fs::remove_file(&head).unwrap();
+        let status = Command::new("mkfifo").arg(&head).status().unwrap();
+        assert!(status.success());
+        let storage = Arc::new(storage);
+
+        let reader = Arc::clone(&storage);
+        let result = finishes_within(move || reader.read_head().is_err());
+        assert_eq!(result, Some(true), "read_head must refuse a FIFO HEAD");
+
+        let reader = Arc::clone(&storage);
+        let result = finishes_within(move || reader.observe_head().is_err());
+        assert_eq!(result, Some(true), "observe_head must refuse a FIFO HEAD");
+
+        let writer = Arc::clone(&storage);
+        let result = finishes_within(move || {
+            writer
+                .compare_and_swap_observed_head(&observed, &object_id(b"second"))
+                .is_err()
+        });
+        assert_eq!(result, Some(true), "observed CAS must refuse a FIFO HEAD");
+        drop(directory);
+    }
+
+    #[test]
+    fn filesystem_head_reads_reject_oversized_heads() {
+        let (directory, storage) = initialized_storage();
+        let observed = storage.observe_head().unwrap();
+        let oversized = vec![b'a'; MAX_STORAGE_HEAD_BYTES as usize + 1];
+        fs::write(directory.path().join("HEAD"), &oversized).unwrap();
+        for error in [
+            storage.read_head().unwrap_err(),
+            storage.observe_head().unwrap_err(),
+            storage
+                .compare_and_swap_observed_head(&observed, &object_id(b"second"))
+                .unwrap_err(),
+        ] {
+            assert!(
+                error.downcast_ref::<BudgetExhausted>().is_some(),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn object_ids_must_be_lowercase_hex() {
+        validate_id(&"ab".repeat(32)).unwrap();
+        assert!(validate_id(&"AB".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn failed_head_write_removes_its_temporary() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("HEAD")).unwrap();
+        fs::write(directory.path().join("HEAD").join("occupant"), b"x").unwrap();
+        assert!(write_filesystem_head_locked(directory.path(), &object_id(b"next")).is_err());
+        let leftovers: Vec<_> = fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().starts_with(".HEAD-"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temporaries: {leftovers:?}");
     }
 }
