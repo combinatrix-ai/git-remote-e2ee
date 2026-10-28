@@ -733,10 +733,42 @@ impl<S: Storage> EncryptedRepository<S> {
         let state = read_client_state(state_path)?;
         self.validate_pinned_head(&chain, &state)?;
 
-        let stop_generation = state.imported_generation;
         let mut imported: HashSet<String> = state.packs.into_iter().collect();
+        self.import_chain_packs(repo, &chain, state.imported_generation, &mut imported)?;
+        let connectivity_timer = trace::Span::new("inner_ref_connectivity_check");
+        if git::ensure_refs_connected_since(repo, &current.manifest.refs, &state.verified_refs)
+            .is_err()
+        {
+            // Imported pack IDs are cache state, not proof that their objects
+            // are still local: deleting a remote-tracking ref and pruning
+            // removes them. Re-import the whole authenticated chain and check
+            // the full graph; the pinned floor is unchanged until that passes.
+            imported.clear();
+            self.import_chain_packs(repo, &chain, None, &mut imported)?;
+            git::ensure_refs_connected_since(repo, &current.manifest.refs, &BTreeMap::new())?;
+        }
+        drop(connectivity_timer);
+        write_client_state_locked(
+            state_path,
+            &imported,
+            &current.id,
+            &current.manifest,
+            &current.manifest.refs,
+        )?;
+        Ok(current.manifest)
+    }
+
+    /// Imports, oldest first, the packs of every chain entry newer than
+    /// `after_generation`, recording each pack ID in `imported`.
+    fn import_chain_packs(
+        &self,
+        repo: &Path,
+        chain: &[OpenedState],
+        after_generation: Option<u64>,
+        imported: &mut HashSet<String>,
+    ) -> Result<()> {
         for entry in chain.iter().rev() {
-            if stop_generation.is_some_and(|generation| entry.manifest.generation <= generation) {
+            if after_generation.is_some_and(|generation| entry.manifest.generation <= generation) {
                 continue;
             }
             for descriptor in &entry.manifest.new_packs {
@@ -773,17 +805,7 @@ impl<S: Storage> EncryptedRepository<S> {
                 imported.insert(descriptor.id.clone());
             }
         }
-        let connectivity_timer = trace::Span::new("inner_ref_connectivity_check");
-        git::ensure_refs_connected_since(repo, &current.manifest.refs, &state.verified_refs)?;
-        drop(connectivity_timer);
-        write_client_state_locked(
-            state_path,
-            &imported,
-            &current.id,
-            &current.manifest,
-            &current.manifest.refs,
-        )?;
-        Ok(current.manifest)
+        Ok(())
     }
 
     fn validate_remote_continuity(&self, state_path: &Path, chain: &[OpenedState]) -> Result<()> {

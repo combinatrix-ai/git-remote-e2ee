@@ -1958,3 +1958,72 @@ fn carrier_recovery_refuses_to_skip_a_historical_head_with_missing_objects() {
     let carrier_head = git(&carrier, &["show", "refs/heads/main:HEAD"], false);
     assert_eq!(carrier_head, junk_id);
 }
+
+#[test]
+fn carrier_history_reads_skip_corrupt_copies_for_an_older_valid_one() {
+    let temporary = tempfile::tempdir().unwrap();
+    let _cache = isolated_cache(&temporary);
+    let carrier = temporary.path().join("carrier.git");
+    let source = temporary.path().join("source");
+    init_source(&source, "content");
+
+    let owner = KeyFile::generate();
+    init_carrier(temporary.path(), &carrier, &owner);
+    let repository = EncryptedRepository::new(
+        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        owner.clone(),
+    );
+    repository
+        .push_ref(&source, "refs/heads/main", false)
+        .unwrap();
+    let (head_id, head) = repository.current_manifest().unwrap();
+    let pack_id = head.new_packs[0].id.clone();
+    let original = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let manifest_bytes = original.get_object(ObjectKind::Manifest, &head_id).unwrap();
+    let pack_bytes = original.get_object(ObjectKind::Pack, &pack_id).unwrap();
+
+    edit_carrier(
+        &carrier,
+        &temporary.path().join("carrier-edit"),
+        |workdir| {
+            for (directory, id) in [("manifests", &head_id), ("packs", &pack_id)] {
+                let chunk = workdir
+                    .join(directory)
+                    .join(&id[..2])
+                    .join(id)
+                    .join("00000000");
+                fs::write(chunk, b"corrupt copy").unwrap();
+            }
+        },
+    );
+
+    let storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    assert_ne!(
+        storage.get_object(ObjectKind::Pack, &pack_id).unwrap(),
+        pack_bytes
+    );
+    let history = storage
+        .recovery_history(2048, 64 * 1024 * 1024)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        history.commits[0].head_id.as_deref(),
+        Some(head_id.as_str())
+    );
+    assert_eq!(history.manifests[&head_id], manifest_bytes);
+
+    assert!(
+        storage
+            .restore_historical_object(ObjectKind::Pack, &pack_id)
+            .unwrap()
+    );
+    assert_eq!(
+        storage.get_object(ObjectKind::Pack, &pack_id).unwrap(),
+        pack_bytes
+    );
+    assert!(
+        !storage
+            .restore_historical_object(ObjectKind::Pack, &"0".repeat(64))
+            .unwrap()
+    );
+}

@@ -460,6 +460,12 @@ inductive check of only the newly reachable range establishes completeness of
 the new state. The frontier advances only after pack authentication, import,
 and the incremental connectivity check all succeed.
 
+Imported pack IDs do not prove that their objects remain in the local object
+database; deleting a remote-tracking ref and pruning removes them. When the
+incremental check fails, the client MUST re-import every pack of the
+authenticated chain and run a full connectivity walk before failing. The
+re-import does not move the floor; only a successful full check advances it.
+
 A missing frontier in a v5 client state requires a full connectivity walk. A
 client state from another wire version is not accepted. The incremental rule assumes the trusted
 client's existing object database has not been corrupted outside this
@@ -482,6 +488,10 @@ publication is a single-parent fast-forward, and a merge can hide a legitimate
 state behind a non-first parent. Discovery MUST deduplicate manifest IDs and
 validate candidates against the authenticated policy and predecessor chain. The byte, outer-commit, candidate, and
 cryptographic-operation budgets MUST be fixed. Exhaustion MUST fail closed.
+Reading a historical manifest or restoring historical ciphertext MUST try each
+stored copy in that bounded history newest first and use the first whose
+content ID matches, so a corrupt copy cannot hide an older valid one. Bytes
+read from rejected copies count against the byte budget.
 Discovery MUST report authenticated descendants and replays. If authenticated
 descendants conflict, recovery MUST refuse to choose a fork. A replayed older
 manifest MUST NOT be treated as a newer candidate. Directory storage has no

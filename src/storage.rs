@@ -12,7 +12,6 @@ use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::crypto::object_id;
 use crate::error::{BudgetExhausted, ObjectUnavailable};
 use crate::trace;
 
@@ -1125,55 +1124,50 @@ impl GitStorage {
         carrier_chunk_entries(self.root(), commit, kind, id)
     }
 
-    fn object_at_commit(
+    /// Commits in `window` whose tree changed the stored copy of `id`, newest
+    /// first. Carrier history is linear, so each one starts a distinct copy.
+    fn copy_commits(&self, window: &[String], kind: ObjectKind, id: &str) -> Result<Vec<String>> {
+        validate_id(id)?;
+        let Some(newest) = window.first() else {
+            return Ok(Vec::new());
+        };
+        let directory = format!("{}/{}/{id}", kind.directory(), &id[..2]);
+        let output = carrier_git_command()
+            .arg("-C")
+            .arg(self.root())
+            .args([
+                "rev-list",
+                &format!("--max-count={}", window.len()),
+                newest,
+                "--",
+                &directory,
+            ])
+            .output()?;
+        ensure_git_success(&output, "git rev-list carrier object copies")?;
+        let window: HashSet<&str> = window.iter().map(String::as_str).collect();
+        Ok(String::from_utf8(output.stdout)?
+            .lines()
+            .filter(|commit| window.contains(commit))
+            .map(ToOwned::to_owned)
+            .collect())
+    }
+
+    /// Streams the copy of `id` stored at `commit` into `sink` chunk by chunk.
+    /// Returns false when the commit holds no copy or the copy is malformed or
+    /// does not hash to `id`; `sink` errors and process failures propagate.
+    fn read_copy_at(
         &self,
         commit: &str,
         kind: ObjectKind,
         id: &str,
-        max_bytes: u64,
-    ) -> Result<Option<Vec<u8>>> {
-        let Some(chunks) = self.chunk_entries_at(commit, kind, id)? else {
-            return Ok(None);
+        mut sink: impl FnMut(usize, &[u8]) -> Result<()>,
+    ) -> Result<bool> {
+        let chunks = match self.chunk_entries_at(commit, kind, id) {
+            Ok(Some(chunks)) => chunks,
+            Ok(None) => return Ok(false),
+            Err(error) if error.is::<std::io::Error>() => return Err(error),
+            Err(_) => return Ok(false),
         };
-        let mut bytes = Vec::new();
-        for (index, (path, _)) in chunks.iter().enumerate() {
-            let output = carrier_git_command()
-                .arg("-C")
-                .arg(self.root())
-                .args(["show", &format!("{commit}:{path}")])
-                .output()?;
-            ensure_git_success(&output, "git show historical carrier object")?;
-            let length = output.stdout.len();
-            if (index + 1 < chunks.len() && length != CARRIER_CHUNK_SIZE)
-                || (index + 1 == chunks.len() && (length == 0 || length > CARRIER_CHUNK_SIZE))
-            {
-                bail!("historical carrier object chunk has invalid size")
-            }
-            let next_length = (bytes.len() as u64)
-                .checked_add(length as u64)
-                .context("historical carrier object size overflow")?;
-            if next_length > max_bytes {
-                bail!(BudgetExhausted(
-                    "carrier recovery manifest byte budget exhausted".to_owned()
-                ))
-            }
-            bytes.extend_from_slice(&output.stdout);
-        }
-        if object_id(&bytes) != id {
-            bail!("historical carrier object content id mismatch")
-        }
-        Ok(Some(bytes))
-    }
-
-    fn restore_object_at(&self, commit: &str, kind: ObjectKind, id: &str) -> Result<bool> {
-        let Some(chunks) = self.chunk_entries_at(commit, kind, id)? else {
-            return Ok(false);
-        };
-        let staging = tempfile::Builder::new()
-            .prefix("git-remote-e2ee-restore-")
-            .tempdir_in(self.root())?;
-        let object_dir = staging.path().join("object");
-        fs::create_dir(&object_dir)?;
         let mut hasher = Sha256::new();
         for (index, (path, _)) in chunks.iter().enumerate() {
             let output = carrier_git_command()
@@ -1181,33 +1175,17 @@ impl GitStorage {
                 .arg(self.root())
                 .args(["show", &format!("{commit}:{path}")])
                 .output()?;
-            ensure_git_success(&output, "git show historical carrier object")?;
             let length = output.stdout.len();
-            if (index + 1 < chunks.len() && length != CARRIER_CHUNK_SIZE)
+            if !output.status.success()
+                || (index + 1 < chunks.len() && length != CARRIER_CHUNK_SIZE)
                 || (index + 1 == chunks.len() && (length == 0 || length > CARRIER_CHUNK_SIZE))
             {
-                bail!("historical carrier object chunk has invalid size")
+                return Ok(false);
             }
             hasher.update(&output.stdout);
-            let chunk_path = object_dir.join(format!("{index:08}"));
-            let mut file = File::create(chunk_path)?;
-            file.write_all(&output.stdout)?;
-            file.sync_all()?;
+            sink(index, &output.stdout)?;
         }
-        if hex::encode(hasher.finalize()) != id {
-            bail!("historical carrier object content id mismatch")
-        }
-        let target = self.object_directory(kind, id)?;
-        if target.exists() {
-            fs::remove_dir_all(&target)?;
-        }
-        fs::create_dir_all(
-            target
-                .parent()
-                .context("carrier object path has no parent")?,
-        )?;
-        fs::rename(object_dir, target)?;
-        Ok(true)
+        Ok(hex::encode(hasher.finalize()) == id)
     }
 
     fn publish_checkout_head(
@@ -1420,10 +1398,11 @@ impl Storage for GitStorage {
             ))
         }
         let mut history = RecoveryHistory::default();
+        // Every byte read counts, including corrupt copies that are skipped.
         let mut total_bytes = 0_u64;
-        for commit_id in commits {
+        for commit_id in &commits {
             let head_id = self
-                .head_bytes_at_commit(&commit_id)?
+                .head_bytes_at_commit(commit_id)?
                 .as_deref()
                 .and_then(|bytes| {
                     std::str::from_utf8(bytes)
@@ -1435,22 +1414,31 @@ impl Storage for GitStorage {
             if let Some(id) = &head_id
                 && !history.manifests.contains_key(id)
             {
-                let remaining = max_manifest_bytes.saturating_sub(total_bytes);
-                if let Some(bytes) =
-                    self.object_at_commit(&commit_id, ObjectKind::Manifest, id, remaining)?
-                {
-                    total_bytes = total_bytes
-                        .checked_add(bytes.len() as u64)
-                        .context("carrier recovery manifest byte count overflow")?;
-                    if total_bytes > max_manifest_bytes {
-                        bail!(BudgetExhausted(
-                            "carrier recovery manifest byte budget exhausted".to_owned()
-                        ))
+                for copy in self.copy_commits(&commits, ObjectKind::Manifest, id)? {
+                    let mut bytes = Vec::new();
+                    let valid =
+                        self.read_copy_at(&copy, ObjectKind::Manifest, id, |_, chunk| {
+                            total_bytes = total_bytes
+                                .checked_add(chunk.len() as u64)
+                                .context("carrier recovery manifest byte count overflow")?;
+                            if total_bytes > max_manifest_bytes {
+                                bail!(BudgetExhausted(
+                                    "carrier recovery manifest byte budget exhausted".to_owned()
+                                ))
+                            }
+                            bytes.extend_from_slice(chunk);
+                            Ok(())
+                        })?;
+                    if valid {
+                        history.manifests.insert(id.clone(), bytes);
+                        break;
                     }
-                    history.manifests.insert(id.clone(), bytes);
                 }
             }
-            history.commits.push(RecoveryCommit { commit_id, head_id });
+            history.commits.push(RecoveryCommit {
+                commit_id: commit_id.clone(),
+                head_id,
+            });
         }
         Ok(Some(history))
     }
@@ -1462,10 +1450,32 @@ impl Storage for GitStorage {
                 "carrier recovery outer-commit budget exhausted".to_owned()
             ))
         }
-        for commit in commits {
-            if self.restore_object_at(&commit, kind, id)? {
-                return Ok(true);
+        for copy in self.copy_commits(&commits, kind, id)? {
+            let staging = tempfile::Builder::new()
+                .prefix("git-remote-e2ee-restore-")
+                .tempdir_in(self.root())?;
+            let object_dir = staging.path().join("object");
+            fs::create_dir(&object_dir)?;
+            let valid = self.read_copy_at(&copy, kind, id, |index, chunk| {
+                let mut file = File::create(object_dir.join(format!("{index:08}")))?;
+                file.write_all(chunk)?;
+                file.sync_all()?;
+                Ok(())
+            })?;
+            if !valid {
+                continue;
             }
+            let target = self.object_directory(kind, id)?;
+            if target.exists() {
+                fs::remove_dir_all(&target)?;
+            }
+            fs::create_dir_all(
+                target
+                    .parent()
+                    .context("carrier object path has no parent")?,
+            )?;
+            fs::rename(object_dir, target)?;
+            return Ok(true);
         }
         Ok(false)
     }
