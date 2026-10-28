@@ -277,7 +277,7 @@ mod tests {
     }
 
     fn object_file(root: &Path, id: &str) -> PathBuf {
-        root.join("objects").join(&id[..2]).join(id)
+        root.join("packs").join(&id[..2]).join(id)
     }
 
     fn reset_dir(path: &Path) {

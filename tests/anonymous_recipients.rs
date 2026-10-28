@@ -52,7 +52,7 @@ fn carrier_history_hides_device_metadata_and_pads_reader_envelopes() {
         || carrier_snapshot(&carrier),
         || {
             let paths = git_output(&carrier, &["log", "--all", "--name-only", "--format="]);
-            assert!(!String::from_utf8_lossy(&paths.stdout).contains("e2ee/policies/"));
+            assert!(!String::from_utf8_lossy(&paths.stdout).contains("policies/"));
         },
         temporary.path(),
     );

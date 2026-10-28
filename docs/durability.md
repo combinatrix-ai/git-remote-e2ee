@@ -22,7 +22,7 @@ objects use the same flush rules:
    - `state.json` and `HEAD` use `rename` in the destination directory and
      replace an existing file.
    - Immutable objects use `hard_link` from `.staging/<temp>` to
-     `objects/<prefix>/<id>`. Those are different directories on the same
+     `packs/<prefix>/<id>`. Those are different directories on the same
      filesystem. An existing path is not replaced. Its bytes are hashed and
      must equal the object id; otherwise the call fails and the file is left
      untouched.
@@ -30,15 +30,15 @@ objects use the same flush rules:
    flushing it, if it fails, fails the publication. Success is not returned
    when this step fails.
 
-`FilesystemStorage::initialize` creates `objects`, `manifests`, and `policies`
+`FilesystemStorage::initialize` creates `packs` and `manifests`
 with the same directory helper, so the storage root (the preexisting ancestor)
 is flushed when those directories are new. A later object shard flushes the new
-`<prefix>` directory and `objects`, not the storage root again. Client state
+`<prefix>` directory and `packs`, not the storage root again. Client state
 creates `.git/git-remote-e2ee/<remote>` the same way and stops at `.git` when
 that directory already exists.
 
 The carrier-Git backend does not use this helper. Its compare-and-swap is the
-fast-forward push of `refs/heads/git-remote-e2ee`.
+fast-forward push of the carrier branch (`refs/heads/main` by default).
 
 `KeyFile::write_new` still creates the final file in place and flushes that
 file only. It does not flush the parent directory. That path is outside this
@@ -74,7 +74,7 @@ result. Crash evidence is still pending.
 
 `MoveFileExW` / `MOVEFILE_WRITE_THROUGH` is not used. `HEAD` and client state
 still use rename. Objects still use a hard link across `.staging` and
-`objects/<prefix>/`. `ReplaceFileW` / `REPLACEFILE_WRITE_THROUGH` is not used;
+`packs/<prefix>/`. `ReplaceFileW` / `REPLACEFILE_WRITE_THROUGH` is not used;
 that flag is unsupported.
 
 ## What a returned success means

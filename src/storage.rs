@@ -151,10 +151,62 @@ pub enum ObjectKind {
     Manifest,
 }
 
+/// The storage layout version this build reads and writes.
+const STORAGE_FORMAT: &[u8] = b"git-remote-e2ee storage 6\n";
+const STORAGE_FORMAT_PREFIX: &str = "git-remote-e2ee storage ";
+const MAX_STORAGE_FORMAT_BYTES: u64 = 256;
+
+/// Plaintext notice at the storage root. It discloses nothing beyond the
+/// fact that the storage holds a git-remote-e2ee repository.
+fn storage_readme(subject: &str) -> String {
+    format!(
+        "# Encrypted Git repository
+
+{subject} holds an end-to-end encrypted Git repository managed by
+git-remote-e2ee (https://github.com/combinatrix-ai/git-remote-e2ee).
+Its contents are ciphertext. Do not edit, rename, or delete files here.
+
+To clone it, install git-remote-e2ee and run:
+
+    git -c e2ee.key=<your device key> clone e2ee::<this repository's URL>
+"
+    )
+}
+
+/// `FORMAT` is unauthenticated: storage can rewrite it freely. It only
+/// turns a layout mismatch into a readable message before any parsing.
+/// Authenticity still comes from signed manifests, which carry their own
+/// version tags.
+fn check_storage_format(location: &str, format: Option<&[u8]>, head_present: bool) -> Result<()> {
+    let found = match format {
+        Some(STORAGE_FORMAT) => return Ok(()),
+        None if !head_present => return Ok(()),
+        None => "5 or earlier".to_owned(),
+        Some(bytes) => {
+            let text = String::from_utf8_lossy(bytes);
+            let text = text.trim();
+            match text.strip_prefix(STORAGE_FORMAT_PREFIX) {
+                Some(version) => version.to_owned(),
+                None => format!("{text:?}"),
+            }
+        }
+    };
+    bail!("storage at {location} uses format {found}; this git-remote-e2ee reads format 6")
+}
+
+fn read_bounded_format(mut reader: impl Read) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader
+        .by_ref()
+        .take(MAX_STORAGE_FORMAT_BYTES)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 impl ObjectKind {
     fn directory(self) -> &'static str {
         match self {
-            Self::Pack => "objects",
+            Self::Pack => "packs",
             Self::Manifest => "manifests",
         }
     }
@@ -171,7 +223,10 @@ impl FilesystemStorage {
     }
 
     pub fn initialize(&self) -> Result<()> {
-        for name in ["objects", "manifests"] {
+        for name in [
+            ObjectKind::Pack.directory(),
+            ObjectKind::Manifest.directory(),
+        ] {
             let directory = self.root.join(name);
             crate::persist::create_dir_all_durable(&directory)
                 .with_context(|| format!("create {}", directory.display()))?;
@@ -182,6 +237,34 @@ impl FilesystemStorage {
     fn object_path(&self, kind: ObjectKind, id: &str) -> Result<PathBuf> {
         validate_id(id)?;
         Ok(self.root.join(kind.directory()).join(&id[..2]).join(id))
+    }
+
+    fn check_format(&self) -> Result<()> {
+        let format = match File::open(self.root.join("FORMAT")) {
+            Ok(file) => Some(read_bounded_format(file)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let head_present = self.root.join("HEAD").exists();
+        check_storage_format(
+            &self.root.display().to_string(),
+            format.as_deref(),
+            head_present,
+        )
+    }
+
+    /// Writes the root notice and `FORMAT` before the genesis HEAD, so a
+    /// published HEAD always has a `FORMAT` beside it.
+    fn write_genesis_files(&self) -> Result<()> {
+        let readme = self.root.join("README.md");
+        if !readme.exists() {
+            write_file_durable(
+                &self.root,
+                "README.md",
+                storage_readme("This directory").as_bytes(),
+            )?;
+        }
+        write_file_durable(&self.root, "FORMAT", STORAGE_FORMAT)
     }
 
     fn lock_file(&self) -> Result<File> {
@@ -286,6 +369,7 @@ impl Storage for FilesystemStorage {
     }
 
     fn read_head(&self) -> Result<Option<String>> {
+        self.check_format()?;
         let path = self.root.join("HEAD");
         match fs::read_to_string(path) {
             Ok(value) => {
@@ -311,26 +395,20 @@ impl Storage for FilesystemStorage {
             }
             .into());
         }
+        if actual.is_none()
+            && let Err(error) = self.write_genesis_files()
+        {
+            fs2::FileExt::unlock(&lock)?;
+            return Err(error);
+        }
 
-        let mut random = [0_u8; 8];
-        OsRng.fill_bytes(&mut random);
-        let temporary = self.root.join(format!(".HEAD-{}", hex::encode(random)));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)?;
-        writeln!(file, "{next}")?;
-        file.sync_all()?;
-        crate::persist::durability_checkpoint(crate::persist::STAGE_AFTER_FILE_FLUSH);
-        fs::rename(&temporary, self.root.join("HEAD"))?;
-        crate::persist::durability_checkpoint(crate::persist::STAGE_AFTER_NAME_PUBLISH);
-        crate::persist::sync_directory(&self.root)
-            .with_context(|| format!("sync directory {}", self.root.display()))?;
+        write_filesystem_head_locked(&self.root, next)?;
         fs2::FileExt::unlock(&lock)?;
         Ok(())
     }
 
     fn observe_head(&self) -> Result<HeadObservation> {
+        self.check_format()?;
         let head_bytes = read_bounded_head_file(&self.root.join("HEAD"))?;
         let head_id = head_bytes.as_deref().and_then(|bytes| {
             std::str::from_utf8(bytes)
@@ -373,6 +451,12 @@ impl Storage for FilesystemStorage {
             }
             .into());
         }
+        if actual.is_none()
+            && let Err(error) = self.write_genesis_files()
+        {
+            fs2::FileExt::unlock(&lock)?;
+            return Err(error);
+        }
 
         write_filesystem_head_locked(&self.root, next)?;
         fs2::FileExt::unlock(&lock)?;
@@ -393,6 +477,22 @@ fn write_filesystem_head_locked(root: &Path, next: &str) -> Result<()> {
     crate::persist::durability_checkpoint(crate::persist::STAGE_AFTER_FILE_FLUSH);
     fs::rename(&temporary, root.join("HEAD"))?;
     crate::persist::durability_checkpoint(crate::persist::STAGE_AFTER_NAME_PUBLISH);
+    crate::persist::sync_directory(root)
+        .with_context(|| format!("sync directory {}", root.display()))?;
+    Ok(())
+}
+
+fn write_file_durable(root: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+    let mut random = [0_u8; 8];
+    OsRng.fill_bytes(&mut random);
+    let temporary = root.join(format!(".{name}-{}", hex::encode(random)));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    fs::rename(&temporary, root.join(name))?;
     crate::persist::sync_directory(root)
         .with_context(|| format!("sync directory {}", root.display()))?;
     Ok(())
@@ -439,16 +539,28 @@ fn verify_file_id(path: &Path, id: &str) -> Result<()> {
     Ok(())
 }
 
-const CARRIER_BRANCH: &str = "git-remote-e2ee";
+const CARRIER_DEFAULT_BRANCH: &str = "main";
 const CARRIER_CHUNK_SIZE: usize = 32 * 1024 * 1024;
-const CARRIER_ATTRIBUTES: &[u8] = b"e2ee/** -delta\n";
+const CARRIER_ATTRIBUTES: &[u8] = b"* -delta\n";
 const CARRIER_CACHE_ENV: &str = "GIT_REMOTE_E2EE_CACHE_DIR";
-const CARRIER_CACHE_FETCH_REF: &str = "refs/heads/git-remote-e2ee";
+/// Each cache serves one (remote, branch) pair, so one fixed ref suffices.
+const CARRIER_CACHE_FETCH_REF: &str = "refs/heads/carrier";
+/// Every path a carrier publication may contain, relative to the branch root.
+const CARRIER_ROOT_ENTRIES: [&str; 6] = [
+    ".gitattributes",
+    "README.md",
+    "FORMAT",
+    "HEAD",
+    "manifests",
+    "packs",
+];
 const MAX_RECOVERY_OUTER_COMMITS: usize = 2048;
 
 pub struct GitStorage {
     checkout: tempfile::TempDir,
+    location: String,
     remote: String,
+    branch: String,
     state: Mutex<GitStorageState>,
 }
 
@@ -707,7 +819,6 @@ impl ObjectStageSink for CarrierObjectStage {
         }
         let target = self
             .root
-            .join("e2ee")
             .join(self.kind.directory())
             .join(&id[..2])
             .join(id);
@@ -767,34 +878,36 @@ fn validated_chunk_paths(directory: &Path) -> Result<Vec<PathBuf>> {
 }
 
 impl GitStorage {
-    pub fn open(remote: &str) -> Result<Self> {
-        if remote.is_empty() {
-            bail!("empty carrier Git remote")
-        }
+    /// Opens `remote`, optionally suffixed with `#<branch>` to select the
+    /// carrier branch (default `main`).
+    pub fn open(location: &str) -> Result<Self> {
+        let (remote, branch) = parse_carrier_location(location)?;
+        let remote = remote.as_str();
+        let branch = branch.as_str();
 
         let lock_timer = trace::Span::new("carrier_cache_lock");
-        let mut cache = CarrierCache::lock(remote)?;
+        let mut cache = CarrierCache::lock(remote, branch)?;
         drop(lock_timer);
         let fetch_timer = trace::Span::new("carrier_cache_fetch");
-        let mut base_commit = cache.refresh(remote)?;
+        let mut base_commit = cache.refresh(remote, branch)?;
         drop(fetch_timer);
         let mut checkout = tempfile::Builder::new()
             .prefix("git-remote-e2ee-carrier-")
             .tempdir()?;
         let checkout_timer = trace::Span::new("carrier_checkout_create");
         if let Err(error) =
-            create_carrier_checkout(checkout.path(), &cache.path, remote, &base_commit)
+            create_carrier_checkout(checkout.path(), &cache.path, remote, branch, &base_commit)
         {
             if !cache.is_corrupt()? {
                 return Err(error).context("create carrier checkout");
             }
             drop(checkout);
             cache.rebuild()?;
-            base_commit = cache.refresh(remote)?;
+            base_commit = cache.refresh(remote, branch)?;
             checkout = tempfile::Builder::new()
                 .prefix("git-remote-e2ee-carrier-")
                 .tempdir()?;
-            create_carrier_checkout(checkout.path(), &cache.path, remote, &base_commit)
+            create_carrier_checkout(checkout.path(), &cache.path, remote, branch, &base_commit)
                 .context("create carrier checkout after rebuilding corrupt cache")?;
         }
         drop(checkout_timer);
@@ -802,7 +915,9 @@ impl GitStorage {
 
         Ok(Self {
             checkout,
+            location: location.to_owned(),
             remote: remote.to_owned(),
+            branch: branch.to_owned(),
             state: Mutex::new(GitStorageState { base_commit }),
         })
     }
@@ -813,16 +928,67 @@ impl GitStorage {
 
     fn object_directory(&self, kind: ObjectKind, id: &str) -> Result<PathBuf> {
         validate_id(id)?;
-        Ok(self
-            .root()
-            .join("e2ee")
-            .join(kind.directory())
-            .join(&id[..2])
-            .join(id))
+        Ok(self.root().join(kind.directory()).join(&id[..2]).join(id))
+    }
+
+    /// Reads a root file from the checkout, falling back to the opened
+    /// commit because the checkout only populates the index.
+    fn local_root_file(&self, name: &str, max_bytes: u64) -> Result<Option<Vec<u8>>> {
+        let path = self.root().join(name);
+        match File::open(&path) {
+            Ok(file) => {
+                if file.metadata()?.len() > max_bytes {
+                    bail!("carrier {name} exceeds its size budget")
+                }
+                let mut bytes = Vec::new();
+                file.take(max_bytes).read_to_end(&mut bytes)?;
+                Ok(Some(bytes))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(commit) = git_rev_parse(self.root(), "HEAD")? else {
+                    return Ok(None);
+                };
+                self.file_at_commit(&commit, name, max_bytes)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn check_format(&self) -> Result<()> {
+        let format = self.local_root_file("FORMAT", MAX_STORAGE_FORMAT_BYTES)?;
+        let head_present = self
+            .local_root_file("HEAD", MAX_STORAGE_HEAD_BYTES)?
+            .is_some();
+        check_storage_format(&self.location, format.as_deref(), head_present)
+    }
+
+    /// Writes HEAD into the checkout, plus the root notice and `FORMAT`
+    /// when this publication creates the branch.
+    fn write_checkout_head(&self, next: &str, genesis: bool) -> Result<()> {
+        if genesis {
+            fs::write(self.root().join("README.md"), storage_readme("This branch"))?;
+            fs::write(self.root().join("FORMAT"), STORAGE_FORMAT)?;
+        }
+        fs::write(self.root().join("HEAD"), format!("{next}\n"))?;
+        Ok(())
+    }
+
+    /// A carrier branch that exists without a HEAD holds someone else's
+    /// content (for example a hosting provider's initial README).
+    fn refuse_foreign_branch(&self, base_commit: &Option<String>) -> Result<()> {
+        if base_commit.is_some() {
+            bail!(
+                "branch {branch} of {remote} already exists; use an empty repository or choose another branch with e2ee::{remote}#<branch>",
+                branch = self.branch,
+                remote = self.remote,
+            )
+        }
+        Ok(())
     }
 
     fn local_head(&self) -> Result<Option<String>> {
-        let path = self.root().join("e2ee/HEAD");
+        self.check_format()?;
+        let path = self.root().join("HEAD");
         match fs::read_to_string(path) {
             Ok(value) => {
                 let value = value.trim().to_owned();
@@ -845,7 +1011,8 @@ impl GitStorage {
     }
 
     fn local_head_bytes(&self) -> Result<Option<Vec<u8>>> {
-        let path = self.root().join("e2ee/HEAD");
+        self.check_format()?;
+        let path = self.root().join("HEAD");
         match read_bounded_head_file(&path) {
             Ok(Some(bytes)) => Ok(Some(bytes)),
             Ok(None) => {
@@ -865,7 +1032,7 @@ impl GitStorage {
         let output = carrier_git_command()
             .arg("-C")
             .arg(self.root())
-            .args(["show", &format!("{commit}:e2ee/HEAD")])
+            .args(["show", &format!("{commit}:HEAD")])
             .output()?;
         if !output.status.success() {
             return Ok(None);
@@ -876,7 +1043,11 @@ impl GitStorage {
     }
 
     fn head_bytes_at_commit(&self, commit: &str) -> Result<Option<Vec<u8>>> {
-        let object = format!("{commit}:e2ee/HEAD");
+        self.file_at_commit(commit, "HEAD", MAX_STORAGE_HEAD_BYTES)
+    }
+
+    fn file_at_commit(&self, commit: &str, name: &str, max_bytes: u64) -> Result<Option<Vec<u8>>> {
+        let object = format!("{commit}:{name}");
         let size = carrier_git_command()
             .arg("-C")
             .arg(self.root())
@@ -886,8 +1057,11 @@ impl GitStorage {
             return Ok(None);
         }
         let size = String::from_utf8(size.stdout)?.trim().parse::<u64>()?;
-        if size > MAX_STORAGE_HEAD_BYTES {
-            bail!("recovery outer-head byte budget exhausted")
+        if size > max_bytes {
+            if name == "HEAD" {
+                bail!("recovery outer-head byte budget exhausted")
+            }
+            bail!("carrier {name} exceeds its size budget")
         }
         let output = carrier_git_command()
             .arg("-C")
@@ -1028,10 +1202,10 @@ impl GitStorage {
         &self,
         next: &str,
         expected: Option<String>,
+        genesis: bool,
         cache: &mut CarrierCache,
-    ) -> Result<()> {
-        fs::create_dir_all(self.root().join("e2ee"))?;
-        fs::write(self.root().join("e2ee/HEAD"), format!("{next}\n"))?;
+    ) -> Result<String> {
+        self.write_checkout_head(next, genesis)?;
         let add_timer = trace::Span::new("carrier_git_add");
         stage_carrier_checkout(self.root(), &cache.path.join("objects"))?;
         drop(add_timer);
@@ -1049,10 +1223,10 @@ impl GitStorage {
             .arg("-C")
             .arg(self.root())
             .args(["push", "--quiet", "origin"])
-            .arg(format!("HEAD:refs/heads/{CARRIER_BRANCH}"))
+            .arg(format!("HEAD:refs/heads/{}", self.branch))
             .output()?;
         if !push.status.success() {
-            let latest = cache.refresh(&self.remote)?;
+            let latest = cache.refresh(&self.remote, &self.branch)?;
             return Err(CasConflict {
                 expected,
                 actual: self.head_at_commit(latest.as_deref())?,
@@ -1061,7 +1235,7 @@ impl GitStorage {
         }
         drop(push_timer);
         cache.update_published_tip(&new_commit)?;
-        Ok(())
+        Ok(new_commit)
     }
 }
 
@@ -1114,9 +1288,9 @@ impl Storage for GitStorage {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("carrier state lock poisoned"))?;
-        let mut cache = CarrierCache::lock(&self.remote)?;
+        let mut cache = CarrierCache::lock(&self.remote, &self.branch)?;
         let refresh_timer = trace::Span::new("carrier_cas_refresh");
-        let remote_tip = cache.refresh(&self.remote)?;
+        let remote_tip = cache.refresh(&self.remote, &self.branch)?;
         drop(refresh_timer);
         if remote_tip != state.base_commit {
             return Err(CasConflict {
@@ -1133,38 +1307,15 @@ impl Storage for GitStorage {
             }
             .into());
         }
-
-        fs::create_dir_all(self.root().join("e2ee"))?;
-        fs::write(self.root().join("e2ee/HEAD"), format!("{next}\n"))?;
-        let add_timer = trace::Span::new("carrier_git_add");
-        stage_carrier_checkout(self.root(), &cache.path.join("objects"))?;
-        drop(add_timer);
-        let commit_timer = trace::Span::new("carrier_git_commit");
-        git_command_with_object_directory(
-            self.root(),
-            &cache.path.join("objects"),
-            &["commit", "--quiet", "-m", "git-remote-e2ee storage update"],
-        )?;
-        drop(commit_timer);
-        let new_commit =
-            git_rev_parse(self.root(), "HEAD")?.context("carrier commit was not created")?;
-        let push_timer = trace::Span::new("carrier_git_push");
-        let push = carrier_git_command()
-            .arg("-C")
-            .arg(self.root())
-            .args(["push", "--quiet", "origin"])
-            .arg(format!("HEAD:refs/heads/{CARRIER_BRANCH}"))
-            .output()?;
-        if !push.status.success() {
-            let latest = cache.refresh(&self.remote)?;
-            return Err(CasConflict {
-                expected: expected.map(ToOwned::to_owned),
-                actual: self.head_at_commit(latest.as_deref())?,
-            }
-            .into());
+        if actual.is_none() {
+            self.refuse_foreign_branch(&state.base_commit)?;
         }
-        drop(push_timer);
-        cache.update_published_tip(&new_commit)?;
+        let new_commit = self.publish_checkout_head(
+            next,
+            expected.map(ToOwned::to_owned),
+            state.base_commit.is_none(),
+            &mut cache,
+        )?;
         state.base_commit = Some(new_commit);
         Ok(())
     }
@@ -1204,8 +1355,8 @@ impl Storage for GitStorage {
         if observed.token != expected_tip.as_deref().unwrap_or_default().as_bytes() {
             bail!("recovery storage token does not match the opened carrier tip")
         }
-        let mut cache = CarrierCache::lock(&self.remote)?;
-        let remote_tip = cache.refresh(&self.remote)?;
+        let mut cache = CarrierCache::lock(&self.remote, &self.branch)?;
+        let remote_tip = cache.refresh(&self.remote, &self.branch)?;
         if remote_tip != expected_tip {
             return Err(CasConflict {
                 expected: observed.head_id.clone(),
@@ -1227,9 +1378,15 @@ impl Storage for GitStorage {
             }
             .into());
         }
-        self.publish_checkout_head(next, observed.head_id.clone(), &mut cache)?;
-        let new_commit =
-            git_rev_parse(self.root(), "HEAD")?.context("carrier commit was not created")?;
+        if actual_bytes.is_none() {
+            self.refuse_foreign_branch(&expected_tip)?;
+        }
+        let new_commit = self.publish_checkout_head(
+            next,
+            observed.head_id.clone(),
+            expected_tip.is_none(),
+            &mut cache,
+        )?;
         state.base_commit = Some(new_commit);
         Ok(())
     }
@@ -1293,8 +1450,11 @@ impl Storage for GitStorage {
     fn prepare_recovery(&self, manifest_ids: &[String], pack_ids: &[String]) -> Result<()> {
         let manifests: HashSet<&str> = manifest_ids.iter().map(String::as_str).collect();
         let packs: HashSet<&str> = pack_ids.iter().map(String::as_str).collect();
-        retain_carrier_objects(&self.root().join("e2ee/manifests"), &manifests)?;
-        retain_carrier_objects(&self.root().join("e2ee/objects"), &packs)?;
+        retain_carrier_objects(
+            &self.root().join(ObjectKind::Manifest.directory()),
+            &manifests,
+        )?;
+        retain_carrier_objects(&self.root().join(ObjectKind::Pack.directory()), &packs)?;
         remove_unretained_index_objects(self.root(), ObjectKind::Manifest, &manifests)?;
         remove_unretained_index_objects(self.root(), ObjectKind::Pack, &packs)?;
         Ok(())
@@ -1306,11 +1466,11 @@ fn remove_unretained_index_objects(
     kind: ObjectKind,
     keep: &HashSet<&str>,
 ) -> Result<()> {
-    let tree = format!("e2ee/{}", kind.directory());
+    let tree = kind.directory();
     let output = carrier_git_command()
         .arg("-C")
         .arg(repo)
-        .args(["ls-files", "-z", "--", &tree])
+        .args(["ls-files", "-z", "--", tree])
         .output()?;
     ensure_git_success(&output, "git ls-files carrier recovery objects")?;
     let mut remove = Vec::new();
@@ -1321,7 +1481,7 @@ fn remove_unretained_index_objects(
     {
         let path = std::str::from_utf8(path)?;
         let mut fields = path.split('/');
-        if fields.next() != Some("e2ee") || fields.next() != Some(kind.directory()) {
+        if fields.next() != Some(kind.directory()) {
             bail!("unexpected carrier index path during recovery")
         }
         let _prefix = fields.next().context("carrier index path has no prefix")?;
@@ -1383,7 +1543,7 @@ fn carrier_chunk_entries(
     id: &str,
 ) -> Result<Option<Vec<(String, String)>>> {
     validate_id(id)?;
-    let directory = format!("e2ee/{}/{}/{id}", kind.directory(), &id[..2]);
+    let directory = format!("{}/{}/{id}", kind.directory(), &id[..2]);
     let output = carrier_git_command()
         .arg("-C")
         .arg(repo)
@@ -1439,9 +1599,10 @@ struct CarrierCache {
 }
 
 impl CarrierCache {
-    fn lock(remote: &str) -> Result<Self> {
+    fn lock(remote: &str, branch: &str) -> Result<Self> {
         let normalized = normalize_carrier_remote(remote)?;
-        let hash = hex::encode(Sha256::digest(normalized.as_bytes()));
+        let key = format!("{normalized}#{branch}");
+        let hash = hex::encode(Sha256::digest(key.as_bytes()));
         let root = carrier_cache_root()?;
         fs::create_dir_all(&root)
             .with_context(|| format!("create carrier cache directory {}", root.display()))?;
@@ -1466,19 +1627,19 @@ impl CarrierCache {
         })
     }
 
-    fn refresh(&mut self, remote: &str) -> Result<Option<String>> {
+    fn refresh(&mut self, remote: &str, branch: &str) -> Result<Option<String>> {
         let initialize_timer = trace::Span::new("carrier_cache_initialize");
         self.ensure_initialized()?;
         drop(initialize_timer);
         let fetch_timer = trace::Span::new("carrier_cache_fetch_remote");
-        match fetch_carrier_branch(&self.path, remote) {
+        match fetch_carrier_branch(&self.path, remote, branch) {
             Ok(tip) => {
                 drop(fetch_timer);
                 Ok(tip)
             }
             Err(fetch_error) if self.is_corrupt()? => {
                 self.rebuild()?;
-                let result = fetch_carrier_branch(&self.path, remote).with_context(|| {
+                let result = fetch_carrier_branch(&self.path, remote, branch).with_context(|| {
                     format!(
                         "fetch carrier branch after rebuilding corrupt cache (initial fetch failed: {fetch_error:#})"
                     )
@@ -1613,6 +1774,28 @@ fn carrier_cache_root() -> Result<PathBuf> {
     Ok(cache_home.join("git-remote-e2ee").join("carrier"))
 }
 
+/// Splits `remote#branch` on the last `#`; without a `#` the branch is
+/// `main`.
+fn parse_carrier_location(location: &str) -> Result<(String, String)> {
+    let (remote, branch) = match location.rsplit_once('#') {
+        Some((remote, branch)) => (remote, branch),
+        None => (location, CARRIER_DEFAULT_BRANCH),
+    };
+    if remote.is_empty() {
+        bail!("empty carrier Git remote")
+    }
+    if branch.is_empty() {
+        bail!("empty carrier branch in {location:?}")
+    }
+    let check = carrier_git_command()
+        .args(["check-ref-format", &format!("refs/heads/{branch}")])
+        .output()?;
+    if !check.status.success() || branch.starts_with('-') {
+        bail!("invalid carrier branch name {branch:?} in {location:?}")
+    }
+    Ok((remote.to_owned(), branch.to_owned()))
+}
+
 fn normalize_carrier_remote(remote: &str) -> Result<String> {
     if remote.trim().is_empty() {
         bail!("empty carrier Git remote")
@@ -1682,17 +1865,15 @@ fn configure_git_pack_settings(mut configure: impl FnMut(&str, &str) -> Result<(
     Ok(())
 }
 
-fn fetch_carrier_branch(cache: &Path, remote: &str) -> Result<Option<String>> {
-    let refspec = format!("+refs/heads/{CARRIER_BRANCH}:{CARRIER_CACHE_FETCH_REF}");
+fn fetch_carrier_branch(cache: &Path, remote: &str, branch: &str) -> Result<Option<String>> {
+    let remote_ref = format!("refs/heads/{branch}");
+    let refspec = format!("+{remote_ref}:{CARRIER_CACHE_FETCH_REF}");
     let fetch = cache_git_output(cache, &["fetch", "--quiet", "--no-tags", remote, &refspec])?;
     if fetch.status.success() {
         return git_rev_parse(cache, CARRIER_CACHE_FETCH_REF);
     }
 
-    let ls_remote = cache_git_output(
-        cache,
-        &["ls-remote", "--heads", remote, CARRIER_CACHE_FETCH_REF],
-    )?;
+    let ls_remote = cache_git_output(cache, &["ls-remote", "--heads", remote, &remote_ref])?;
     ensure_git_success(&ls_remote, "git ls-remote carrier branch")?;
     if String::from_utf8_lossy(&ls_remote.stdout).trim().is_empty() {
         let delete = cache_git_output(cache, &["update-ref", "-d", CARRIER_CACHE_FETCH_REF])?;
@@ -1707,6 +1888,7 @@ fn create_carrier_checkout(
     checkout: &Path,
     cache: &Path,
     remote: &str,
+    branch: &str,
     base_commit: &Option<String>,
 ) -> Result<()> {
     let _timer = trace::Span::new("carrier_checkout_git_setup");
@@ -1737,20 +1919,17 @@ fn create_carrier_checkout(
     )?;
     git_command(checkout, &["remote", "add", "origin", remote])?;
 
-    let remote_ref = format!("refs/remotes/origin/{CARRIER_BRANCH}");
+    let remote_ref = format!("refs/remotes/origin/{branch}");
     match base_commit {
         Some(commit) => {
             git_command(checkout, &["update-ref", &remote_ref, commit])?;
-            let local_ref = format!("refs/heads/{CARRIER_BRANCH}");
+            let local_ref = format!("refs/heads/{branch}");
             git_command(checkout, &["update-ref", &local_ref, commit])?;
             git_command(checkout, &["symbolic-ref", "HEAD", &local_ref])?;
             git_command(checkout, &["read-tree", commit])?;
         }
         None => {
-            git_command(
-                checkout,
-                &["checkout", "--quiet", "--orphan", CARRIER_BRANCH],
-            )?;
+            git_command(checkout, &["checkout", "--quiet", "--orphan", branch])?;
         }
     }
     fs::write(checkout.join(".gitattributes"), CARRIER_ATTRIBUTES)?;
@@ -1858,13 +2037,11 @@ fn stage_carrier_checkout(repo: &Path, object_directory: &Path) -> Result<()> {
     }
 
     let mut paths = Vec::new();
-    let attributes = repo.join(".gitattributes");
-    if attributes.exists() {
-        collect(repo, &attributes, &mut paths)?;
-    }
-    let encrypted = repo.join("e2ee");
-    if encrypted.exists() {
-        collect(repo, &encrypted, &mut paths)?;
+    for name in CARRIER_ROOT_ENTRIES {
+        let path = repo.join(name);
+        if path.exists() {
+            collect(repo, &path, &mut paths)?;
+        }
     }
     if paths.is_empty() {
         bail!("carrier publication has no staged files")

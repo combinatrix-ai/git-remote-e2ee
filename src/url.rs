@@ -1,6 +1,6 @@
 //! `e2ee::` storage URLs. A URL names a Git carrier, written the way Git
-//! itself would accept it, unless it starts with `dir:`, which names a
-//! directory backend.
+//! itself would accept it and optionally followed by `#<branch>`, unless it
+//! starts with `dir:`, which names a directory backend.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -27,11 +27,18 @@ impl StorageUrl {
         if address.is_empty() {
             bail!("empty storage URL")
         }
-        let local = Path::new(address);
+        let (path, fragment) = match address.rsplit_once('#') {
+            Some((path, branch)) => (path, Some(branch)),
+            None => (address, None),
+        };
+        let local = Path::new(path);
         if local.is_relative() && local.exists() {
-            return Ok(Self::Git(
-                std::path::absolute(local)?.to_string_lossy().into_owned(),
-            ));
+            let mut absolute = std::path::absolute(local)?.to_string_lossy().into_owned();
+            if let Some(branch) = fragment {
+                absolute.push('#');
+                absolute.push_str(branch);
+            }
+            return Ok(Self::Git(absolute));
         }
         Ok(Self::Git(address.to_owned()))
     }
@@ -71,6 +78,22 @@ mod tests {
     }
 
     #[test]
+    fn carrier_branch_fragments_round_trip_unchanged() {
+        for url in [
+            "e2ee::https://host/x.git#vault",
+            "e2ee::git@github.com:you/notes.git#team/vault",
+            "e2ee::/srv/carrier.git#vault",
+        ] {
+            let parsed = StorageUrl::parse(url).unwrap();
+            assert_eq!(
+                parsed,
+                StorageUrl::Git(url.strip_prefix("e2ee::").unwrap().to_owned())
+            );
+            assert_eq!(parsed.to_string(), url);
+        }
+    }
+
+    #[test]
     fn relative_paths_become_absolute() {
         let current = std::env::current_dir().unwrap();
         assert_eq!(
@@ -80,6 +103,10 @@ mod tests {
         assert_eq!(
             StorageUrl::parse("e2ee::src").unwrap(),
             StorageUrl::Git(current.join("src").to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            StorageUrl::parse("e2ee::src#vault").unwrap(),
+            StorageUrl::Git(format!("{}#vault", current.join("src").display()))
         );
     }
 

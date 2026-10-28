@@ -281,10 +281,7 @@ fn missing_pack_observation_does_not_advance_the_floor() {
         .unwrap();
     let (_, manifest) = repository.current_manifest().unwrap();
     let pack_id = manifest.new_packs[0].id.clone();
-    let pack_path = remote_path
-        .join("objects")
-        .join(&pack_id[..2])
-        .join(&pack_id);
+    let pack_path = remote_path.join("packs").join(&pack_id[..2]).join(&pack_id);
     let saved_pack = fs::read(&pack_path).unwrap();
     fs::remove_file(&pack_path).unwrap();
 
@@ -298,7 +295,7 @@ fn missing_pack_observation_does_not_advance_the_floor() {
     assert!(error.contains(&pack_id), "unexpected error: {error}");
     assert_eq!(client_state(&destination)["generation"], 1);
 
-    write_stored_object(&remote_path, "objects", &pack_id, &saved_pack);
+    write_stored_object(&remote_path, "packs", &pack_id, &saved_pack);
     let fetched = repository.fetch_into(&destination, "encrypted").unwrap();
     assert_eq!(fetched.generation, 2);
     let state = client_state(&destination);
@@ -643,7 +640,7 @@ fn detects_tampered_pack_ciphertext() {
         .unwrap();
     let manifest = encrypted.verify().unwrap();
     let id = &manifest.new_packs[0].id;
-    let path = remote_path.join("objects").join(&id[..2]).join(id);
+    let path = remote_path.join("packs").join(&id[..2]).join(id);
     let mut bytes = fs::read(&path).unwrap();
     let last = bytes.len() - 1;
     bytes[last] ^= 1;
@@ -682,7 +679,7 @@ fn late_stream_authentication_failure_does_not_advance_refs_or_pins() {
         .unwrap();
     let manifest = encrypted.current_manifest().unwrap().1;
     let id = &manifest.new_packs[0].id;
-    let path = remote_path.join("objects").join(&id[..2]).join(id);
+    let path = remote_path.join("packs").join(&id[..2]).join(id);
     let mut bytes = fs::read(&path).unwrap();
     assert!(bytes.len() > 1024 * 1024 * 2);
     let last = bytes.len() - 1;
@@ -1029,7 +1026,7 @@ fn recover_refuses_unknown_formats_and_missing_floor_objects() {
     let missing_pack = &floor_manifest.new_packs[0].id;
     fs::remove_file(
         missing_storage_path
-            .join("objects")
+            .join("packs")
             .join(&missing_pack[..2])
             .join(missing_pack),
     )
@@ -1345,7 +1342,7 @@ fn init_with_relative_storage_creates_the_store_in_the_child_cwd() {
             key_path.to_str().unwrap(),
         ],
     );
-    assert!(work.join("relative-store/objects").is_dir());
+    assert!(work.join("relative-store/packs").is_dir());
     assert!(work.join("relative-store/manifests").is_dir());
     assert!(!work.join("relative-store/policies").exists());
     assert!(!root.path().join("relative-store").exists());
@@ -1368,7 +1365,7 @@ fn relative_dotdot_storage_follows_the_filesystem() {
             key_path.to_str().unwrap(),
         ],
     );
-    assert!(work.join("sibling-store/objects").is_dir());
+    assert!(work.join("sibling-store/packs").is_dir());
     assert!(!nested.join("sibling-store").exists());
 
     #[cfg(unix)]
@@ -1389,7 +1386,78 @@ fn relative_dotdot_storage_follows_the_filesystem() {
                 key_path.to_str().unwrap(),
             ],
         );
-        assert!(outside_parent.join("dotdot-store/objects").is_dir());
+        assert!(outside_parent.join("dotdot-store/packs").is_dir());
         assert!(!work.join("dotdot-store").exists());
     }
+}
+
+#[test]
+fn directory_root_holds_exactly_the_v6_layout() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let remote_path = temporary.path().join("remote");
+    initialize_git(&source);
+    let encrypted =
+        EncryptedRepository::new(FilesystemStorage::new(&remote_path), KeyFile::generate());
+    encrypted.initialize().unwrap();
+    commit(&source, "layout\n", "layout");
+    encrypted
+        .push_ref(&source, "refs/heads/main", false)
+        .unwrap();
+
+    // HEAD.lock and .staging are local coordination files of this backend.
+    let mut names: Vec<_> = fs::read_dir(&remote_path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name != "HEAD.lock" && name != ".staging")
+        .collect();
+    names.sort();
+    assert_eq!(names, ["FORMAT", "HEAD", "README.md", "manifests", "packs"]);
+    assert_eq!(
+        fs::read(remote_path.join("FORMAT")).unwrap(),
+        b"git-remote-e2ee storage 6\n"
+    );
+    let readme = fs::read_to_string(remote_path.join("README.md")).unwrap();
+    assert!(readme.starts_with("# Encrypted Git repository\n\nThis directory holds"));
+    assert!(
+        remote_path
+            .join("packs")
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_some()
+    );
+}
+
+#[test]
+fn directory_format_mismatch_names_the_found_format() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let remote_path = temporary.path().join("remote");
+    initialize_git(&source);
+    let encrypted =
+        EncryptedRepository::new(FilesystemStorage::new(&remote_path), KeyFile::generate());
+    encrypted.initialize().unwrap();
+    commit(&source, "format\n", "format");
+    encrypted
+        .push_ref(&source, "refs/heads/main", false)
+        .unwrap();
+
+    fs::write(remote_path.join("FORMAT"), "git-remote-e2ee storage 7\n").unwrap();
+    let error = format!("{:#}", encrypted.verify().unwrap_err());
+    assert!(
+        error.contains(&format!(
+            "storage at {} uses format 7; this git-remote-e2ee reads format 6",
+            remote_path.display()
+        )),
+        "{error}"
+    );
+    assert!(encrypted.initialize().is_err());
+
+    fs::remove_file(remote_path.join("FORMAT")).unwrap();
+    let error = format!("{:#}", encrypted.verify().unwrap_err());
+    assert!(
+        error.contains("uses format 5 or earlier; this git-remote-e2ee reads format 6"),
+        "{error}"
+    );
 }

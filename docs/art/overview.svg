@@ -36,9 +36,9 @@
   <rect x="436" y="24" width="300" height="282" rx="12" fill="#eef1f5" stroke="#d5dbe4"/>
   <text x="456" y="54" class="h">On the storage host</text>
   <text x="456" y="73" class="sub">GitHub, a NAS, a bare repo…</text>
-  <text x="456" y="108" class="mono ink">e2ee/HEAD</text>
+  <text x="456" y="108" class="mono ink">HEAD</text>
   <text x="456" y="128" class="mono cipher">  9f4c…e21a</text>
-  <text x="456" y="154" class="mono ink">e2ee/objects/</text>
+  <text x="456" y="154" class="mono ink">packs/</text>
   <text x="456" y="174" class="mono cipher">  3f/9a1c07…  (1.2 MiB)</text>
   <text x="456" y="194" class="mono cipher">  7c/e04b5d…  (3.4 KiB)</text>
   <text x="456" y="214" class="mono cipher">  b8/51f2aa…  (80 KiB)</text>
