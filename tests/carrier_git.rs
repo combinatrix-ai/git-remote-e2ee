@@ -1807,6 +1807,209 @@ fn carrier_init_refuses_an_existing_branch_and_another_branch_works() {
     assert!(!git(&carrier, &["rev-parse", "refs/heads/vault"], false).is_empty());
 }
 
+/// Installs a pre-receive hook that rejects every push while `marker` exists,
+/// removing the marker on the first rejection when `once` is set.
+fn reject_pushes_while(carrier: &Path, marker: &Path, once: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let remove = if once {
+        format!("rm '{}'", marker.display())
+    } else {
+        String::new()
+    };
+    let hook = carrier.join("hooks/pre-receive");
+    fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\nif [ -e '{marker}' ]; then\n  {remove}\n  echo 'carrier test hook refused the update' >&2\n  exit 1\nfi\n",
+            marker = marker.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn remote_tip(carrier: &Path) -> String {
+    git(carrier, &["rev-parse", "refs/heads/main"], false)
+}
+
+#[test]
+fn rejected_carrier_publish_restores_the_published_head() {
+    let temporary = tempfile::tempdir().unwrap();
+    let _cache = isolated_cache(&temporary);
+    let carrier = temporary.path().join("carrier.git");
+    git(
+        temporary.path(),
+        &["init", "--bare", "-q", carrier.to_str().unwrap()],
+        false,
+    );
+    let published = "5".repeat(64);
+    let rejected = "6".repeat(64);
+    let next = "7".repeat(64);
+    let storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    storage.compare_and_swap_head(None, &published).unwrap();
+    let tip = remote_tip(&carrier);
+
+    let marker = temporary.path().join("reject");
+    fs::write(&marker, "").unwrap();
+    reject_pushes_while(&carrier, &marker, false);
+    let error = storage
+        .compare_and_swap_head(Some(&published), &rejected)
+        .unwrap_err();
+    assert_eq!(remote_tip(&carrier), tip);
+    assert_eq!(
+        storage.read_head().unwrap().as_deref(),
+        Some(published.as_str())
+    );
+    assert!(
+        error.downcast_ref::<CasConflict>().is_none(),
+        "a hook rejection is not a compare-and-swap loss: {error:#}"
+    );
+    assert!(
+        format!("{error:#}").contains("carrier test hook refused the update"),
+        "the push error keeps git's stderr: {error:#}"
+    );
+
+    fs::remove_file(&marker).unwrap();
+    storage
+        .compare_and_swap_head(Some(&published), &next)
+        .unwrap();
+    assert_eq!(
+        git(&carrier, &["show", "refs/heads/main:HEAD"], false),
+        next
+    );
+    assert_eq!(
+        git(&carrier, &["rev-parse", "refs/heads/main^"], false),
+        tip,
+        "the next publication builds on the published commit, not the rejected one"
+    );
+}
+
+#[test]
+fn rejected_carrier_genesis_leaves_an_uninitialized_checkout() {
+    let temporary = tempfile::tempdir().unwrap();
+    let _cache = isolated_cache(&temporary);
+    let carrier = temporary.path().join("carrier.git");
+    git(
+        temporary.path(),
+        &["init", "--bare", "-q", carrier.to_str().unwrap()],
+        false,
+    );
+    let marker = temporary.path().join("reject");
+    fs::write(&marker, "").unwrap();
+    reject_pushes_while(&carrier, &marker, true);
+    let storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let rejected = "6".repeat(64);
+    let next = "7".repeat(64);
+    let error = storage.compare_and_swap_head(None, &rejected).unwrap_err();
+    assert_eq!(storage.read_head().unwrap(), None);
+    assert!(error.downcast_ref::<CasConflict>().is_none(), "{error:#}");
+
+    storage.compare_and_swap_head(None, &next).unwrap();
+    assert_eq!(
+        git(&carrier, &["show", "refs/heads/main:HEAD"], false),
+        next
+    );
+    assert_eq!(
+        git(&carrier, &["rev-list", "--count", "refs/heads/main"], false),
+        "1"
+    );
+}
+
+#[test]
+fn stale_compare_and_swap_conflicts_even_when_the_remote_head_is_garbage() {
+    let temporary = tempfile::tempdir().unwrap();
+    let _cache = isolated_cache(&temporary);
+    let carrier = temporary.path().join("carrier.git");
+    git(
+        temporary.path(),
+        &["init", "--bare", "-q", carrier.to_str().unwrap()],
+        false,
+    );
+    let published = "5".repeat(64);
+    GitStorage::open(carrier.to_str().unwrap())
+        .unwrap()
+        .compare_and_swap_head(None, &published)
+        .unwrap();
+    let stale = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    edit_carrier(&carrier, &temporary.path().join("editor"), |workdir| {
+        fs::write(workdir.join("HEAD"), "not a manifest id\n").unwrap();
+    });
+
+    let error = stale
+        .compare_and_swap_head(Some(&published), &"8".repeat(64))
+        .unwrap_err();
+    let conflict = error
+        .downcast_ref::<CasConflict>()
+        .unwrap_or_else(|| panic!("expected a conflict: {error:#}"));
+    assert_eq!(conflict.actual, None);
+}
+
+#[test]
+fn failed_ref_in_a_helper_push_batch_is_not_published_by_the_next_ref() {
+    let temporary = tempfile::tempdir().unwrap();
+    let _cache = isolated_cache(&temporary);
+    let carrier = temporary.path().join("carrier.git");
+    let source = temporary.path().join("source");
+    let key_path = temporary.path().join("repository.key.json");
+    init_source(&source, "batch marker");
+    let key = KeyFile::generate();
+    key.write_new(&key_path).unwrap();
+    init_carrier(temporary.path(), &carrier, &key);
+    let url = format!("e2ee::{}", carrier.display());
+    push_through_helper(&source, &url, &key_path, temporary.path());
+
+    let marker = temporary.path().join("reject-once");
+    fs::write(&marker, "").unwrap();
+    reject_pushes_while(&carrier, &marker, true);
+    let output = helper_command(&source, temporary.path())
+        .args([
+            "push",
+            "--porcelain",
+            "private",
+            "main:refs/heads/a",
+            "main:refs/heads/b",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stdout={stdout} stderr={stderr}");
+    let status = |reference: &str| {
+        stdout
+            .lines()
+            .find(|line| line.contains(&format!(":{reference}\t")))
+            .unwrap_or_else(|| panic!("no status for {reference}: {stdout}"))
+            .to_owned()
+    };
+    let (failed, published) = if status("refs/heads/a").starts_with('!') {
+        ("refs/heads/a", "refs/heads/b")
+    } else {
+        ("refs/heads/b", "refs/heads/a")
+    };
+    assert!(status(failed).starts_with('!'), "{stdout}");
+    assert!(!status(published).starts_with('!'), "{stdout}");
+
+    let manifest =
+        EncryptedRepository::new(GitStorage::open(carrier.to_str().unwrap()).unwrap(), key)
+            .verify()
+            .unwrap();
+    let names: Vec<_> = manifest.refs.keys().map(String::as_str).collect();
+    assert!(names.contains(&published), "{names:?}");
+    assert!(
+        !names.contains(&failed),
+        "the failed ref was published by the next one: {names:?}"
+    );
+
+    assert!(
+        !stdout.contains("fetch first") && !stderr.contains("fetch first"),
+        "a rejected publish is not reported as a race: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("carrier test hook refused the update"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn carrier_recovery_classifies_missing_head_manifest_as_unavailable() {
     let temporary = tempfile::tempdir().unwrap();
