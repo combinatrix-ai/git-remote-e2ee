@@ -105,7 +105,7 @@ impl Manifest {
         if self.repository_root != previous.repository_root {
             bail!("manifest repository root changed")
         }
-        if self.generation != previous.generation + 1 {
+        if previous.generation.checked_add(1) != Some(self.generation) {
             bail!("manifest generation is not consecutive")
         }
         if self.previous.as_deref() != Some(previous_id) {
@@ -134,7 +134,7 @@ impl Manifest {
             }
             ManifestAuthorization::PolicyTransition => {
                 validate_introduced_policy(self, selected_policy, true)?;
-                if self.policy_generation != previous.policy_generation + 1
+                if previous.policy_generation.checked_add(1) != Some(self.policy_generation)
                     || selected_policy.body.previous.as_deref() != Some(previous.policy_id.as_str())
                 {
                     bail!("policy transition did not select the direct policy child")
@@ -568,7 +568,7 @@ pub fn unwrap_predecessor_key(
         .predecessor_key_wrap
         .as_deref()
         .context("successor manifest is missing predecessor key link")?;
-    if parent_header.generation + 1 != manifest.generation
+    if parent_header.generation.checked_add(1) != Some(manifest.generation)
         || parent_header.repository_root != manifest.repository_root
     {
         bail!("predecessor header does not match manifest generation")
@@ -1340,5 +1340,31 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn generation_overflow_is_a_validation_error() {
+        let owner = KeyFile::generate();
+        let (policy, policy_bytes) = PolicyState::genesis(&owner, "owner").unwrap();
+        let previous = manifest_for(&policy, u64::MAX, ManifestAuthorization::Writer);
+        let next = manifest_for(&policy, 0, ManifestAuthorization::Writer);
+        assert!(
+            next.validate_successor(&"11".repeat(32), &previous, &policy)
+                .is_err()
+        );
+
+        let parent = Manifest::genesis(owner.repository_root.clone(), &policy, policy_bytes);
+        let parent_bytes = seal_manifest(
+            &owner,
+            &policy,
+            &random_key(),
+            ManifestAuthorization::PolicyTransition,
+            parent,
+        )
+        .unwrap();
+        let mut parent_header = peek_manifest_header(&parent_bytes).unwrap();
+        parent_header.generation = u64::MAX;
+        let child = manifest_for(&policy, 1, ManifestAuthorization::Writer);
+        assert!(unwrap_predecessor_key(&random_key(), &child, &parent_header).is_err());
     }
 }

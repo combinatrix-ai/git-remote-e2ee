@@ -281,7 +281,14 @@ impl<S: Storage> EncryptedRepository<S> {
             .iter_mut()
             .find(|device| device.public.device_id == device_id && device.active())
             .context("device is not active in the current policy")?;
-        target.revoked_at = Some(current.policy.body.generation + 1);
+        target.revoked_at = Some(
+            current
+                .policy
+                .body
+                .generation
+                .checked_add(1)
+                .context("policy generation overflow")?,
+        );
         if !devices
             .iter()
             .any(|device| device.active() && device.roles.reader)
@@ -462,7 +469,11 @@ impl<S: Storage> EncryptedRepository<S> {
         }
 
         let next_key = random_key();
-        let generation = current.manifest.generation + 1;
+        let generation = current
+            .manifest
+            .generation
+            .checked_add(1)
+            .context("manifest generation overflow")?;
         let mut new_packs = Vec::new();
         let mut total_pack_count = current.manifest.total_pack_count;
         if let Some(next_object) = next_object {
@@ -1673,7 +1684,11 @@ fn transition_manifest(
     policy_bytes: Vec<u8>,
     generation_key: &[u8; 32],
 ) -> Result<Manifest> {
-    let generation = current.manifest.generation + 1;
+    let generation = current
+        .manifest
+        .generation
+        .checked_add(1)
+        .context("manifest generation overflow")?;
     Ok(Manifest {
         format_version: current.manifest.format_version,
         repository_root: current.manifest.repository_root.clone(),
