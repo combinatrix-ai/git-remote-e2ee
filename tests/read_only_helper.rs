@@ -221,7 +221,7 @@ fn exercise_read_only_helper<S: Storage>(
 fn read_only_devices_use_both_storage_backends_without_publishing() {
     let temporary = tempfile::tempdir().unwrap();
     let filesystem_remote = temporary.path().join("filesystem-remote");
-    let filesystem_url = format!("e2ee::{}", filesystem_remote.display());
+    let filesystem_url = format!("e2ee::dir:{}", filesystem_remote.display());
     exercise_read_only_helper(
         temporary.path(),
         FilesystemStorage::new(&filesystem_remote),
@@ -243,7 +243,7 @@ fn read_only_devices_use_both_storage_backends_without_publishing() {
         .output()
         .unwrap();
     assert!(initialize_output.status.success());
-    let carrier_url = format!("e2ee::git+{}", carrier.display());
+    let carrier_url = format!("e2ee::{}", carrier.display());
     exercise_read_only_helper(
         &temporary.path().join("carrier-case"),
         GitStorage::open(carrier.to_str().unwrap()).unwrap(),

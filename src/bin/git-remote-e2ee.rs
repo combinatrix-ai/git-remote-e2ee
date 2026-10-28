@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 use git_remote_e2ee::crypto::KeyFile;
 use git_remote_e2ee::repository::{EncryptedRepository, PushRejection};
 use git_remote_e2ee::storage::{CasConflict, FilesystemStorage, GitStorage, Storage};
+use git_remote_e2ee::url::StorageUrl;
 
 fn main() {
     if let Err(error) = run() {
@@ -24,14 +25,14 @@ fn run() -> Result<()> {
 
     let key_path = configured_key_path(&remote_name)?;
     let key = KeyFile::read(&key_path)?;
-    let backend = parse_backend_url(&url)?;
-    persist_absolute_url(&remote_name, &url, &backend)?;
-    match backend {
-        BackendUrl::Filesystem(path) => run_protocol(
+    let storage = StorageUrl::parse(&url)?;
+    persist_absolute_url(&remote_name, &url, &storage)?;
+    match storage {
+        StorageUrl::Directory(path) => run_protocol(
             EncryptedRepository::new(FilesystemStorage::new(path), key),
             remote_name,
         ),
-        BackendUrl::Git(remote) => run_protocol(
+        StorageUrl::Git(remote) => run_protocol(
             EncryptedRepository::new(GitStorage::open(&remote)?, key),
             remote_name,
         ),
@@ -235,8 +236,8 @@ fn configured_key_path(remote_name: &str) -> Result<PathBuf> {
 /// A relative storage path in a clone URL is resolved against the directory
 /// `git clone` ran in, which later fetches from inside the clone do not share.
 /// Rewrite the remote's URL to the absolute path the first time it is seen.
-fn persist_absolute_url(remote_name: &str, url: &str, backend: &BackendUrl) -> Result<()> {
-    let absolute = backend.url();
+fn persist_absolute_url(remote_name: &str, url: &str, storage: &StorageUrl) -> Result<()> {
+    let absolute = storage.to_string();
     let key = format!("remote.{remote_name}.url");
     let Some(configured) = configured_value(&key)? else {
         return Ok(());
@@ -281,38 +282,4 @@ fn configured_path(key: &str) -> Result<Option<PathBuf>> {
     } else {
         Ok(None)
     }
-}
-
-enum BackendUrl {
-    Filesystem(PathBuf),
-    Git(String),
-}
-
-impl BackendUrl {
-    fn url(&self) -> String {
-        match self {
-            Self::Filesystem(path) => format!("e2ee::{}", path.display()),
-            Self::Git(remote) => format!("e2ee::git+{remote}"),
-        }
-    }
-}
-
-fn parse_backend_url(url: &str) -> Result<BackendUrl> {
-    let path = url.strip_prefix("e2ee::").unwrap_or(url);
-    if path.is_empty() {
-        bail!("empty git-remote-e2ee storage URL")
-    }
-    if let Some(remote) = path.strip_prefix("git+") {
-        if remote.is_empty() {
-            bail!("empty carrier Git remote")
-        }
-        let local = Path::new(remote);
-        if local.is_relative() && local.exists() {
-            return Ok(BackendUrl::Git(
-                std::path::absolute(local)?.to_string_lossy().into_owned(),
-            ));
-        }
-        return Ok(BackendUrl::Git(remote.to_owned()));
-    }
-    Ok(BackendUrl::Filesystem(std::path::absolute(path)?))
 }

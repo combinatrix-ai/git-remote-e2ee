@@ -235,7 +235,7 @@ fn carrier_git_supports_native_push_and_clone_without_plaintext() {
     key.write_new(&key_path).unwrap();
     init_carrier(temporary.path(), &carrier, &key);
 
-    let url = format!("e2ee::git+{}", carrier.display());
+    let url = format!("e2ee::{}", carrier.display());
     git(&source, &["remote", "add", "private", &url], false);
     git(
         &source,
@@ -314,7 +314,7 @@ fn carrier_git_supports_tags_and_ref_deletion() {
     key.write_new(&key_path).unwrap();
     init_carrier(temporary.path(), &carrier, &key);
 
-    let url = format!("e2ee::git+{}", carrier.display());
+    let url = format!("e2ee::{}", carrier.display());
     git(&source, &["remote", "add", "private", &url], false);
     git(
         &source,
@@ -760,7 +760,7 @@ fn native_fetch_rejects_outer_carrier_rollback() {
         ],
         false,
     );
-    let url = format!("e2ee::git+{}", carrier.display());
+    let url = format!("e2ee::{}", carrier.display());
     git(&source, &["remote", "add", "private", &url], false);
     git(
         &source,

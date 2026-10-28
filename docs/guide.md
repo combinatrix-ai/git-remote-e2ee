@@ -24,6 +24,18 @@ Other architectures use the backend selected for their target.
 From a checkout, use `cargo install --path .` instead. Both binaries must be on
 `PATH` for Git to find the helper.
 
+## Storage URLs
+
+An `e2ee::` URL is followed by the storage address:
+
+| URL | Storage |
+|---|---|
+| `e2ee::https://host/you/repo.git`, `e2ee::git@host:you/repo.git`, `e2ee::ssh://…`, `e2ee::file://…`, `e2ee::/srv/repo.git` | A Git repository used as carrier. Anything `git push` accepts. |
+| `e2ee::dir:/srv/encrypted/example` | A directory (filesystem backend). |
+
+A relative path is resolved against the directory the command runs in, and the
+helper saves the absolute form in the remote's configuration.
+
 ## Keys
 
 `git-e2ee keygen` writes a private device key file. The first key created for a
@@ -56,7 +68,7 @@ git-e2ee carrier-init \
   --key /safe/place/carrier.key.json
 
 git remote add private \
-  'e2ee::git+https://git.example/user/encrypted-carrier.git'
+  'e2ee::https://git.example/user/encrypted-carrier.git'
 git config remote.private.e2ee-key /safe/place/carrier.key.json
 git push -u private main
 ```
@@ -97,7 +109,7 @@ git-e2ee init \
   --storage /srv/encrypted/example \
   --key /safe/place/repository.key.json
 
-git remote add private 'e2ee::/srv/encrypted/example'
+git remote add private 'e2ee::dir:/srv/encrypted/example'
 git config remote.private.e2ee-key /safe/place/repository.key.json
 git push -u private main
 ```
@@ -112,7 +124,7 @@ Supply the key path once:
 
 ```console
 git -c e2ee.key=/safe/place/carrier.key.json clone \
-  'e2ee::git+https://git.example/user/encrypted-carrier.git'
+  'e2ee::https://git.example/user/encrypted-carrier.git'
 ```
 
 The helper saves the path as `remote.origin.e2ee-key` in the new clone. Later
