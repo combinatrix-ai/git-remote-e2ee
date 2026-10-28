@@ -81,7 +81,9 @@ fresh bare remotes, clients, cache directories, and a temporary GPG home. Git
 auto-GC, maintenance, and receive auto-GC were disabled. The bare receivers
 used `receive.unpackLimit=0`; the carrier receiver also used
 `attr.tree=refs/heads/git-remote-e2ee`, so it could read the committed
-`e2ee/** -delta` attribute. The E2EE push and returning-client caches were
+`e2ee/** -delta` attribute. (That run used an earlier layout; the current
+layout, format 6, uses branch `main` and `* -delta` at the branch root, so
+reproduce with `attr.tree=refs/heads/main`.) The E2EE push and returning-client caches were
 isolated per round under the temporary benchmark directory. Each tiny commit
 replaced one line in Godot's tracked README and was pushed and fetched before
 the next. See `scripts/benchmark-git-backend.sh` for the complete harness.

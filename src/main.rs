@@ -245,6 +245,7 @@ fn main() -> Result<()> {
             if in_repository && git_config(&format!("remote.{name}.url"), false)?.is_some() {
                 bail!("Git remote {name} already exists; choose another name with --name")
             }
+            let mut created_key = None;
             let key = match key {
                 Some(path) if path.exists() => path,
                 requested => {
@@ -255,18 +256,31 @@ fn main() -> Result<()> {
                     };
                     generated.write_new(&path)?;
                     println!("created key {} (administrator)", path.display());
+                    created_key = Some(path.clone());
                     path
                 }
             };
-            let target = Target {
-                storage,
-                key: std::path::absolute(key)?,
+            let initialized = (|| -> Result<Target> {
+                let target = Target {
+                    storage,
+                    key: std::path::absolute(key)?,
+                };
+                let pin = admin_pin_path(&target.key)?;
+                with_repository!(&target, |repository| {
+                    repository.initialize(&label)?;
+                    repository.pin_admin_state(&pin)?;
+                });
+                Ok(target)
+            })();
+            let target = match initialized {
+                Ok(target) => target,
+                Err(error) => {
+                    if let Some(path) = created_key {
+                        let _ = std::fs::remove_file(path);
+                    }
+                    return Err(error);
+                }
             };
-            let pin = admin_pin_path(&target.key)?;
-            with_repository!(&target, |repository| {
-                repository.initialize(&label)?;
-                repository.pin_admin_state(&pin)?;
-            });
             println!("initialized {}", target.storage);
             if in_repository {
                 run_git(&["remote", "add", &name, &target.storage.to_string()])?;

@@ -108,7 +108,7 @@ tree_logical_bytes() {
 object_snapshot() {
   local root=$1
   local object digest
-  find "$root/objects" -type f -print | LC_ALL=C sort | while IFS= read -r object; do
+  find "$root/packs" -type f -print | LC_ALL=C sort | while IFS= read -r object; do
     if [[ $time_style == bsd ]]; then
       digest=$(shasum -a 256 "$object" | awk '{print $1}')
     else
@@ -291,7 +291,7 @@ repository_root=$(sed -n 's/^[[:space:]]*"repository_root": "\([^"]*\)",$/\1/p' 
   --output "$work/new-user.key.json" >/dev/null
 "$git_e2ee" device-export --key "$work/new-user.key.json" \
   --output "$work/new-user.public.json" >/dev/null
-object_snapshot "$work/e2ee-storage" >"$work/objects-before-device-add.sha256"
+object_snapshot "$work/e2ee-storage" >"$work/packs-before-device-add.sha256"
 run_phase add_user e2ee device-add "$work/e2ee-storage" "$work/e2ee-new-client" \
   "$git_e2ee" device-add "e2ee::dir:$work/e2ee-storage" "$work/new-user.public.json" \
     --label new-user --key "$work/repository.key.json"
@@ -312,8 +312,8 @@ if (( total_readers > 2 )); then
     active_reader_key=$reader_key
   done
 fi
-object_snapshot "$work/e2ee-storage" >"$work/objects-after-device-add.sha256"
-cmp "$work/objects-before-device-add.sha256" "$work/objects-after-device-add.sha256"
+object_snapshot "$work/e2ee-storage" >"$work/packs-after-device-add.sha256"
+cmp "$work/packs-before-device-add.sha256" "$work/packs-after-device-add.sha256"
 run_phase add_user e2ee fetch-new-user "$work/e2ee-storage" \
   "$work/e2ee-new-client" \
   "$git_e2ee" fetch --storage "$work/e2ee-storage" \
