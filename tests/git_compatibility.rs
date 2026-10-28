@@ -63,7 +63,7 @@ fn setup_remote(root: &Path) -> (std::path::PathBuf, std::path::PathBuf, KeyFile
     let key = KeyFile::generate();
     key.write_new(&key_path).unwrap();
     EncryptedRepository::new(FilesystemStorage::new(&storage), key.clone())
-        .initialize()
+        .initialize("owner")
         .unwrap();
     (storage, key_path, key)
 }

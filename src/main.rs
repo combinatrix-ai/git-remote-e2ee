@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use git_remote_e2ee::crypto::{KeyFile, PublicDevice};
-use git_remote_e2ee::policy::DeviceRoles;
+use git_remote_e2ee::policy::{DeviceRoles, validate_device_label};
 use git_remote_e2ee::repository::{
     EncryptedRepository, RecoveryOptions, RecoveryReport, admin_state_path,
 };
@@ -68,6 +68,9 @@ enum Command {
         /// Name of the Git remote to add
         #[arg(long, default_value = "origin")]
         name: String,
+        /// Label shown for this device in `device-list`. Defaults to the hostname
+        #[arg(long)]
+        label: Option<String>,
     },
     /// Check the whole manifest chain and every pack
     Verify {
@@ -79,6 +82,9 @@ enum Command {
         target: String,
         /// Public device file from `git-e2ee device-export`
         device: PathBuf,
+        /// Label shown in `device-list`; unique among active devices
+        #[arg(long)]
+        label: String,
         #[arg(long, value_enum, default_value = "write")]
         role: DeviceRole,
         #[arg(long)]
@@ -223,8 +229,18 @@ fn main() -> Result<()> {
                 output.display()
             );
         }
-        Command::Init { url, key, name } => {
+        Command::Init {
+            url,
+            key,
+            name,
+            label,
+        } => {
             let storage = StorageUrl::parse(&url)?;
+            let label = match label {
+                Some(label) => label,
+                None => default_owner_label(),
+            };
+            validate_device_label(&label)?;
             let in_repository = inside_git_repository()?;
             if in_repository && git_config(&format!("remote.{name}.url"), false)?.is_some() {
                 bail!("Git remote {name} already exists; choose another name with --name")
@@ -248,7 +264,7 @@ fn main() -> Result<()> {
             };
             let pin = admin_pin_path(&target.key)?;
             with_repository!(&target, |repository| {
-                repository.initialize()?;
+                repository.initialize(&label)?;
                 repository.pin_admin_state(&pin)?;
             });
             println!("initialized {}", target.storage);
@@ -275,6 +291,7 @@ fn main() -> Result<()> {
         Command::DeviceAdd {
             target,
             device,
+            label,
             role,
             key,
         } => {
@@ -284,9 +301,9 @@ fn main() -> Result<()> {
             let device_id = public.device_id.clone();
             let roles = DeviceRoles::from(role);
             let (manifest, policy) = with_repository!(&target, |repository| {
-                repository.add_device(public, roles, &pin)?
+                repository.add_device(public, &label, roles, &pin)?
             });
-            println!("added {device_id}; manifest {manifest}; policy {policy}");
+            println!("added {device_id} ({label}); manifest {manifest}; policy {policy}");
         }
         Command::DeviceRevoke {
             target,
@@ -302,11 +319,19 @@ fn main() -> Result<()> {
         }
         Command::DeviceList { target, key } => {
             let target = Target::resolve(&target, key)?;
-            let devices = with_repository!(&target, |repository| repository.list_devices()?);
+            let pin = admin_pin_path(&target.key)?;
+            let own_id = KeyFile::read(&target.key)?.device_id()?;
+            let devices = with_repository!(&target, |repository| repository.list_devices(&pin)?);
             for device in devices {
                 println!(
-                    "{} role={} status={}",
+                    "{}{}  {}  role={}  status={}",
+                    if device.public.device_id == own_id {
+                        "* "
+                    } else {
+                        "  "
+                    },
                     device.public.device_id,
+                    device.label,
                     role_name(&device.roles),
                     if device.active() { "active" } else { "revoked" }
                 );
@@ -370,6 +395,17 @@ fn default_key_path(repository_root: &str) -> Result<PathBuf> {
     std::fs::create_dir_all(&directory)
         .with_context(|| format!("create {}", directory.display()))?;
     Ok(directory.join(format!("{repository_root}.json")))
+}
+
+fn default_owner_label() -> String {
+    Process::new("hostname")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|hostname| hostname.trim().to_owned())
+        .filter(|hostname| validate_device_label(hostname).is_ok())
+        .unwrap_or_else(|| "owner".to_owned())
 }
 
 fn admin_pin_path(key: &Path) -> Result<PathBuf> {

@@ -294,7 +294,7 @@ repository_root=$(sed -n 's/^[[:space:]]*"repository_root": "\([^"]*\)",$/\1/p' 
 object_snapshot "$work/e2ee-storage" >"$work/objects-before-device-add.sha256"
 run_phase add_user e2ee device-add "$work/e2ee-storage" "$work/e2ee-new-client" \
   "$git_e2ee" device-add "e2ee::dir:$work/e2ee-storage" "$work/new-user.public.json" \
-    --key "$work/repository.key.json"
+    --label new-user --key "$work/repository.key.json"
 active_reader_key="$work/new-user.key.json"
 if (( total_readers > 2 )); then
   for reader_number in $(seq 3 "$total_readers"); do
@@ -308,7 +308,7 @@ if (( total_readers > 2 )); then
     run_phase "add_reader_$reader_label" e2ee device-add \
       "$work/e2ee-storage" "$work/e2ee-new-client" \
       "$git_e2ee" device-add "e2ee::dir:$work/e2ee-storage" "$reader_public" \
-        --key "$work/repository.key.json"
+        --label "reader-$reader_label" --key "$work/repository.key.json"
     active_reader_key=$reader_key
   done
 fi

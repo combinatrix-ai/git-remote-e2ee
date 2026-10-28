@@ -174,7 +174,7 @@ fn shallow_push_is_rejected_before_publication_and_unshallow_recovers() {
     );
     let key = KeyFile::generate();
     let encrypted = EncryptedRepository::new(FilesystemStorage::new(&storage), key);
-    encrypted.initialize().unwrap();
+    encrypted.initialize("owner").unwrap();
     let head_before = fs::read(storage.join("HEAD")).unwrap();
     let error = encrypted
         .push_ref(&shallow, "refs/heads/main", false)
@@ -209,7 +209,7 @@ fn pushes_incrementally_and_fetches_into_another_repository() {
 
     let key = KeyFile::generate();
     let encrypted = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key.clone());
-    encrypted.initialize().unwrap();
+    encrypted.initialize("owner").unwrap();
 
     let first = commit(&source, "first\n", "first");
     encrypted
@@ -254,7 +254,7 @@ fn missing_pack_observation_does_not_advance_the_floor() {
 
     let key = KeyFile::generate();
     let repository = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key);
-    repository.initialize().unwrap();
+    repository.initialize("owner").unwrap();
     commit(&source, "first\n", "first");
     repository
         .push_update_for_remote(
@@ -312,7 +312,7 @@ fn successful_own_publication_advances_the_client_floor() {
 
     let key = KeyFile::generate();
     let repository = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key);
-    repository.initialize().unwrap();
+    repository.initialize("owner").unwrap();
     commit(&source, "published\n", "published");
     let head = repository
         .push_update_for_remote(
@@ -341,7 +341,7 @@ fn returning_client_fetches_multiple_offline_generations_from_deltas() {
     initialize_git(&destination);
     let key = KeyFile::generate();
     let repository = EncryptedRepository::new(FilesystemStorage::new(&remote), key);
-    repository.initialize().unwrap();
+    repository.initialize("owner").unwrap();
 
     commit(&source, "one\n", "one");
     repository
@@ -373,7 +373,7 @@ fn returning_client_rejects_signed_ref_advance_without_its_pack() {
     initialize_git(&destination);
     let key = KeyFile::generate();
     let repository = EncryptedRepository::new(FilesystemStorage::new(&remote), key.clone());
-    repository.initialize().unwrap();
+    repository.initialize("owner").unwrap();
     commit(&source, "valid\n", "valid");
     repository
         .push_ref(&source, "refs/heads/main", false)
@@ -386,7 +386,7 @@ fn returning_client_rejects_signed_ref_advance_without_its_pack() {
         .to_owned();
     let manifest_bytes = read_stored_object(&remote, "manifests", &head);
     let header = peek_manifest_header(&manifest_bytes).unwrap();
-    let (policy, _) = PolicyState::genesis(&key).unwrap();
+    let (policy, _) = PolicyState::genesis(&key, "owner").unwrap();
     policy.validate_genesis(&key.repository_root).unwrap();
     let current_key = unwrap_generation_key(&header, &key).unwrap();
     let current = open_manifest(&manifest_bytes, &current_key).unwrap();
@@ -455,7 +455,7 @@ fn missing_verified_frontier_tip_fails_closed() {
 
     let key = KeyFile::generate();
     let repository = EncryptedRepository::new(FilesystemStorage::new(&remote), key);
-    repository.initialize().unwrap();
+    repository.initialize("owner").unwrap();
     commit(&source, "valid\n", "valid");
     repository
         .push_ref(&source, "refs/heads/main", false)
@@ -516,7 +516,7 @@ fn local_publication_advances_verified_frontier_before_observation() {
 
     let key = KeyFile::generate();
     let repository = EncryptedRepository::new(FilesystemStorage::new(&remote), key);
-    repository.initialize().unwrap();
+    repository.initialize("owner").unwrap();
 
     let first = commit(&source, "first\n", "first");
     repository
@@ -571,7 +571,7 @@ fn rejects_non_fast_forward_update() {
 
     let key = KeyFile::generate();
     let encrypted = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key);
-    encrypted.initialize().unwrap();
+    encrypted.initialize("owner").unwrap();
     let first = commit(&source, "first\n", "first");
     encrypted
         .push_ref(&source, "refs/heads/main", false)
@@ -601,7 +601,7 @@ fn explicit_force_can_publish_a_rollback() {
 
     let key = KeyFile::generate();
     let encrypted = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key);
-    encrypted.initialize().unwrap();
+    encrypted.initialize("owner").unwrap();
     let first = commit(&source, "first\n", "first");
     encrypted
         .push_ref(&source, "refs/heads/main", false)
@@ -633,7 +633,7 @@ fn detects_tampered_pack_ciphertext() {
 
     let key = KeyFile::generate();
     let encrypted = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key);
-    encrypted.initialize().unwrap();
+    encrypted.initialize("owner").unwrap();
     commit(&source, "secret\n", "secret");
     encrypted
         .push_ref(&source, "refs/heads/main", false)
@@ -673,7 +673,7 @@ fn late_stream_authentication_failure_does_not_advance_refs_or_pins() {
 
     let key = KeyFile::generate();
     let encrypted = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key);
-    encrypted.initialize().unwrap();
+    encrypted.initialize("owner").unwrap();
     encrypted
         .push_ref(&source, "refs/heads/main", false)
         .unwrap();
@@ -708,7 +708,7 @@ fn rejects_storage_head_rollback_after_fetch_pins_history() {
 
     let key = KeyFile::generate();
     let encrypted = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key);
-    encrypted.initialize().unwrap();
+    encrypted.initialize("owner").unwrap();
     commit(&source, "first\n", "first");
     let first_head = encrypted
         .push_ref(&source, "refs/heads/main", false)
@@ -736,7 +736,7 @@ fn rejects_same_generation_manifest_fork_after_fetch_pins_history() {
 
     let key = KeyFile::generate();
     let encrypted = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key.clone());
-    encrypted.initialize().unwrap();
+    encrypted.initialize("owner").unwrap();
     commit(&source, "first\n", "first");
     encrypted
         .push_ref(&source, "refs/heads/main", false)
@@ -744,7 +744,7 @@ fn rejects_same_generation_manifest_fork_after_fetch_pins_history() {
     encrypted.fetch_into(&destination, "encrypted").unwrap();
 
     let fork = EncryptedRepository::new(FilesystemStorage::new(&fork_path), key);
-    fork.initialize().unwrap();
+    fork.initialize("owner").unwrap();
     let fork_head = fork.push_ref(&source, "refs/heads/main", false).unwrap();
     copy_tree(&fork_path.join("manifests"), &remote_path.join("manifests"));
     fs::write(remote_path.join("HEAD"), format!("{fork_head}\n")).unwrap();
@@ -769,7 +769,7 @@ fn recover_replaces_reader_signed_junk_from_the_directory_floor() {
     let admin_pin = temporary.path().join("owner.admin-state.json");
     let storage = FilesystemStorage::new(&storage_path);
     let repository = EncryptedRepository::new(storage.clone(), owner.clone());
-    repository.initialize().unwrap();
+    repository.initialize("owner").unwrap();
     repository.pin_admin_state(&admin_pin).unwrap();
     commit(&source, "recovery keeps this content\n", "base");
     repository
@@ -778,6 +778,7 @@ fn recover_replaces_reader_signed_junk_from_the_directory_floor() {
     repository
         .add_device(
             reader.public_device().unwrap(),
+            "device-1",
             DeviceRoles::reader(),
             &admin_pin,
         )
@@ -906,11 +907,12 @@ fn recover_refuses_a_revoked_devices_unverifiable_head() {
     let admin_pin = temporary.path().join("owner.admin-state.json");
     let storage = FilesystemStorage::new(&storage_path);
     let owner_repository = EncryptedRepository::new(storage.clone(), owner);
-    owner_repository.initialize().unwrap();
+    owner_repository.initialize("owner").unwrap();
     owner_repository.pin_admin_state(&admin_pin).unwrap();
     owner_repository
         .add_device(
             reader.public_device().unwrap(),
+            "device-2",
             DeviceRoles::reader(),
             &admin_pin,
         )
@@ -959,7 +961,7 @@ fn recover_refuses_unknown_formats_and_missing_floor_objects() {
     let key = KeyFile::generate();
     let unknown_storage = FilesystemStorage::new(&unknown_storage_path);
     let unknown_repository = EncryptedRepository::new(unknown_storage.clone(), key.clone());
-    unknown_repository.initialize().unwrap();
+    unknown_repository.initialize("owner").unwrap();
     unknown_repository
         .fetch_into(&unknown_repo, "encrypted")
         .unwrap();
@@ -1011,7 +1013,7 @@ fn recover_refuses_unknown_formats_and_missing_floor_objects() {
     let missing_key = KeyFile::generate();
     let missing_storage = FilesystemStorage::new(&missing_storage_path);
     let missing_repository = EncryptedRepository::new(missing_storage.clone(), missing_key.clone());
-    missing_repository.initialize().unwrap();
+    missing_repository.initialize("owner").unwrap();
     let source = temporary.path().join("missing-source");
     initialize_git(&source);
     commit(&source, "required floor object\n", "required");
@@ -1088,7 +1090,7 @@ fn recover_never_overrides_authenticated_rollback() {
     let key = KeyFile::generate();
     let storage = FilesystemStorage::new(&storage_path);
     let repository = EncryptedRepository::new(storage.clone(), key);
-    repository.initialize().unwrap();
+    repository.initialize("owner").unwrap();
     commit(&source, "one\n", "one");
     let first = repository
         .push_ref(&source, "refs/heads/main", false)
@@ -1130,7 +1132,7 @@ fn recovery_discovery_budget_exhaustion_fails_closed() {
     let key = KeyFile::generate();
     let inner = FilesystemStorage::new(&storage_path);
     let repository = EncryptedRepository::new(inner.clone(), key.clone());
-    repository.initialize().unwrap();
+    repository.initialize("owner").unwrap();
     repository.fetch_into(&repo, "encrypted").unwrap();
     let floor = inner.read_head().unwrap().unwrap();
     let invalid_bytes = b"malformed successor";
@@ -1178,7 +1180,7 @@ fn writer_can_add_branch_without_having_other_remote_branch_objects() {
 
     let key = KeyFile::generate();
     let encrypted = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key);
-    encrypted.initialize().unwrap();
+    encrypted.initialize("owner").unwrap();
     let main = commit(&first_writer, "main\n", "main");
     encrypted
         .push_ref(&first_writer, "refs/heads/main", false)
@@ -1238,7 +1240,7 @@ fn deletion_and_tag_publication_race_with_exactly_one_cas_winner() {
     initialize_git(&source);
     let key = KeyFile::generate();
     let seed_repository = EncryptedRepository::new(FilesystemStorage::new(&remote), key.clone());
-    seed_repository.initialize().unwrap();
+    seed_repository.initialize("owner").unwrap();
     let main = commit(&source, "main\n", "main");
     seed_repository
         .push_ref(&source, "refs/heads/main", false)
@@ -1299,7 +1301,7 @@ fn rejects_unsupported_ref_namespaces_consistently() {
 
     let key = KeyFile::generate();
     let encrypted = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key);
-    encrypted.initialize().unwrap();
+    encrypted.initialize("owner").unwrap();
     commit(&source, "tagged\n", "tagged");
     let error = encrypted
         .push_update(&source, "refs/heads/main", "refs/notes/review", false)
@@ -1399,7 +1401,7 @@ fn directory_root_holds_exactly_the_v6_layout() {
     initialize_git(&source);
     let encrypted =
         EncryptedRepository::new(FilesystemStorage::new(&remote_path), KeyFile::generate());
-    encrypted.initialize().unwrap();
+    encrypted.initialize("owner").unwrap();
     commit(&source, "layout\n", "layout");
     encrypted
         .push_ref(&source, "refs/heads/main", false)
@@ -1437,7 +1439,7 @@ fn directory_format_mismatch_names_the_found_format() {
     initialize_git(&source);
     let encrypted =
         EncryptedRepository::new(FilesystemStorage::new(&remote_path), KeyFile::generate());
-    encrypted.initialize().unwrap();
+    encrypted.initialize("owner").unwrap();
     commit(&source, "format\n", "format");
     encrypted
         .push_ref(&source, "refs/heads/main", false)
@@ -1452,7 +1454,7 @@ fn directory_format_mismatch_names_the_found_format() {
         )),
         "{error}"
     );
-    assert!(encrypted.initialize().is_err());
+    assert!(encrypted.initialize("owner").is_err());
 
     fs::remove_file(remote_path.join("FORMAT")).unwrap();
     let error = format!("{:#}", encrypted.verify().unwrap_err());

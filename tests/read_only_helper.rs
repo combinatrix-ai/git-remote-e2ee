@@ -107,12 +107,13 @@ fn exercise_read_only_helper<S: Storage>(
     reader_key.write_new(&reader_key_path).unwrap();
 
     let owner = EncryptedRepository::new(storage, owner_key);
-    owner.initialize().unwrap();
+    owner.initialize("owner").unwrap();
     let admin_pin = temporary.join("owner.admin-state.json");
     owner.pin_admin_state(&admin_pin).unwrap();
     owner
         .add_device(
             reader_key.public_device().unwrap(),
+            "device-1",
             DeviceRoles::reader(),
             &admin_pin,
         )
@@ -262,12 +263,13 @@ fn read_only_device_cannot_publish_recovery() {
     let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
     let storage = FilesystemStorage::new(&storage_path);
     let owner_repository = EncryptedRepository::new(storage.clone(), owner);
-    owner_repository.initialize().unwrap();
+    owner_repository.initialize("owner").unwrap();
     let admin_pin = temporary.path().join("owner.admin-state.json");
     owner_repository.pin_admin_state(&admin_pin).unwrap();
     owner_repository
         .add_device(
             reader.public_device().unwrap(),
+            "device-2",
             DeviceRoles::reader(),
             &admin_pin,
         )

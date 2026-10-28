@@ -107,7 +107,15 @@ fn init_inside_a_repository_creates_a_key_and_adds_origin() {
         "{verified}"
     );
     let listed = success(&sandbox.e2ee(&repo, &["device-list", "origin"]));
-    assert!(listed.contains("role=admin status=active"), "{listed}");
+    assert!(
+        listed.starts_with("* ") && listed.contains("  role=admin  status=active"),
+        "{listed}"
+    );
+    let label = listed.split("  ").nth(1).unwrap_or_default();
+    assert!(
+        !label.is_empty(),
+        "init without --label must label the owner: {listed}"
+    );
 }
 
 #[test]

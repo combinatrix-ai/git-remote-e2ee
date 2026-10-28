@@ -67,7 +67,7 @@ fn run_metadata_scenario<S: Storage>(
     let owner = KeyFile::generate();
     let pin = scratch.join("owner.admin-state.json");
     let repository = EncryptedRepository::new(make_storage(), owner.clone());
-    repository.initialize().unwrap();
+    repository.initialize("owner").unwrap();
     repository.pin_admin_state(&pin).unwrap();
     let mut devices = vec![owner.public_device().unwrap()];
     assert_eq!(
@@ -84,6 +84,7 @@ fn run_metadata_scenario<S: Storage>(
         repository
             .add_device(
                 reader.public_device().unwrap(),
+                &format!("phone-{index}"),
                 DeviceRoles::collaborator(),
                 &pin,
             )
@@ -126,6 +127,8 @@ fn assert_storage_is_anonymous(bytes: &[u8], devices: &[git_remote_e2ee::crypto:
         b"signing_public_key".to_vec(),
         b"wrapping_public_key".to_vec(),
         b"device_id".to_vec(),
+        b"label".to_vec(),
+        b"phone-".to_vec(),
         b"policies/".to_vec(),
     ];
     for device in devices {
