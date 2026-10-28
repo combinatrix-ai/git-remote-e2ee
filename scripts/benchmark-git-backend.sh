@@ -213,6 +213,7 @@ if [[ ${BENCH_TRACE:-0} == 1 ]]; then
   export GIT_REMOTE_E2EE_TRACE=1
 fi
 work=$(mktemp -d "$work_parent/git-remote-e2ee-bench.XXXXXX")
+export XDG_STATE_HOME="$work/xdg-state" XDG_CONFIG_HOME="$work/xdg-config"
 work=$(cd "$work" && pwd -P)
 chmod 700 "$work"
 gpgconf_bin=$(command -v gpgconf || true)
@@ -463,9 +464,9 @@ run_round() {
   done
   git -C "$source_work" config remote.e2ee-directory.e2ee-key "$key_directory"
   git -C "$source_work" config remote.e2ee-carrier.e2ee-key "$key_carrier"
-  "$git_e2ee" init --storage "$round_dir/e2ee-directory" --key "$key_directory" >/dev/null
-  env "GIT_REMOTE_E2EE_CACHE_DIR=$cache_push" \
-    "$git_e2ee" carrier-init --remote "$carrier_git" --key "$key_carrier" >/dev/null
+  (cd "$round_dir" && "$git_e2ee" init "e2ee::dir:$round_dir/e2ee-directory" --key "$key_directory" >/dev/null)
+  (cd "$round_dir" && env "GIT_REMOTE_E2EE_CACHE_DIR=$cache_push" \
+    "$git_e2ee" init "$e2ee_url" --key "$key_carrier" >/dev/null)
 
   echo "round $round: initial local encryption and initial Git-backend pushes" >&2
   if [[ $e2ee_only != 1 ]]; then

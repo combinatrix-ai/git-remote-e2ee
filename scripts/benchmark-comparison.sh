@@ -72,6 +72,7 @@ git_e2ee="$project_root/target/release/git-e2ee"
 
 work_parent=${TMPDIR:-/tmp}
 work=$(mktemp -d "$work_parent/git-remote-e2ee-compare.XXXXXX")
+export XDG_STATE_HOME="$work/xdg-state" XDG_CONFIG_HOME="$work/xdg-config"
 cleanup() {
   if [[ ${BENCH_KEEP_WORK:-0} == 1 ]]; then
     echo "benchmark work directory retained at $work" >&2
@@ -255,8 +256,8 @@ git -C "$work/e2ee-client" config maintenance.auto false
 git -C "$work/e2ee-new-client" config gc.auto 0
 git -C "$work/e2ee-new-client" config maintenance.auto false
 "$git_e2ee" keygen --output "$work/repository.key.json" >/dev/null
-"$git_e2ee" init --storage "$work/e2ee-storage" \
-  --key "$work/repository.key.json" >/dev/null
+(cd "$work" && "$git_e2ee" init "e2ee::dir:$work/e2ee-storage" \
+  --key "$work/repository.key.json" >/dev/null)
 if [[ $e2ee_push_mode == native ]]; then
   git -C "$work/source" remote add private "e2ee::dir:$work/e2ee-storage"
   git -C "$work/source" config remote.private.e2ee-key "$work/repository.key.json"
@@ -292,8 +293,8 @@ repository_root=$(sed -n 's/^[[:space:]]*"repository_root": "\([^"]*\)",$/\1/p' 
   --output "$work/new-user.public.json" >/dev/null
 object_snapshot "$work/e2ee-storage" >"$work/objects-before-device-add.sha256"
 run_phase add_user e2ee device-add "$work/e2ee-storage" "$work/e2ee-new-client" \
-  "$git_e2ee" device-add --storage "$work/e2ee-storage" \
-    --key "$work/repository.key.json" --device "$work/new-user.public.json"
+  "$git_e2ee" device-add "e2ee::dir:$work/e2ee-storage" "$work/new-user.public.json" \
+    --key "$work/repository.key.json"
 active_reader_key="$work/new-user.key.json"
 if (( total_readers > 2 )); then
   for reader_number in $(seq 3 "$total_readers"); do
@@ -306,8 +307,8 @@ if (( total_readers > 2 )); then
       --output "$reader_public" >/dev/null
     run_phase "add_reader_$reader_label" e2ee device-add \
       "$work/e2ee-storage" "$work/e2ee-new-client" \
-      "$git_e2ee" device-add --storage "$work/e2ee-storage" \
-        --key "$work/repository.key.json" --device "$reader_public"
+      "$git_e2ee" device-add "e2ee::dir:$work/e2ee-storage" "$reader_public" \
+        --key "$work/repository.key.json"
     active_reader_key=$reader_key
   done
 fi

@@ -6,7 +6,9 @@ use git_remote_e2ee::crypto::KeyFile;
 
 fn run_cli(state_home: &Path, args: &[String]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_git-e2ee"))
-        .env("XDG_STATE_HOME", state_home)
+        .current_dir(state_home)
+        .env("XDG_STATE_HOME", state_home.join("state"))
+        .env("XDG_CONFIG_HOME", state_home.join("config"))
         .args(args)
         .output()
         .unwrap()
@@ -16,15 +18,17 @@ fn path_arg(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+fn dir_url(storage: &Path) -> String {
+    format!("e2ee::dir:{}", storage.display())
+}
+
 fn add_device_args(storage: &Path, key: &Path, public: &Path) -> Vec<String> {
     vec![
         "device-add".to_owned(),
-        "--storage".to_owned(),
-        path_arg(storage),
+        dir_url(storage),
+        path_arg(public),
         "--key".to_owned(),
         path_arg(key),
-        "--device".to_owned(),
-        path_arg(public),
     ]
 }
 
@@ -40,8 +44,7 @@ fn device_add_parses_roles_and_device_list_uses_role_names() {
         temporary.path(),
         &[
             "init".to_owned(),
-            "--storage".to_owned(),
-            path_arg(&storage),
+            dir_url(&storage),
             "--key".to_owned(),
             path_arg(&owner_path),
         ],
@@ -91,8 +94,7 @@ fn device_add_parses_roles_and_device_list_uses_role_names() {
         temporary.path(),
         &[
             "device-list".to_owned(),
-            "--storage".to_owned(),
-            path_arg(&storage),
+            dir_url(&storage),
             "--key".to_owned(),
             path_arg(&owner_path),
         ],
@@ -124,7 +126,7 @@ fn init_accepts_relative_storage_and_key_paths() {
     let initialized = Command::new(env!("CARGO_BIN_EXE_git-e2ee"))
         .current_dir(temporary.path())
         .env("XDG_STATE_HOME", temporary.path().join("state"))
-        .args(["init", "--storage", "storage", "--key", "owner.key.json"])
+        .args(["init", "e2ee::dir:storage", "--key", "owner.key.json"])
         .output()
         .unwrap();
     assert!(
@@ -165,8 +167,7 @@ fn admin_pin_survives_moving_the_key() {
         temporary.path(),
         &[
             "init".to_owned(),
-            "--storage".to_owned(),
-            path_arg(&storage),
+            dir_url(&storage),
             "--key".to_owned(),
             path_arg(&owner_path),
         ],

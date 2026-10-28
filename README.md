@@ -102,22 +102,18 @@ Use an empty GitHub repository as encrypted storage and push an existing
 project to it:
 
 ```console
-git-e2ee keygen --output ~/.config/git-e2ee/notes.key.json
-git-e2ee carrier-init \
-  --remote https://github.com/you/notes-encrypted.git \
-  --key ~/.config/git-e2ee/notes.key.json
-
 cd my-notes
-git remote add private 'e2ee::https://github.com/you/notes-encrypted.git'
-git config remote.private.e2ee-key ~/.config/git-e2ee/notes.key.json
-git push -u private main
+git-e2ee init https://github.com/you/notes-encrypted.git
+git push -u origin main
 ```
 
+`init` creates a key under `~/.config/git-e2ee/keys/`, initializes the storage,
+and adds it as the Git remote `origin` (use `--name` if `origin` is taken).
 From then on, `git pull` and `git push` work as usual. To clone it somewhere
-else, pass a key once:
+else, pass the key once:
 
 ```console
-git -c e2ee.key="$HOME/.config/git-e2ee/notes.key.json" clone \
+git -c e2ee.key="$HOME/.config/git-e2ee/keys/<repository-root>.json" clone \
   'e2ee::https://github.com/you/notes-encrypted.git' my-notes
 ```
 
