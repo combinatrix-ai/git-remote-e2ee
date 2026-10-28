@@ -14,6 +14,10 @@ use crate::crypto::{
     KeyFile, PublicDevice, SecretKey, SubkeyKind, derive_subkey, object_id, open_pack_stream,
     random_key, seal_pack_stream,
 };
+use crate::error::{
+    BudgetExhausted, ForeignRepository, MissingStorageHead, NotActiveReader, ObjectUnavailable,
+    Unsupported,
+};
 use crate::git;
 use crate::manifest::{
     Manifest, ManifestAuthorization, ManifestHeader, PackDescriptor, open_manifest, pack_aad,
@@ -163,7 +167,9 @@ impl RecoveryBudget {
             .checked_add(byte_count as u64)
             .context("recovery byte budget overflow")?;
         if self.bytes_read > MAX_RECOVERY_BYTES {
-            bail!("recovery manifest byte budget exhausted")
+            bail!(BudgetExhausted(
+                "recovery manifest byte budget exhausted".to_owned()
+            ))
         }
         let operations = (header.generation_key_envelopes.len() as u64)
             .checked_mul(2)
@@ -174,7 +180,9 @@ impl RecoveryBudget {
             .checked_add(operations)
             .context("recovery crypto budget overflow")?;
         if self.crypto_operations > MAX_RECOVERY_CRYPTO_OPERATIONS {
-            bail!("recovery cryptographic-operation budget exhausted")
+            bail!(BudgetExhausted(
+                "recovery cryptographic-operation budget exhausted".to_owned()
+            ))
         }
         Ok(())
     }
@@ -904,7 +912,7 @@ impl<S: Storage> EncryptedRepository<S> {
         let observation = match self.storage.observe_head() {
             Ok(observation) => observation,
             Err(error) => {
-                if format!("{error:#}").contains("budget exhausted") {
+                if error.is::<BudgetExhausted>() {
                     return Err(error).context("bounded recovery discovery failed");
                 }
                 report.reason = format!("storage head is unavailable: {error:#}");
@@ -928,7 +936,7 @@ impl<S: Storage> EncryptedRepository<S> {
             None if observation.head_bytes.is_some() => Err(anyhow::anyhow!(
                 "storage HEAD is not a valid manifest object ID"
             )),
-            None => Err(anyhow::anyhow!("encrypted repository has no storage HEAD")),
+            None => Err(MissingStorageHead.into()),
         };
         match current_chain {
             Ok(chain) => {
@@ -974,11 +982,10 @@ impl<S: Storage> EncryptedRepository<S> {
                 }
             }
             Err(error) => {
-                if format!("{error:#}").contains("budget exhausted") {
+                if error.is::<BudgetExhausted>() {
                     return Err(error).context("bounded recovery discovery failed");
                 }
-                let (class, reason) =
-                    classify_recovery_error(&error, observation.head_bytes.as_deref());
+                let (class, reason) = classify_recovery_error(&error);
                 report.classification = class;
                 report.reason = reason;
                 if class == RecoveryClass::Invalid
@@ -1040,7 +1047,9 @@ impl<S: Storage> EncryptedRepository<S> {
         let carrier_history = history.is_some();
         let history = history.unwrap_or_default();
         if history.commits.len() > MAX_RECOVERY_OUTER_COMMITS {
-            bail!("recovery outer-commit budget exhausted")
+            bail!(BudgetExhausted(
+                "recovery outer-commit budget exhausted".to_owned()
+            ))
         }
         let historical_bytes = history.manifests.values().try_fold(0_u64, |total, bytes| {
             total
@@ -1048,14 +1057,18 @@ impl<S: Storage> EncryptedRepository<S> {
                 .context("recovery manifest byte budget overflow")
         })?;
         if historical_bytes > MAX_RECOVERY_MANIFEST_BYTES {
-            bail!("recovery manifest byte budget exhausted")
+            bail!(BudgetExhausted(
+                "recovery manifest byte budget exhausted".to_owned()
+            ))
         }
         budget.bytes_read = budget
             .bytes_read
             .checked_add(historical_bytes)
             .context("recovery manifest byte budget overflow")?;
         if budget.bytes_read > MAX_RECOVERY_BYTES {
-            bail!("recovery manifest byte budget exhausted")
+            bail!(BudgetExhausted(
+                "recovery manifest byte budget exhausted".to_owned()
+            ))
         }
         if carrier_history
             && !history
@@ -1074,9 +1087,11 @@ impl<S: Storage> EncryptedRepository<S> {
             match self.read_manifest_material(id) {
                 Ok(material) => Ok(material),
                 Err(current_error) => {
-                    let bytes = history.manifests.get(id).with_context(|| {
-                        format!("historical manifest {id} is unavailable (current read: {current_error:#})")
-                    })?;
+                    let Some(bytes) = history.manifests.get(id) else {
+                        return Err(current_error.context(format!(
+                            "historical manifest {id} is not in carrier history"
+                        )));
+                    };
                     if object_id(bytes) != id {
                         bail!("historical manifest {id} content ID mismatch")
                     }
@@ -1150,7 +1165,9 @@ impl<S: Storage> EncryptedRepository<S> {
                 }
             }
             if unique_heads.len() > MAX_RECOVERY_CANDIDATES {
-                bail!("recovery candidate budget exhausted")
+                bail!(BudgetExhausted(
+                    "recovery candidate budget exhausted".to_owned()
+                ))
             }
             for (candidate_id, commit) in unique_heads {
                 if candidate_id == floor_id {
@@ -1163,7 +1180,7 @@ impl<S: Storage> EncryptedRepository<S> {
                 ) {
                     Ok(chain) => chain,
                     Err(error) => {
-                        let (class, _) = classify_recovery_error(&error, None);
+                        let (class, _) = classify_recovery_error(&error);
                         match class {
                             RecoveryClass::Invalid => continue,
                             RecoveryClass::Unverifiable
@@ -1543,7 +1560,9 @@ impl<S: Storage> EncryptedRepository<S> {
                         (policy, Some(parent.policy.clone()))
                     }
                     ManifestAuthorization::Checkpoint => {
-                        bail!("checkpoint transitions are reserved but not implemented")
+                        bail!(Unsupported(
+                            "checkpoint transitions are reserved but not implemented".to_owned()
+                        ))
                     }
                 };
                 manifest.validate_successor(&parent.id, &parent.manifest, &policy)?;
@@ -1690,33 +1709,26 @@ struct RejectedHeadLog {
     entries: Vec<RejectedHeadEvidence>,
 }
 
-fn classify_recovery_error(
-    error: &anyhow::Error,
-    raw_head: Option<&[u8]>,
-) -> (RecoveryClass, String) {
-    let detail = format!("{error:#}");
-    if detail.contains("unsupported") || detail.contains("reserved but not implemented") {
-        return (RecoveryClass::Unsupported, detail);
-    }
-    if detail.contains("device is not an active reader")
-        || detail.contains("cannot open the generation key")
-    {
-        return (RecoveryClass::Unverifiable, detail);
-    }
-    if detail.contains("key file belongs to a different repository") {
-        return (RecoveryClass::Discontinuous, detail);
-    }
-    if error.chain().any(|cause| {
-        cause
-            .downcast_ref::<io::Error>()
-            .is_some_and(|source| source.kind() != io::ErrorKind::InvalidData)
+fn classify_recovery_error(error: &anyhow::Error) -> (RecoveryClass, String) {
+    let has = |matches: fn(&(dyn std::error::Error + 'static)) -> bool| error.chain().any(matches);
+    let class = if has(|cause| cause.is::<Unsupported>()) {
+        RecoveryClass::Unsupported
+    } else if has(|cause| cause.is::<NotActiveReader>()) {
+        RecoveryClass::Unverifiable
+    } else if has(|cause| cause.is::<ForeignRepository>()) {
+        RecoveryClass::Discontinuous
+    } else if has(|cause| {
+        cause.is::<ObjectUnavailable>()
+            || cause.is::<MissingStorageHead>()
+            || cause
+                .downcast_ref::<io::Error>()
+                .is_some_and(|source| source.kind() != io::ErrorKind::InvalidData)
     }) {
-        return (RecoveryClass::Unavailable, detail);
-    }
-    if detail.contains("encrypted repository has no storage HEAD") && raw_head.is_none() {
-        return (RecoveryClass::Unavailable, detail);
-    }
-    (RecoveryClass::Invalid, detail)
+        RecoveryClass::Unavailable
+    } else {
+        RecoveryClass::Invalid
+    };
+    (class, format!("{error:#}"))
 }
 
 fn record_rejected_head(
@@ -1982,7 +1994,13 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use super::{ClientState, read_client_state, testing_write_client_state};
+    use std::io;
+
+    use super::{
+        ClientState, ForeignRepository, MissingStorageHead, NotActiveReader, ObjectUnavailable,
+        RecoveryClass, Unsupported, classify_recovery_error, read_client_state,
+        testing_write_client_state,
+    };
 
     #[test]
     fn concurrent_client_state_process_writes_never_lower_or_corrupt_the_floor() {
@@ -2082,5 +2100,51 @@ mod tests {
         }"#;
         let state: ClientState = serde_json::from_slice(legacy).unwrap();
         assert!(state.verified_refs.is_empty());
+    }
+
+    #[test]
+    fn recovery_classification_ignores_storage_controlled_message_text() {
+        for text in [
+            "parse manifest header: unknown field `unsupported`",
+            "checkpoint transitions are reserved but not implemented",
+            "device is not an active reader of the current generation",
+            "key file belongs to a different repository",
+            "carrier object 00 is unavailable",
+            "encrypted repository has no storage HEAD",
+            "recovery manifest byte budget exhausted",
+        ] {
+            let (class, _) = classify_recovery_error(&anyhow::anyhow!(text.to_owned()));
+            assert_eq!(class, RecoveryClass::Invalid, "{text}");
+        }
+    }
+
+    #[test]
+    fn recovery_classification_follows_error_types_through_context() {
+        let cases: [(anyhow::Error, RecoveryClass); 6] = [
+            (
+                Unsupported("manifest format 99".to_owned()).into(),
+                RecoveryClass::Unsupported,
+            ),
+            (NotActiveReader.into(), RecoveryClass::Unverifiable),
+            (ForeignRepository.into(), RecoveryClass::Discontinuous),
+            (
+                ObjectUnavailable {
+                    storage: "carrier",
+                    id: "00".to_owned(),
+                    source: None,
+                }
+                .into(),
+                RecoveryClass::Unavailable,
+            ),
+            (MissingStorageHead.into(), RecoveryClass::Unavailable),
+            (
+                io::Error::from(io::ErrorKind::InvalidData).into(),
+                RecoveryClass::Invalid,
+            ),
+        ];
+        for (error, expected) in cases {
+            let error = error.context("read manifest");
+            assert_eq!(classify_recovery_error(&error).0, expected, "{error:#}");
+        }
     }
 }
