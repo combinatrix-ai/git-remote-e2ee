@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
@@ -300,6 +300,18 @@ impl<S: Storage> EncryptedRepository<S> {
         Ok(result)
     }
 
+    /// Continuity state is keyed by repository root rather than by Git remote
+    /// name, so `git remote rename` or a second remote for the same encrypted
+    /// repository cannot silently start from an empty pin.
+    fn client_state_path(&self, repo: &Path) -> Result<PathBuf> {
+        let directory = git_state_directory(repo)?
+            .join("git-remote-e2ee")
+            .join(&self.key.repository_root);
+        crate::persist::create_dir_all_durable(&directory)
+            .with_context(|| format!("create {}", directory.display()))?;
+        Ok(directory.join("state.json"))
+    }
+
     pub fn pin_admin_state(&self, pin_path: &Path) -> Result<()> {
         let _pin_lock = ClientStateLock::acquire(pin_path)?;
         let chain = self.current_chain()?;
@@ -410,7 +422,7 @@ impl<S: Storage> EncryptedRepository<S> {
         force: bool,
     ) -> Result<String> {
         let state_path = remote_name
-            .map(|name| client_state_path(repo, name))
+            .map(|_| self.client_state_path(repo))
             .transpose()?;
         let _state_lock = state_path
             .as_deref()
@@ -541,7 +553,7 @@ impl<S: Storage> EncryptedRepository<S> {
         destination_ref: &str,
         force: bool,
     ) -> Result<()> {
-        let state_path = client_state_path(repo, remote_name)?;
+        let state_path = self.client_state_path(repo)?;
         let _state_lock = ClientStateLock::acquire(&state_path)?;
         self.preflight_ref_change(
             repo,
@@ -560,7 +572,7 @@ impl<S: Storage> EncryptedRepository<S> {
         remote_name: &str,
         destination_ref: &str,
     ) -> Result<()> {
-        let state_path = client_state_path(repo, remote_name)?;
+        let state_path = self.client_state_path(repo)?;
         let _state_lock = ClientStateLock::acquire(&state_path)?;
         self.preflight_ref_change(
             repo,
@@ -646,8 +658,7 @@ impl<S: Storage> EncryptedRepository<S> {
 
     pub fn fetch_into(&self, repo: &Path, remote_name: &str) -> Result<Manifest> {
         git::ensure_repository(repo)?;
-        validate_remote_name(remote_name)?;
-        let state_path = client_state_path(repo, remote_name)?;
+        let state_path = self.client_state_path(repo)?;
         let _state_lock = ClientStateLock::acquire(&state_path)?;
         let manifest = self.import_packs_locked(repo, &state_path)?;
         for (reference, object) in &manifest.refs {
@@ -662,10 +673,9 @@ impl<S: Storage> EncryptedRepository<S> {
         Ok(manifest)
     }
 
-    pub fn observe_manifest(&self, repo: &Path, remote_name: &str) -> Result<Manifest> {
+    pub fn observe_manifest(&self, repo: &Path) -> Result<Manifest> {
         git::ensure_repository(repo)?;
-        validate_remote_name(remote_name)?;
-        let state_path = client_state_path(repo, remote_name)?;
+        let state_path = self.client_state_path(repo)?;
         let _state_lock = ClientStateLock::acquire(&state_path)?;
         let chain = self.current_chain()?;
         let current = chain.first().context("manifest chain is empty")?.clone();
@@ -696,10 +706,9 @@ impl<S: Storage> EncryptedRepository<S> {
         Ok(current.manifest.clone())
     }
 
-    pub fn import_packs(&self, repo: &Path, remote_name: &str) -> Result<Manifest> {
+    pub fn import_packs(&self, repo: &Path) -> Result<Manifest> {
         git::ensure_repository(repo)?;
-        validate_remote_name(remote_name)?;
-        let state_path = client_state_path(repo, remote_name)?;
+        let state_path = self.client_state_path(repo)?;
         let _state_lock = ClientStateLock::acquire(&state_path)?;
         self.import_packs_locked(repo, &state_path)
     }
@@ -868,15 +877,9 @@ impl<S: Storage> EncryptedRepository<S> {
         Ok((current.id, current.manifest))
     }
 
-    pub fn recover(
-        &self,
-        repo: &Path,
-        remote_name: &str,
-        options: RecoveryOptions<'_>,
-    ) -> Result<RecoveryReport> {
+    pub fn recover(&self, repo: &Path, options: RecoveryOptions<'_>) -> Result<RecoveryReport> {
         git::ensure_repository(repo)?;
-        validate_remote_name(remote_name)?;
-        let state_path = client_state_path(repo, remote_name)?;
+        let state_path = self.client_state_path(repo)?;
         let _state_lock = ClientStateLock::acquire(&state_path)?;
         let state = read_client_state(&state_path)?;
         let mut report = RecoveryReport {
@@ -1754,7 +1757,7 @@ fn record_rejected_head(
     Ok(())
 }
 
-fn git_state_directory(repo: &Path) -> Result<std::path::PathBuf> {
+fn git_state_directory(repo: &Path) -> Result<PathBuf> {
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -1766,14 +1769,21 @@ fn git_state_directory(repo: &Path) -> Result<std::path::PathBuf> {
     Ok(String::from_utf8(output.stdout)?.trim().into())
 }
 
-fn client_state_path(repo: &Path, remote_name: &str) -> Result<std::path::PathBuf> {
-    validate_remote_name(remote_name)?;
-    let directory = git_state_directory(repo)?
-        .join("git-remote-e2ee")
-        .join(remote_name);
+/// Where an administrator's continuity pin lives on this machine. It is keyed
+/// by repository root, not by key-file path, so moving or renaming the key
+/// keeps the pin.
+pub fn admin_state_path(repository_root: &str) -> Result<PathBuf> {
+    let state_home = match std::env::var_os("XDG_STATE_HOME") {
+        Some(path) if !path.is_empty() => PathBuf::from(path),
+        _ => PathBuf::from(
+            std::env::var_os("HOME").context("HOME is unset and XDG_STATE_HOME is unset")?,
+        )
+        .join(".local/state"),
+    };
+    let directory = state_home.join("git-e2ee").join(repository_root);
     crate::persist::create_dir_all_durable(&directory)
         .with_context(|| format!("create {}", directory.display()))?;
-    Ok(directory.join("state.json"))
+    Ok(directory.join("admin-state.json"))
 }
 
 fn read_client_state(path: &Path) -> Result<ClientState> {
@@ -1958,17 +1968,6 @@ pub(crate) fn testing_write_client_state(
     };
     let _state_lock = ClientStateLock::acquire(path)?;
     persist_client_state_locked(path, &state)
-}
-
-fn validate_remote_name(name: &str) -> Result<()> {
-    if name.is_empty()
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
-        bail!("remote name may contain only ASCII letters, digits, '-' and '_'")
-    }
-    Ok(())
 }
 
 #[cfg(test)]

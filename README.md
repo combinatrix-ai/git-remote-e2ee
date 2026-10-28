@@ -183,7 +183,7 @@ next to unrelated branches. Do not edit it by hand.
 **What if I lose my key?**
 If no remaining device has access, the data is gone. There is no recovery
 service by design. Keep an offline backup of at least one administrator key and
-its `.admin-state.json` file.
+its `admin-state.json` pin (under `~/.local/state/git-e2ee/<repository-root>/`).
 
 **Does revoking a device hide old history from it?**
 No. It keeps whatever it could already decrypt. It gets no keys for anything

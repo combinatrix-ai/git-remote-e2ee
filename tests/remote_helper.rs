@@ -21,6 +21,15 @@ fn git_output(repo: &Path, args: &[&str], with_helper: bool) -> Output {
     command.output().unwrap()
 }
 
+fn state_dir(repo: &Path) -> std::path::PathBuf {
+    let entries: Vec<_> = fs::read_dir(repo.join(".git/git-remote-e2ee"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    entries.into_iter().next().unwrap()
+}
+
 fn git(repo: &Path, args: &[&str], with_helper: bool) -> String {
     let output = git_output(repo, args, with_helper);
     assert!(
@@ -216,7 +225,7 @@ fn concurrent_helper_processes_preserve_the_client_state_floor() {
     }
     assert_eq!(current_successes, 2);
 
-    let state_path = destination.join(".git/git-remote-e2ee/private/state.json");
+    let state_path = state_dir(&destination).join("state.json");
     let state: serde_json::Value = serde_json::from_slice(&fs::read(state_path).unwrap()).unwrap();
     assert_eq!(state["generation"], expected_manifest.generation);
     assert_eq!(state["imported_generation"], expected_manifest.generation);

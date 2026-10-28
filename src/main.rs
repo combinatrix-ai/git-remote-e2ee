@@ -5,7 +5,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use git_remote_e2ee::crypto::{KeyFile, PublicDevice};
 use git_remote_e2ee::policy::DeviceRoles;
-use git_remote_e2ee::repository::{EncryptedRepository, RecoveryOptions, RecoveryReport};
+use git_remote_e2ee::repository::{
+    EncryptedRepository, RecoveryOptions, RecoveryReport, admin_state_path,
+};
 use git_remote_e2ee::storage::{FilesystemStorage, GitStorage};
 
 #[derive(Parser)]
@@ -77,7 +79,7 @@ enum Command {
         key: PathBuf,
         #[arg(long, default_value = ".")]
         repo: PathBuf,
-        #[arg(long, default_value = "e2ee")]
+        #[arg(long, default_value = "origin")]
         remote_name: String,
     },
     Verify {
@@ -125,8 +127,6 @@ enum Command {
         key: PathBuf,
         #[arg(long, default_value = ".")]
         repo: PathBuf,
-        #[arg(long, default_value = "origin")]
-        remote_name: String,
         #[arg(long)]
         publish: bool,
         #[arg(long, requires = "publish")]
@@ -166,14 +166,14 @@ fn main() -> Result<()> {
             );
         }
         Command::Init { storage, key } => {
-            let pin = admin_pin_path(&key);
+            let pin = admin_pin_path(&key)?;
             let repository = open_repository(storage, key)?;
             let head = repository.initialize()?;
             repository.pin_admin_state(&pin)?;
             println!("{head}");
         }
         Command::CarrierInit { remote, key } => {
-            let pin = admin_pin_path(&key);
+            let pin = admin_pin_path(&key)?;
             let repository =
                 EncryptedRepository::new(GitStorage::open(&remote)?, KeyFile::read(&key)?);
             let head = repository.initialize()?;
@@ -217,7 +217,7 @@ fn main() -> Result<()> {
             device,
             role,
         } => {
-            let pin = admin_pin_path(&key);
+            let pin = admin_pin_path(&key)?;
             let public = PublicDevice::read(&device)?;
             let device_id = public.device_id.clone();
             let roles = DeviceRoles::from(role);
@@ -240,7 +240,7 @@ fn main() -> Result<()> {
             key,
             device_id,
         } => {
-            let pin = admin_pin_path(&key);
+            let pin = admin_pin_path(&key)?;
             let (manifest, policy) = match (storage, remote) {
                 (Some(storage), None) => {
                     EncryptedRepository::new(FilesystemStorage::new(storage), KeyFile::read(&key)?)
@@ -284,7 +284,6 @@ fn main() -> Result<()> {
             remote,
             key,
             repo,
-            remote_name,
             publish,
             base,
             discard_newer,
@@ -298,13 +297,12 @@ fn main() -> Result<()> {
                 accept_stale_floor,
             };
             let report = match (storage, remote) {
-                (Some(storage), None) => EncryptedRepository::new(
-                    FilesystemStorage::new(storage),
-                    key,
-                )
-                .recover(&repo, &remote_name, options)?,
+                (Some(storage), None) => {
+                    EncryptedRepository::new(FilesystemStorage::new(storage), key)
+                        .recover(&repo, options)?
+                }
                 (None, Some(remote)) => EncryptedRepository::new(GitStorage::open(&remote)?, key)
-                    .recover(&repo, &remote_name, options)?,
+                    .recover(&repo, options)?,
                 _ => unreachable!("clap requires exactly one backend"),
             };
             print_recovery_report(&report);
@@ -388,10 +386,8 @@ fn role_name(roles: &DeviceRoles) -> &'static str {
     }
 }
 
-fn admin_pin_path(key: &std::path::Path) -> PathBuf {
-    let mut value = key.as_os_str().to_owned();
-    value.push(".admin-state.json");
-    PathBuf::from(value)
+fn admin_pin_path(key: &std::path::Path) -> Result<PathBuf> {
+    admin_state_path(&KeyFile::read(key)?.repository_root)
 }
 
 fn open_repository(
@@ -425,12 +421,10 @@ mod tests {
         match cli.command {
             Command::Recover {
                 publish,
-                remote_name,
                 accept_stale_floor,
                 ..
             } => {
                 assert!(!publish);
-                assert_eq!(remote_name, "origin");
                 assert!(!accept_stale_floor);
             }
             _ => panic!("parsed a different command"),

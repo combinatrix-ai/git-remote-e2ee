@@ -211,6 +211,15 @@ fn add_helper_to_path(command: &mut Command) {
     command.env("PATH", env::join_paths(paths).unwrap());
 }
 
+fn state_dir(repo: &Path) -> std::path::PathBuf {
+    let entries: Vec<_> = fs::read_dir(repo.join(".git/git-remote-e2ee"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    entries.into_iter().next().unwrap()
+}
+
 #[test]
 fn carrier_git_supports_native_push_and_clone_without_plaintext() {
     let temporary = tempfile::tempdir().unwrap();
@@ -909,7 +918,7 @@ fn carrier_recovery_chooses_legitimate_descendant_and_restores_deleted_ciphertex
     let pack_id = floor_manifest.new_packs[0].id.clone();
     repository.fetch_into(&returning, "private").unwrap();
     let floor_generation: u64 = serde_json::from_slice::<serde_json::Value>(
-        &fs::read(returning.join(".git/git-remote-e2ee/private/state.json")).unwrap(),
+        &fs::read(state_dir(&returning).join("state.json")).unwrap(),
     )
     .unwrap()["generation"]
         .as_u64()
@@ -971,7 +980,6 @@ fn carrier_recovery_chooses_legitimate_descendant_and_restores_deleted_ciphertex
     let report = recoverer
         .recover(
             &returning,
-            "private",
             RecoveryOptions {
                 publish: false,
                 base: None,
@@ -993,7 +1001,6 @@ fn carrier_recovery_chooses_legitimate_descendant_and_restores_deleted_ciphertex
     let older_base = recoverer
         .recover(
             &returning,
-            "private",
             RecoveryOptions {
                 publish: true,
                 base: Some(&floor_id),
@@ -1013,7 +1020,6 @@ fn carrier_recovery_chooses_legitimate_descendant_and_restores_deleted_ciphertex
     let recovered = recoverer
         .recover(
             &returning,
-            "private",
             RecoveryOptions {
                 publish: true,
                 base: None,
@@ -1160,7 +1166,6 @@ fn carrier_recovery_offers_hidden_legitimate_content_descendant() {
     let report = recoverer
         .recover(
             &returning,
-            "private",
             RecoveryOptions {
                 publish: false,
                 base: None,
@@ -1179,7 +1184,6 @@ fn carrier_recovery_offers_hidden_legitimate_content_descendant() {
     let stale_choice = recoverer
         .recover(
             &returning,
-            "private",
             RecoveryOptions {
                 publish: true,
                 base: Some(&floor_id),
@@ -1199,7 +1203,6 @@ fn carrier_recovery_offers_hidden_legitimate_content_descendant() {
     let recovered = recoverer
         .recover(
             &returning,
-            "private",
             RecoveryOptions {
                 publish: true,
                 base: None,
@@ -1338,7 +1341,6 @@ fn carrier_recovery_refuses_history_with_a_merge_hiding_a_legitimate_state() {
     let error = recoverer
         .recover(
             &returning,
-            "private",
             RecoveryOptions {
                 publish: true,
                 base: None,
@@ -1434,7 +1436,6 @@ fn carrier_recovery_refuses_conflicting_authenticated_descendants() {
     let report = EncryptedRepository::new(recovery_storage, owner)
         .recover(
             &returning,
-            "private",
             RecoveryOptions {
                 publish: true,
                 base: None,
@@ -1527,7 +1528,6 @@ fn carrier_recovery_loses_cas_without_retrying_when_another_writer_publishes() {
     let offered = stale_recoverer
         .recover(
             &returning,
-            "private",
             RecoveryOptions {
                 publish: false,
                 base: None,
@@ -1554,7 +1554,6 @@ fn carrier_recovery_loses_cas_without_retrying_when_another_writer_publishes() {
     let error = stale_recoverer
         .recover(
             &returning,
-            "private",
             RecoveryOptions {
                 publish: true,
                 base: None,

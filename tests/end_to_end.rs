@@ -121,12 +121,18 @@ fn commit(repo: &Path, contents: &str, message: &str) -> String {
     git(repo, &["rev-parse", "HEAD"])
 }
 
-fn client_state(repo: &Path, remote_name: &str) -> serde_json::Value {
-    let path = repo
-        .join(".git/git-remote-e2ee")
-        .join(remote_name)
-        .join("state.json");
+fn client_state(repo: &Path) -> serde_json::Value {
+    let path = state_dir(repo).join("state.json");
     serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+}
+
+fn state_dir(repo: &Path) -> std::path::PathBuf {
+    let entries: Vec<_> = fs::read_dir(repo.join(".git/git-remote-e2ee"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    entries.into_iter().next().unwrap()
 }
 
 fn copy_tree(source: &Path, destination: &Path) {
@@ -260,11 +266,8 @@ fn missing_pack_observation_does_not_advance_the_floor() {
         )
         .unwrap();
     repository.fetch_into(&destination, "encrypted").unwrap();
-    assert_eq!(client_state(&destination, "encrypted")["generation"], 1);
-    assert_eq!(
-        client_state(&destination, "encrypted")["imported_generation"],
-        1
-    );
+    assert_eq!(client_state(&destination)["generation"], 1);
+    assert_eq!(client_state(&destination)["imported_generation"], 1);
 
     commit(&source, "second\n", "second");
     repository
@@ -285,22 +288,20 @@ fn missing_pack_observation_does_not_advance_the_floor() {
     let saved_pack = fs::read(&pack_path).unwrap();
     fs::remove_file(&pack_path).unwrap();
 
-    let listed = repository
-        .observe_manifest(&destination, "encrypted")
-        .unwrap();
+    let listed = repository.observe_manifest(&destination).unwrap();
     assert_eq!(listed.generation, 2);
-    assert_eq!(client_state(&destination, "encrypted")["generation"], 1);
+    assert_eq!(client_state(&destination)["generation"], 1);
     let error = repository
         .fetch_into(&destination, "encrypted")
         .unwrap_err()
         .to_string();
     assert!(error.contains(&pack_id), "unexpected error: {error}");
-    assert_eq!(client_state(&destination, "encrypted")["generation"], 1);
+    assert_eq!(client_state(&destination)["generation"], 1);
 
     write_stored_object(&remote_path, "objects", &pack_id, &saved_pack);
     let fetched = repository.fetch_into(&destination, "encrypted").unwrap();
     assert_eq!(fetched.generation, 2);
-    let state = client_state(&destination, "encrypted");
+    let state = client_state(&destination);
     assert_eq!(state["generation"], 2);
     assert_eq!(state["imported_generation"], 2);
 }
@@ -326,7 +327,7 @@ fn successful_own_publication_advances_the_client_floor() {
         )
         .unwrap();
 
-    let state_path = source.join(".git/git-remote-e2ee/encrypted/state.json");
+    let state_path = state_dir(&source).join("state.json");
     let state: serde_json::Value = serde_json::from_slice(&fs::read(state_path).unwrap()).unwrap();
     assert_eq!(state["head_id"], head);
     assert_eq!(state["generation"], 1);
@@ -442,8 +443,8 @@ fn returning_client_rejects_signed_ref_advance_without_its_pack() {
         error.contains("does not resolve") || error.contains("missing Git objects"),
         "unexpected connectivity error: {error}"
     );
-    assert_eq!(client_state(&destination, "e2ee")["generation"], 1);
-    assert_eq!(client_state(&destination, "e2ee")["imported_generation"], 1);
+    assert_eq!(client_state(&destination)["generation"], 1);
+    assert_eq!(client_state(&destination)["imported_generation"], 1);
 }
 
 #[test]
@@ -464,7 +465,7 @@ fn missing_verified_frontier_tip_fails_closed() {
         .unwrap();
     repository.fetch_into(&destination, "e2ee").unwrap();
 
-    let state_path = destination.join(".git/git-remote-e2ee/e2ee/state.json");
+    let state_path = state_dir(&destination).join("state.json");
     let mut state: serde_json::Value =
         serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
     state["verified_refs"]["refs/heads/main"] = serde_json::Value::String("1".repeat(40));
@@ -531,11 +532,11 @@ fn local_publication_advances_verified_frontier_before_observation() {
         )
         .unwrap();
     assert_eq!(
-        client_state(&source, "origin")["verified_refs"]["refs/heads/main"],
+        client_state(&source)["verified_refs"]["refs/heads/main"],
         first
     );
 
-    let observed = repository.observe_manifest(&source, "origin").unwrap();
+    let observed = repository.observe_manifest(&source).unwrap();
     assert_eq!(observed.refs.get("refs/heads/main"), Some(&first));
 
     let second = commit(&source, "second\n", "second");
@@ -549,7 +550,7 @@ fn local_publication_advances_verified_frontier_before_observation() {
         )
         .unwrap();
     assert_eq!(
-        client_state(&source, "origin")["verified_refs"]["refs/heads/main"],
+        client_state(&source)["verified_refs"]["refs/heads/main"],
         second
     );
 }
@@ -689,11 +690,7 @@ fn late_stream_authentication_failure_does_not_advance_refs_or_pins() {
     fs::write(path, bytes).unwrap();
 
     assert!(encrypted.fetch_into(&destination, "encrypted").is_err());
-    assert!(
-        !destination
-            .join(".git/git-remote-e2ee/encrypted/state.json")
-            .exists()
-    );
+    assert!(!state_dir(&destination).join("state.json").exists());
     let output = Command::new("git")
         .arg("-C")
         .arg(&destination)
@@ -791,7 +788,7 @@ fn recover_replaces_reader_signed_junk_from_the_directory_floor() {
     repository.fetch_into(&returning, "encrypted").unwrap();
     let (floor_id, floor_manifest) = repository.current_manifest().unwrap();
     let floor_generation = floor_manifest.generation;
-    let floor_state = client_state(&returning, "encrypted");
+    let floor_state = client_state(&returning);
     assert_eq!(floor_state["head_id"], floor_id);
 
     let encrypted = storage.get_object(ObjectKind::Manifest, &floor_id).unwrap();
@@ -844,7 +841,6 @@ fn recover_replaces_reader_signed_junk_from_the_directory_floor() {
     let blocked = recoverer
         .recover(
             &returning,
-            "encrypted",
             RecoveryOptions {
                 publish: true,
                 base: None,
@@ -869,12 +865,11 @@ fn recover_replaces_reader_signed_junk_from_the_directory_floor() {
             .unwrap()
             .contains("--accept-stale-floor")
     );
-    assert_eq!(client_state(&returning, "encrypted")["head_id"], floor_id);
+    assert_eq!(client_state(&returning)["head_id"], floor_id);
 
     let recovered = recoverer
         .recover(
             &returning,
-            "encrypted",
             RecoveryOptions {
                 publish: true,
                 base: None,
@@ -889,9 +884,8 @@ fn recover_replaces_reader_signed_junk_from_the_directory_floor() {
     assert_eq!(current.previous.as_deref(), Some(floor_id.as_str()));
     assert_eq!(current.generation, floor_generation + 1);
     assert_ne!(current_id, junk_id);
-    assert_eq!(client_state(&returning, "encrypted")["head_id"], current_id);
-    let rejected =
-        fs::read(returning.join(".git/git-remote-e2ee/encrypted/rejected-heads.json")).unwrap();
+    assert_eq!(client_state(&returning)["head_id"], current_id);
+    let rejected = fs::read(state_dir(&returning).join("rejected-heads.json")).unwrap();
     assert!(String::from_utf8_lossy(&rejected).contains(&junk_id));
 
     recoverer.fetch_into(&returning, "encrypted").unwrap();
@@ -900,8 +894,8 @@ fn recover_replaces_reader_signed_junk_from_the_directory_floor() {
         git(&fresh, &["show", "refs/remotes/encrypted/main:note.md"]),
         "recovery keeps this content"
     );
-    assert_eq!(client_state(&returning, "encrypted")["head_id"], current_id);
-    assert_eq!(client_state(&fresh, "encrypted")["head_id"], current_id);
+    assert_eq!(client_state(&returning)["head_id"], current_id);
+    assert_eq!(client_state(&fresh)["head_id"], current_id);
 }
 
 #[test]
@@ -927,7 +921,7 @@ fn recover_refuses_a_revoked_devices_unverifiable_head() {
     owner_repository
         .fetch_into(&reader_repo, "encrypted")
         .unwrap();
-    let old_floor = client_state(&reader_repo, "encrypted")["head_id"]
+    let old_floor = client_state(&reader_repo)["head_id"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -940,7 +934,6 @@ fn recover_refuses_a_revoked_devices_unverifiable_head() {
     let report = reader_repository
         .recover(
             &reader_repo,
-            "encrypted",
             RecoveryOptions {
                 publish: true,
                 base: None,
@@ -955,15 +948,8 @@ fn recover_refuses_a_revoked_devices_unverifiable_head() {
         storage.read_head().unwrap().as_deref(),
         Some(revoked_head.as_str())
     );
-    assert_eq!(
-        client_state(&reader_repo, "encrypted")["head_id"],
-        old_floor
-    );
-    assert!(
-        !reader_repo
-            .join(".git/git-remote-e2ee/encrypted/rejected-heads.json")
-            .exists()
-    );
+    assert_eq!(client_state(&reader_repo)["head_id"], old_floor);
+    assert!(!state_dir(&reader_repo).join("rejected-heads.json").exists());
 }
 
 #[test]
@@ -1008,7 +994,6 @@ fn recover_refuses_unknown_formats_and_missing_floor_objects() {
     let unsupported = EncryptedRepository::new(unknown_storage.clone(), key)
         .recover(
             &unknown_repo,
-            "encrypted",
             RecoveryOptions {
                 publish: true,
                 base: None,
@@ -1052,7 +1037,6 @@ fn recover_refuses_unknown_formats_and_missing_floor_objects() {
     let unavailable = missing_repository
         .recover(
             &missing_repo,
-            "encrypted",
             RecoveryOptions {
                 publish: false,
                 base: None,
@@ -1073,7 +1057,6 @@ fn recover_refuses_unknown_formats_and_missing_floor_objects() {
     let refused = EncryptedRepository::new(missing_storage.clone(), missing_key)
         .recover(
             &missing_repo,
-            "encrypted",
             RecoveryOptions {
                 publish: true,
                 base: None,
@@ -1094,10 +1077,7 @@ fn recover_refuses_unknown_formats_and_missing_floor_objects() {
         missing_storage.read_head().unwrap().as_deref(),
         Some(invalid_id.as_str())
     );
-    assert_eq!(
-        client_state(&missing_repo, "encrypted")["head_id"],
-        floor_id
-    );
+    assert_eq!(client_state(&missing_repo)["head_id"], floor_id);
 }
 
 #[test]
@@ -1128,7 +1108,6 @@ fn recover_never_overrides_authenticated_rollback() {
     let report = repository
         .recover(
             &returning,
-            "encrypted",
             RecoveryOptions {
                 publish: true,
                 base: None,
@@ -1175,7 +1154,6 @@ fn recovery_discovery_budget_exhaustion_fails_closed() {
     let error = recovery
         .recover(
             &repo,
-            "encrypted",
             RecoveryOptions {
                 publish: false,
                 base: None,
@@ -1189,7 +1167,7 @@ fn recovery_discovery_budget_exhaustion_fails_closed() {
         inner.read_head().unwrap().as_deref(),
         Some(invalid_id.as_str())
     );
-    assert_eq!(client_state(&repo, "encrypted")["head_id"], floor);
+    assert_eq!(client_state(&repo)["head_id"], floor);
 }
 
 #[test]
@@ -1336,6 +1314,7 @@ fn rejects_unsupported_ref_namespaces_consistently() {
 fn git_e2ee(workdir: &Path, args: &[impl AsRef<std::ffi::OsStr>]) -> std::process::Output {
     let output = Command::new(env!("CARGO_BIN_EXE_git-e2ee"))
         .current_dir(workdir)
+        .env("XDG_STATE_HOME", workdir.join("state"))
         .args(args)
         .output()
         .unwrap();
