@@ -248,12 +248,8 @@ fn carrier_git_supports_native_push_and_clone_without_plaintext() {
     );
     git(&source, &["push", "private", "main"], true);
     assert_eq!(
-        git(
-            &carrier,
-            &["show", "refs/heads/git-remote-e2ee:.gitattributes"],
-            false,
-        ),
-        "e2ee/** -delta"
+        git(&carrier, &["show", "refs/heads/main:.gitattributes"], false,),
+        "* -delta"
     );
 
     let mut clone_command = Command::new("git");
@@ -290,12 +286,7 @@ fn carrier_git_supports_native_push_and_clone_without_plaintext() {
 
     let grep = Command::new("git")
         .arg(format!("--git-dir={}", carrier.display()))
-        .args([
-            "grep",
-            "-n",
-            "carrier secret marker",
-            "refs/heads/git-remote-e2ee",
-        ])
+        .args(["grep", "-n", "carrier secret marker", "refs/heads/main"])
         .output()
         .unwrap();
     assert_eq!(grep.status.code(), Some(1));
@@ -457,7 +448,7 @@ fn carrier_git_allows_exactly_one_concurrent_writer() {
                 &format!("--git-dir={}", carrier.display()),
                 "rev-list",
                 "--count",
-                "refs/heads/git-remote-e2ee",
+                "refs/heads/main",
             ],
             false,
         ),
@@ -546,7 +537,7 @@ fn stale_carrier_cache_is_refreshed_before_compare_and_swap() {
         &[
             &format!("--git-dir={}", carrier.display()),
             "show",
-            "refs/heads/git-remote-e2ee:e2ee/HEAD",
+            "refs/heads/main:HEAD",
         ],
         false,
     );
@@ -702,7 +693,7 @@ fn carrier_git_process_race_has_exactly_one_winner() {
                 &format!("--git-dir={}", carrier.display()),
                 "rev-list",
                 "--count",
-                "refs/heads/git-remote-e2ee",
+                "refs/heads/main",
             ],
             false,
         ),
@@ -756,7 +747,7 @@ fn native_fetch_rejects_outer_carrier_rollback() {
         &[
             &format!("--git-dir={}", carrier.display()),
             "rev-parse",
-            "refs/heads/git-remote-e2ee",
+            "refs/heads/main",
         ],
         false,
     );
@@ -791,7 +782,7 @@ fn native_fetch_rejects_outer_carrier_rollback() {
         &[
             &format!("--git-dir={}", carrier.display()),
             "update-ref",
-            "refs/heads/git-remote-e2ee",
+            "refs/heads/main",
             &generation_zero,
         ],
         false,
@@ -828,7 +819,7 @@ fn carrier_git_detects_tampered_ciphertext_chunk() {
             "clone",
             "-q",
             "-b",
-            "git-remote-e2ee",
+            "main",
             carrier.to_str().unwrap(),
             attacker.to_str().unwrap(),
         ],
@@ -840,18 +831,14 @@ fn carrier_git_detects_tampered_ciphertext_chunk() {
         &["config", "user.email", "attacker@example.invalid"],
         false,
     );
-    let chunks = git(&attacker, &["ls-files", "e2ee/objects/*/*/*"], false);
+    let chunks = git(&attacker, &["ls-files", "packs/*/*/*"], false);
     let chunk = chunks.lines().next().expect("encrypted pack chunk");
     let mut bytes = fs::read(attacker.join(chunk)).unwrap();
     bytes[0] ^= 0x80;
     fs::write(attacker.join(chunk), bytes).unwrap();
     git(&attacker, &["add", chunk], false);
     git(&attacker, &["commit", "-q", "-m", "tamper chunk"], false);
-    git(
-        &attacker,
-        &["push", "-q", "origin", "git-remote-e2ee"],
-        false,
-    );
+    git(&attacker, &["push", "-q", "origin", "main"], false);
 
     let fresh = EncryptedRepository::new(GitStorage::open(carrier.to_str().unwrap()).unwrap(), key);
     let error = fresh.verify().unwrap_err();
@@ -937,7 +924,7 @@ fn carrier_recovery_chooses_legitimate_descendant_and_restores_deleted_ciphertex
             "clone",
             "-q",
             "-b",
-            "git-remote-e2ee",
+            "main",
             carrier.to_str().unwrap(),
             attacker.to_str().unwrap(),
         ],
@@ -949,25 +936,15 @@ fn carrier_recovery_chooses_legitimate_descendant_and_restores_deleted_ciphertex
         &["config", "user.email", "carrier-editor@example.invalid"],
         false,
     );
-    fs::remove_dir_all(
-        attacker
-            .join("e2ee/objects")
-            .join(&pack_id[..2])
-            .join(&pack_id),
-    )
-    .unwrap();
-    fs::write(attacker.join("e2ee/HEAD"), format!("{floor_id}\n")).unwrap();
-    git(&attacker, &["add", "-A", "e2ee"], false);
+    fs::remove_dir_all(attacker.join("packs").join(&pack_id[..2]).join(&pack_id)).unwrap();
+    fs::write(attacker.join("HEAD"), format!("{floor_id}\n")).unwrap();
+    git(&attacker, &["add", "-A", "."], false);
     git(
         &attacker,
         &["commit", "-q", "-m", "replay floor and delete pack"],
         false,
     );
-    git(
-        &attacker,
-        &["push", "-q", "origin", "git-remote-e2ee"],
-        false,
-    );
+    git(&attacker, &["push", "-q", "origin", "main"], false);
 
     let replay_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
     let junk_id = create_reader_signed_junk(&replay_storage, &reader, &floor_policy, &floor_id);
@@ -1059,7 +1036,7 @@ fn carrier_recovery_chooses_legitimate_descendant_and_restores_deleted_ciphertex
     );
     let carrier_head = Command::new("git")
         .arg(format!("--git-dir={}", carrier.display()))
-        .args(["show", "refs/heads/git-remote-e2ee:e2ee/HEAD"])
+        .args(["show", "refs/heads/main:HEAD"])
         .output()
         .unwrap();
     assert!(carrier_head.status.success());
@@ -1134,7 +1111,7 @@ fn carrier_recovery_offers_hidden_legitimate_content_descendant() {
             "clone",
             "-q",
             "-b",
-            "git-remote-e2ee",
+            "main",
             carrier.to_str().unwrap(),
             attacker.to_str().unwrap(),
         ],
@@ -1146,14 +1123,10 @@ fn carrier_recovery_offers_hidden_legitimate_content_descendant() {
         &["config", "user.email", "carrier-editor@example.invalid"],
         false,
     );
-    fs::write(attacker.join("e2ee/HEAD"), format!("{floor_id}\n")).unwrap();
-    git(&attacker, &["add", "-A", "e2ee"], false);
+    fs::write(attacker.join("HEAD"), format!("{floor_id}\n")).unwrap();
+    git(&attacker, &["add", "-A", "."], false);
     git(&attacker, &["commit", "-q", "-m", "replay floor"], false);
-    git(
-        &attacker,
-        &["push", "-q", "origin", "git-remote-e2ee"],
-        false,
-    );
+    git(&attacker, &["push", "-q", "origin", "main"], false);
 
     let replay_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
     let junk_id = create_reader_signed_junk(&replay_storage, &reader, &floor_policy, &floor_id);
@@ -1288,7 +1261,7 @@ fn carrier_recovery_refuses_history_with_a_merge_hiding_a_legitimate_state() {
             "clone",
             "-q",
             "-b",
-            "git-remote-e2ee",
+            "main",
             carrier.to_str().unwrap(),
             attacker.to_str().unwrap(),
         ],
@@ -1312,23 +1285,10 @@ fn carrier_recovery_refuses_history_with_a_merge_hiding_a_legitimate_state() {
     );
     git(
         &attacker,
-        &[
-            "merge",
-            "-q",
-            "--no-ff",
-            "-s",
-            "ours",
-            "-m",
-            "hide",
-            "git-remote-e2ee",
-        ],
+        &["merge", "-q", "--no-ff", "-s", "ours", "-m", "hide", "main"],
         false,
     );
-    git(
-        &attacker,
-        &["push", "-q", "origin", "side:git-remote-e2ee"],
-        false,
-    );
+    git(&attacker, &["push", "-q", "origin", "side:main"], false);
 
     let junk_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
     let junk_id = create_reader_signed_junk(&junk_storage, &reader, &floor_policy, &floor_id);
@@ -1568,8 +1528,223 @@ fn carrier_recovery_loses_cas_without_retrying_when_another_writer_publishes() {
     assert_eq!(latest.current_manifest().unwrap().0, winner);
 }
 
+fn carrier_refs(carrier: &Path) -> String {
+    git(
+        carrier,
+        &["for-each-ref", "--format=%(refname) %(objectname)"],
+        false,
+    )
+}
+
+fn helper_command(cwd: &Path, home: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .current_dir(cwd)
+        .env("XDG_STATE_HOME", home.join("state"))
+        .env("XDG_CONFIG_HOME", home.join("config"));
+    add_helper_to_path(&mut command);
+    command
+}
+
+fn assert_success(output: Output, action: &str) {
+    assert!(
+        output.status.success(),
+        "{action}: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn push_through_helper(source: &Path, url: &str, key_path: &Path, home: &Path) {
+    git(source, &["remote", "add", "private", url], false);
+    git(
+        source,
+        &[
+            "config",
+            "remote.private.e2ee-key",
+            key_path.to_str().unwrap(),
+        ],
+        false,
+    );
+    assert_success(
+        helper_command(source, home)
+            .args(["push", "-q", "private", "main"])
+            .output()
+            .unwrap(),
+        "push through helper",
+    );
+}
+
+/// Commits a plain edit to a carrier branch, as a storage-level writer could.
+fn edit_carrier(carrier: &Path, workdir: &Path, edit: impl FnOnce(&Path)) {
+    if workdir.exists() {
+        fs::remove_dir_all(workdir).unwrap();
+    }
+    git(
+        carrier.parent().unwrap(),
+        &[
+            "clone",
+            "-q",
+            "-b",
+            "main",
+            carrier.to_str().unwrap(),
+            workdir.to_str().unwrap(),
+        ],
+        false,
+    );
+    git(workdir, &["config", "user.name", "Carrier editor"], false);
+    git(
+        workdir,
+        &["config", "user.email", "carrier-editor@example.invalid"],
+        false,
+    );
+    edit(workdir);
+    git(workdir, &["add", "-A", "."], false);
+    git(workdir, &["commit", "-q", "-m", "edit carrier"], false);
+    git(workdir, &["push", "-q", "origin", "main"], false);
+}
+
 #[test]
-fn carrier_branch_coexists_with_unrelated_repository_history() {
+fn carrier_root_holds_exactly_the_v6_layout() {
+    let temporary = tempfile::tempdir().unwrap();
+    let _cache = isolated_cache(&temporary);
+    let carrier = temporary.path().join("carrier.git");
+    let source = temporary.path().join("source");
+    let key_path = temporary.path().join("repository.key.json");
+    init_source(&source, "layout marker");
+    let key = KeyFile::generate();
+    key.write_new(&key_path).unwrap();
+    init_carrier(temporary.path(), &carrier, &key);
+    let url = format!("e2ee::{}", carrier.display());
+    push_through_helper(&source, &url, &key_path, temporary.path());
+
+    let entries = git(
+        &carrier,
+        &["ls-tree", "--name-only", "refs/heads/main"],
+        false,
+    );
+    assert_eq!(
+        entries.lines().collect::<Vec<_>>(),
+        [
+            ".gitattributes",
+            "FORMAT",
+            "HEAD",
+            "README.md",
+            "manifests",
+            "packs"
+        ]
+    );
+    let blob = |name: &str| {
+        git_output(
+            &carrier,
+            &["cat-file", "blob", &format!("refs/heads/main:{name}")],
+            false,
+        )
+        .stdout
+    };
+    assert_eq!(blob("FORMAT"), b"git-remote-e2ee storage 6\n");
+    assert_eq!(blob(".gitattributes"), b"* -delta\n");
+    let readme = String::from_utf8(blob("README.md")).unwrap();
+    assert!(readme.starts_with("# Encrypted Git repository\n\nThis branch holds"));
+    assert!(readme.contains("git -c e2ee.key=<your device key> clone e2ee::"));
+    assert!(
+        !git(
+            &carrier,
+            &["ls-tree", "--name-only", "refs/heads/main", "packs/"],
+            false
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn carrier_format_mismatch_names_the_found_format() {
+    let temporary = tempfile::tempdir().unwrap();
+    let _cache = isolated_cache(&temporary);
+    let carrier = temporary.path().join("carrier.git");
+    let workdir = temporary.path().join("carrier-edit");
+    let key = KeyFile::generate();
+    init_carrier(temporary.path(), &carrier, &key);
+    let read_error = || {
+        let repository = EncryptedRepository::new(
+            GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+            key.clone(),
+        );
+        format!("{:#}", repository.current_manifest().unwrap_err())
+    };
+
+    edit_carrier(&carrier, &workdir, |root| {
+        fs::write(root.join("FORMAT"), "git-remote-e2ee storage 7\n").unwrap();
+    });
+    let error = read_error();
+    assert!(
+        error.contains(&format!(
+            "storage at {} uses format 7; this git-remote-e2ee reads format 6",
+            carrier.display()
+        )),
+        "{error}"
+    );
+
+    edit_carrier(&carrier, &workdir, |root| {
+        fs::remove_file(root.join("FORMAT")).unwrap();
+    });
+    let error = read_error();
+    assert!(
+        error.contains("uses format 5 or earlier; this git-remote-e2ee reads format 6"),
+        "{error}"
+    );
+}
+
+#[test]
+fn carrier_branch_fragment_selects_the_branch_through_the_helper() {
+    let temporary = tempfile::tempdir().unwrap();
+    let _cache = isolated_cache(&temporary);
+    let carrier = temporary.path().join("carrier.git");
+    let source = temporary.path().join("source");
+    let clone = temporary.path().join("clone");
+    let key_path = temporary.path().join("repository.key.json");
+    let source_head = init_source(&source, "vault branch marker");
+    let key = KeyFile::generate();
+    key.write_new(&key_path).unwrap();
+    git(
+        temporary.path(),
+        &["init", "--bare", "-q", carrier.to_str().unwrap()],
+        false,
+    );
+    let location = format!("{}#vault", carrier.display());
+    EncryptedRepository::new(GitStorage::open(&location).unwrap(), key.clone())
+        .initialize()
+        .unwrap();
+
+    let url = format!("e2ee::{location}");
+    push_through_helper(&source, &url, &key_path, temporary.path());
+    assert_success(
+        helper_command(temporary.path(), temporary.path())
+            .args([
+                "-c",
+                &format!("e2ee.key={}", key_path.display()),
+                "clone",
+                "-q",
+                &url,
+            ])
+            .arg(&clone)
+            .output()
+            .unwrap(),
+        "clone through helper",
+    );
+    assert_eq!(git(&clone, &["rev-parse", "HEAD"], false), source_head);
+    assert_eq!(git(&clone, &["config", "remote.origin.url"], false), url);
+
+    let refs = carrier_refs(&carrier);
+    let names: Vec<_> = refs
+        .lines()
+        .map(|line| line.split_once(' ').unwrap().0)
+        .collect();
+    assert_eq!(names, ["refs/heads/vault"]);
+}
+
+#[test]
+fn carrier_init_refuses_an_existing_branch_and_another_branch_works() {
     let temporary = tempfile::tempdir().unwrap();
     let _cache = isolated_cache(&temporary);
     let carrier = temporary.path().join("carrier.git");
@@ -1587,10 +1762,31 @@ fn carrier_branch_coexists_with_unrelated_repository_history() {
     );
     git(&ordinary, &["push", "-q", "-u", "origin", "main"], false);
     let main_before = git(&ordinary, &["rev-parse", "HEAD"], false);
+    let refs_before = carrier_refs(&carrier);
 
     let key = KeyFile::generate();
-    let encrypted =
-        EncryptedRepository::new(GitStorage::open(carrier.to_str().unwrap()).unwrap(), key);
+    let refused = EncryptedRepository::new(
+        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        key.clone(),
+    )
+    .initialize()
+    .unwrap_err();
+    assert!(
+        format!("{refused:#}").contains(&format!(
+            "branch main of {remote} already exists; use an empty repository or choose another branch with e2ee::{remote}#<branch>",
+            remote = carrier.display()
+        )),
+        "{refused:#}"
+    );
+    assert_eq!(carrier_refs(&carrier), refs_before);
+
+    let location = format!("{}#vault", carrier.display());
+    let encrypted = EncryptedRepository::new(GitStorage::open(&location).unwrap(), key);
+    let caches = fs::read_dir(temporary.path().join("carrier-cache"))
+        .unwrap()
+        .filter(|entry| entry.as_ref().unwrap().path().is_dir())
+        .count();
+    assert_eq!(caches, 2, "each branch of one remote has its own cache");
     encrypted.initialize().unwrap();
     assert!(
         encrypted
@@ -1599,29 +1795,9 @@ fn carrier_branch_coexists_with_unrelated_repository_history() {
             .to_string()
             .contains("already initialized")
     );
-
     assert_eq!(
-        git(
-            temporary.path(),
-            &[
-                &format!("--git-dir={}", carrier.display()),
-                "rev-parse",
-                "refs/heads/main",
-            ],
-            false,
-        ),
+        git(&carrier, &["rev-parse", "refs/heads/main"], false),
         main_before
     );
-    assert!(
-        !git(
-            temporary.path(),
-            &[
-                &format!("--git-dir={}", carrier.display()),
-                "rev-parse",
-                "refs/heads/git-remote-e2ee",
-            ],
-            false,
-        )
-        .is_empty()
-    );
+    assert!(!git(&carrier, &["rev-parse", "refs/heads/vault"], false).is_empty());
 }

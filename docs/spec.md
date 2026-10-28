@@ -149,10 +149,21 @@ All objects except `HEAD` are immutable and named by SHA-256 of their exact
 stored bytes:
 
 ```text
-objects/<hash>       encrypted incremental Git packs
+packs/<hash>         encrypted incremental Git packs
 manifests/<hash>     plaintext discovery header plus encrypted sealed header and body
 HEAD                 opaque newest-manifest ID
+FORMAT               "git-remote-e2ee storage 6\n", the storage layout version
+README.md            plaintext notice, written once at initialization
 ```
+
+Both backends use this layout at the storage root (the directory, or the root
+of the carrier branch). `FORMAT` and `README.md` are written in the same step
+that creates the genesis `HEAD`. Every operation that reads storage state
+checks `FORMAT` first: no `HEAD` and no `FORMAT` means uninitialized; a
+`HEAD` without `FORMAT`, or any other `FORMAT` content, fails with
+`storage at <location> uses format <found or "5 or earlier">; this
+git-remote-e2ee reads format 6`. `FORMAT` is unauthenticated and only selects
+that message; authenticity comes from the signed manifests.
 
 Private device keys and decrypted generation keys are never stored remotely or
 in client continuity pins. A policy is included in the encrypted body of the
@@ -500,11 +511,12 @@ ABA change of the compared `HEAD` value.
 
 - Filesystem storage uses locking. `HEAD` is published by rename inside the
   storage root. Immutable objects are hard-linked from `.staging` into
-  `objects/<prefix>/` on the same filesystem and are not replaced. New
+  `packs/<prefix>/` on the same filesystem and are not replaced. New
   directories and the parent of a published name are flushed; a flush error
   fails the operation. Limits are in [durability.md](durability.md).
-- Carrier Git uses a normal fast-forward push of
-  `refs/heads/git-remote-e2ee`; receive-pack ref update is the CAS.
+- Carrier Git uses a normal fast-forward push of the carrier branch
+  (`refs/heads/main`, or the branch named by `#<branch>`); receive-pack ref
+  update is the CAS. Initialization refuses a branch that already exists.
 
 The losing client fetches/decrypts the winner and uses the inner Git DAG to
 decide whether to retry, merge, or rebase. Administrative CAS failures are

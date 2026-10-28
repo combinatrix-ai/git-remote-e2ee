@@ -438,7 +438,7 @@ run_round() {
   done
   git --git-dir="$gcrypt_git" symbolic-ref HEAD refs/heads/gcrypt-carrier
   if [[ $carrier_attr_tree == 1 ]]; then
-    git --git-dir="$carrier_git" config attr.tree refs/heads/git-remote-e2ee
+    git --git-dir="$carrier_git" config attr.tree refs/heads/main
   else
     git --git-dir="$carrier_git" config --unset-all attr.tree 2>/dev/null || true
   fi

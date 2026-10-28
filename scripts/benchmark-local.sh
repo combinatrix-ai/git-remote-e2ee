@@ -140,8 +140,8 @@ run_phase initial_push "$git_e2ee" push \
   --repo "$work/source" --ref "$source_ref"
 storage_after_initial=$(storage_bytes)
 storage_logical_after_initial=$(tree_logical_bytes "$work/storage")
-pack_logical_after_initial=$(tree_logical_bytes "$work/storage/objects")
-initial_pack_files=$(find "$work/storage/objects" -type f | wc -l | tr -d ' ')
+pack_logical_after_initial=$(tree_logical_bytes "$work/storage/packs")
+initial_pack_files=$(find "$work/storage/packs" -type f | wc -l | tr -d ' ')
 
 git init -q "$work/destination"
 run_phase fresh_fetch "$git_e2ee" fetch \
@@ -182,8 +182,8 @@ source_reachable_bytes=$(git -C "$source_repo" rev-list --disk-usage --objects H
   awk '{print $1}')
 final_storage=$(storage_bytes)
 final_storage_logical=$(tree_logical_bytes "$work/storage")
-final_pack_logical=$(tree_logical_bytes "$work/storage/objects")
-final_pack_files=$(find "$work/storage/objects" -type f | wc -l | tr -d ' ')
+final_pack_logical=$(tree_logical_bytes "$work/storage/packs")
+final_pack_files=$(find "$work/storage/packs" -type f | wc -l | tr -d ' ')
 manifest_files=$(find "$work/storage/manifests" -type f | wc -l | tr -d ' ')
 policy_files=$(find "$work/storage/policies" -type f | wc -l | tr -d ' ')
 crate_sha=$(git -C "$project_root" rev-parse HEAD)

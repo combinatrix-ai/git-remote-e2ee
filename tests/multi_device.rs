@@ -120,7 +120,7 @@ fn revoked_reader_cannot_reach_later_history_but_keeps_prior_snapshot() {
     repo_a.push_ref(&source, "refs/heads/main", false).unwrap();
     let before_tip = commit(&source, "second pack\n", "second pack");
     repo_a.push_ref(&source, "refs/heads/main", false).unwrap();
-    assert_eq!(count_files(&remote.join("objects")), 2);
+    assert_eq!(count_files(&remote.join("packs")), 2);
     repo_a
         .add_device(
             key_b.public_device().unwrap(),
@@ -128,7 +128,7 @@ fn revoked_reader_cannot_reach_later_history_but_keeps_prior_snapshot() {
             &admin_pin,
         )
         .unwrap();
-    assert_eq!(count_files(&remote.join("objects")), 2);
+    assert_eq!(count_files(&remote.join("packs")), 2);
     let repo_b = EncryptedRepository::new(FilesystemStorage::new(&remote), key_b.clone());
     repo_b.fetch_into(&client_b, "e2ee").unwrap();
     assert_eq!(
@@ -141,17 +141,17 @@ fn revoked_reader_cannot_reach_later_history_but_keeps_prior_snapshot() {
     );
     let before_revoke = temp.path().join("before-revoke");
     copy_directory(&remote, &before_revoke);
-    let old_objects = snapshot_files(&remote.join("objects"));
+    let old_objects = snapshot_files(&remote.join("packs"));
 
     repo_a
         .revoke_device(&key_b.device_id().unwrap(), &admin_pin)
         .unwrap();
-    assert_eq!(count_files(&remote.join("objects")), 2);
+    assert_eq!(count_files(&remote.join("packs")), 2);
     assert!(repo_b.current_manifest().is_err());
 
     let after = commit(&source, "after revoke secret\n", "after revoke");
     repo_a.push_ref(&source, "refs/heads/main", false).unwrap();
-    assert_eq!(count_files(&remote.join("objects")), 3);
+    assert_eq!(count_files(&remote.join("packs")), 3);
     for (path, contents) in old_objects {
         assert_eq!(fs::read(path).unwrap(), contents);
     }
@@ -216,7 +216,7 @@ fn revoked_reader_cannot_reach_later_history_but_keeps_prior_snapshot() {
             &admin_pin,
         )
         .unwrap();
-    assert_eq!(count_files(&remote.join("objects")), 3);
+    assert_eq!(count_files(&remote.join("packs")), 3);
     let destination = temp.path().join("destination");
     initialize_git(&destination);
     let repo_c = EncryptedRepository::new(FilesystemStorage::new(&remote), key_c);

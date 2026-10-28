@@ -34,7 +34,7 @@ private key of a device that remains active.
 ## Immutable object model
 
 ```text
-objects/<ciphertext hash>      encrypted incremental Git pack
+packs/<ciphertext hash>        encrypted incremental Git pack
 manifests/<object hash>        plaintext discovery header + encrypted sealed header and body
 HEAD                           opaque newest-manifest pointer
 ```
@@ -168,7 +168,7 @@ compare_and_swap_head(expected, next)
 
 The ciphertext digest is computed during the write. `finish(id)` validates the
 digest and publishes the staged object by hard-linking it from `.staging` into
-`objects/<prefix>/`. Those are different directories on the same filesystem.
+`packs/<prefix>/`. Those are different directories on the same filesystem.
 An existing object id is not replaced. Filesystem storage serializes CAS with
 an advisory lock and publishes `HEAD` by renaming a temporary file in the
 storage root. File contents are flushed before the name is published. A
@@ -188,9 +188,12 @@ not guarantee correct compare-and-swap behavior.
 
 ## Carrier Git mapping
 
-The carrier backend maps protocol objects to normal blobs under `e2ee/`, split
-into a dense canonical sequence of 32 MiB chunks, on the dedicated branch
-`refs/heads/git-remote-e2ee`. Each protocol publication creates an outer commit.
+The carrier backend maps protocol objects to normal blobs at the branch root,
+in the same layout as the directory backend, split into a dense canonical
+sequence of 32 MiB chunks, on the carrier branch (`refs/heads/main`, or the
+branch named by a `#<branch>` suffix on the remote). The genesis commit also
+adds `README.md`, `FORMAT`, and `.gitattributes`; initialization refuses a
+branch that already exists, since it can only hold someone else's content. Each protocol publication creates an outer commit.
 A normal fast-forward push is the CAS: two candidates from the same parent
 cannot both win.
 
@@ -202,13 +205,14 @@ that a membership transition occurred. Inner Git metadata remains encrypted.
 Each helper process fetches the carrier branch into a persistent bare object
 cache, then creates a disposable Git directory with an alternate pointing at
 the cache. It seeds a process-local index from the base commit with `git
-read-tree`, without checking out or copying the historical `e2ee/` files.
+read-tree`, without checking out or copying the historical ciphertext files.
 Carrier object reads stream blobs through `git cat-file --batch`; publication
 stages only the new chunk paths and `HEAD` with a NUL-delimited path list, so
 Git does not scan the complete carrier tree. The temporary index keeps
 concurrent helper processes from sharing mutable checkout state.
 
-The cache is keyed by the SHA-256 of a normalized remote URL; a file lock
+The cache is keyed by the SHA-256 of a normalized remote URL and the carrier
+branch; a file lock
 serializes cache updates and publications across helper processes. Automatic
 garbage collection is disabled so borrowed objects remain available. During a
 publication, Git writes new objects and the commit into the locked cache object
@@ -221,13 +225,13 @@ an outdated branch tip.
 Carrier Git repositories touched by the helper set `core.compression=0`,
 `core.looseCompression=0`, `pack.compression=0`, `pack.window=0`,
 `pack.depth=0`, and `core.bigFileThreshold=1m`. The committed root
-`.gitattributes` marks `e2ee/**` as `-delta`. These settings avoid spending CPU
+`.gitattributes` marks `*` as `-delta`. These settings avoid spending CPU
 compressing or deltifying ciphertext, which is already encrypted and
 incompressible. They are performance settings, not integrity assumptions;
 normal object IDs and the signed manifest checks remain in force. A Git server
 must consult that attribute tree for its own `upload-pack` delta search to
 avoid server-side deltification. The benchmark's local bare receiver sets
-`attr.tree=refs/heads/git-remote-e2ee`; hosted servers control this setting and
+`attr.tree=refs/heads/main`; hosted servers control this setting and
 may have different server-side pack behavior.
 
 Recovery publishes a fresh cache generation instead of replacing objects that
@@ -347,7 +351,7 @@ verifies against a device record in the authenticated policy.
    compare-and-swap from the observed storage token, which is the current outer
    tip on the carrier. The verified base and the CAS token are separate values.
    On the carrier the new outer commit is a child of the current tip, so the
-   push is still a fast-forward. Rebuild the `e2ee/` tree from the ciphertext
+   push is still a fast-forward. Rebuild the `manifests/` and `packs/` trees from the ciphertext
    objects the base chain requires, restored byte for byte from the carrier's
    history or the local cache and checked against their content IDs; if any is
    missing, fail as unavailable. A lost CAS fails; the operator must start a
@@ -404,7 +408,7 @@ requirement that a losing recovery fail without retrying blindly.
 
 Before publication, required manifests and packs are restored into the
 disposable carrier checkout, unneeded ciphertext objects are removed from that
-checkout's `e2ee/` tree, and all base-chain packs are imported into a temporary
+checkout's `manifests/` and `packs/` trees, and all base-chain packs are imported into a temporary
 bare Git repository to verify complete ref connectivity. The temporary
 repository is deleted when the command exits; the persistent carrier cache
 continues to contain ciphertext Git objects only.

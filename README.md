@@ -173,8 +173,10 @@ limits. [SECURITY.md](SECURITY.md) explains how to report an issue.
 ## FAQ
 
 **What does the GitHub repository look like?**
-One branch, `git-remote-e2ee`, holding ciphertext under `e2ee/`. It can live
-next to unrelated branches. Do not edit it by hand.
+One branch, `main` (or the one you name with `e2ee::<url>#<branch>`), holding
+a plaintext `README.md`, a `FORMAT` version marker, and ciphertext under
+`manifests/` and `packs/`. Other branches are left alone. Do not edit it by
+hand.
 
 **What if I lose my key?**
 If no remaining device has access, the data is gone. There is no recovery

@@ -59,8 +59,12 @@ is reported as rolled back.
 ## Git host as storage (carrier-Git backend)
 
 Any ordinary Git repository can carry the ciphertext: GitHub, GitLab, or a bare
-repository. It may be empty or contain unrelated branches. `git-remote-e2ee`
-uses its own `git-remote-e2ee` branch.
+repository. `git-remote-e2ee` stores everything on one branch, `main` by
+default. Append `#<branch>` to the URL to use another branch, for example
+`e2ee::https://git.example/user/notes.git#vault`. Initialization refuses a
+branch that already exists, such as the `main` a hosting provider creates
+with an initial README; use an empty repository or pick another branch. Other
+branches of the repository are never touched.
 
 Run `init` inside the repository you want to protect:
 
@@ -80,12 +84,19 @@ outside a Git repository, `init` only creates the key and the storage.
 The carrier holds only this outer structure:
 
 ```text
-refs/heads/git-remote-e2ee
-└── e2ee/
-    ├── HEAD
-    ├── objects/aa/<opaque-id>/00000000
-    ├── manifests/bb/<opaque-id>/00000000
+refs/heads/main
+├── README.md        plaintext notice: encrypted repository, do not edit
+├── FORMAT           "git-remote-e2ee storage 6"
+├── .gitattributes   "* -delta"
+├── HEAD
+├── packs/aa/<opaque-id>/00000000
+└── manifests/bb/<opaque-id>/00000000
 ```
+
+The directory backend uses the same root layout without `.gitattributes`.
+`FORMAT` names the storage layout version so an incompatible client stops with
+a clear message instead of an authentication failure. It is not
+authenticated; integrity still comes from the signed manifests.
 
 Ciphertext is split into 32 MiB chunks so it can be stored as ordinary Git
 blobs. The host can still observe outer commit times, chunk counts and sizes,
@@ -94,9 +105,9 @@ update frequency, and total growth.
 Each helper process fetches the carrier branch into a persistent local bare
 object cache, then uses a disposable checkout that borrows those cached Git
 objects. The cache is shared by helper and `git-e2ee` processes for the same
-normalized remote URL. It is stored at
-`$XDG_CACHE_HOME/git-remote-e2ee/carrier/<sha256-of-normalized-remote>` or, when
-`XDG_CACHE_HOME` is unset, `~/.cache/git-remote-e2ee/carrier/<sha256-of-normalized-remote>`.
+normalized remote URL and carrier branch. It is stored at
+`$XDG_CACHE_HOME/git-remote-e2ee/carrier/<sha256-of-remote-and-branch>` or, when
+`XDG_CACHE_HOME` is unset, `~/.cache/git-remote-e2ee/carrier/<sha256-of-remote-and-branch>`.
 Set `GIT_REMOTE_E2EE_CACHE_DIR` to override the parent directory that contains
 the per-remote cache directories; tests and isolated runs should set it to a
 temporary directory. Fetches are serialized across processes, and each refresh
@@ -273,7 +284,7 @@ compare_and_swap_head(expected, next)
 
 The filesystem backend implements head compare-and-swap with an advisory lock
 and a rename in the storage root. Object publication hard-links a staged file
-from `.staging` into `objects/<prefix>/` on the same filesystem and never
+from `.staging` into `packs/<prefix>/` on the same filesystem and never
 replaces an existing ID. File contents are flushed before a name is published,
 new directories are flushed through the preexisting ancestor, and the parent
 directory is flushed again afterwards; a flush error fails the call. Crash and
