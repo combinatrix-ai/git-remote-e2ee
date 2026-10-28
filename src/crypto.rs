@@ -24,6 +24,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+use crate::error::Unsupported;
 use crate::trace;
 
 const SYMMETRIC_MAGIC: &[u8; 8] = b"E2EES05\0";
@@ -122,7 +123,10 @@ impl KeyFile {
         let bytes = fs::read(path).with_context(|| format!("read key file {}", path.display()))?;
         let key: Self = serde_json::from_slice(&bytes).context("parse key file")?;
         if key.format_version != 3 {
-            bail!("unsupported key file format {}", key.format_version)
+            bail!(Unsupported(format!(
+                "unsupported key file format {}",
+                key.format_version
+            )))
         }
         validate_root(&key.repository_root)?;
         key.signing_key()?;
@@ -562,7 +566,7 @@ pub fn open_pack_stream(
             .expect("fixed chunk size field"),
     ) as usize;
     if chunk_size != PACK_STREAM_CHUNK_SIZE {
-        bail!("unsupported pack stream chunk size")
+        bail!(Unsupported("unsupported pack stream chunk size".to_owned()))
     }
     let segments = plaintext_size.div_ceil(PACK_STREAM_CHUNK_SIZE as u64);
     if segments == 0 || segments >= u32::MAX as u64 {

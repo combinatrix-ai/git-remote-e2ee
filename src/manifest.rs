@@ -11,6 +11,7 @@ use crate::crypto::{
     derive_subkey, dummy_generation_envelope, open_with_key, random_seed, seal_with_key,
     verify_domain, verify_key_commitment, wrap_generation_key_with_seed,
 };
+use crate::error::{ForeignRepository, NotActiveReader, Unsupported};
 use crate::policy::PolicyState;
 
 pub const FORMAT_VERSION: u32 = 5;
@@ -143,7 +144,9 @@ impl Manifest {
                 }
             }
             ManifestAuthorization::Checkpoint => {
-                bail!("checkpoint transitions are reserved but not implemented")
+                bail!(Unsupported(
+                    "checkpoint transitions are reserved but not implemented".to_owned()
+                ))
             }
         }
         Ok(())
@@ -248,7 +251,9 @@ pub fn seal_manifest(
             validate_introduced_policy(&manifest, policy, true)?
         }
         ManifestAuthorization::Checkpoint => {
-            bail!("checkpoint transitions are reserved but not implemented")
+            bail!(Unsupported(
+                "checkpoint transitions are reserved but not implemented".to_owned()
+            ))
         }
     }
     validate_pack_delta(&manifest)?;
@@ -337,7 +342,7 @@ pub fn peek_manifest_header(encrypted: &[u8]) -> Result<ManifestHeader> {
 
 pub fn unwrap_generation_key(header: &ManifestHeader, key: &KeyFile) -> Result<SecretKey> {
     if key.repository_root != header.repository_root {
-        bail!("key file belongs to a different repository")
+        bail!(ForeignRepository)
     }
     validate_public_header(header)?;
     let device_id = key.device_id()?;
@@ -360,9 +365,7 @@ pub fn unwrap_generation_key(header: &ManifestHeader, key: &KeyFile) -> Result<S
             return Ok(generation_key);
         }
     }
-    bail!(
-        "device is not an active reader of the current generation (revoked, never added, or envelope malformed)"
-    )
+    bail!(NotActiveReader)
 }
 
 pub fn open_manifest(encrypted: &[u8], generation_key: &[u8; 32]) -> Result<OpenedManifest> {
@@ -508,7 +511,9 @@ pub fn verify_manifest(
                 .context("policy transition manifest was not signed by a parent administrator")?
         }
         ManifestAuthorization::Checkpoint => {
-            bail!("checkpoint transitions are reserved but not implemented")
+            bail!(Unsupported(
+                "checkpoint transitions are reserved but not implemented".to_owned()
+            ))
         }
     };
     verify_domain(
@@ -764,7 +769,10 @@ fn validate_introduced_policy(
 
 fn validate_public_header(header: &ManifestHeader) -> Result<()> {
     if header.format_version != FORMAT_VERSION {
-        bail!("unsupported manifest format {}", header.format_version)
+        bail!(Unsupported(format!(
+            "unsupported manifest format {}",
+            header.format_version
+        )))
     }
     if header.repository_root.len() != 64
         || !header
