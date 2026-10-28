@@ -1,4 +1,5 @@
 pub mod crypto;
+pub mod error;
 pub mod git;
 pub mod manifest;
 mod persist;

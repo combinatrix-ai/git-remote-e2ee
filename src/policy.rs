@@ -9,6 +9,7 @@ use crate::crypto::{
     KeyFile, PublicDevice, object_id, repository_root_for_device, validate_public_device,
     verify_domain,
 };
+use crate::error::Unsupported;
 
 pub const POLICY_FORMAT_VERSION: u32 = 6;
 const POLICY_SIGNATURE_DOMAIN: &[u8] = b"git-remote-e2ee policy v6\0";
@@ -160,7 +161,10 @@ impl PolicyState {
         let exact_body = BASE64.decode(object.body).context("decode policy body")?;
         let body: PolicyBody = serde_json::from_slice(&exact_body).context("parse policy body")?;
         if body.format_version != POLICY_FORMAT_VERSION {
-            bail!("unsupported policy format {}", body.format_version)
+            bail!(Unsupported(format!(
+                "unsupported policy format {}",
+                body.format_version
+            )))
         }
         validate_devices(&body.devices)?;
         validate_device_roots(&body)?;

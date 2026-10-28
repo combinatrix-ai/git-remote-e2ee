@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::crypto::object_id;
+use crate::error::{BudgetExhausted, ObjectUnavailable};
 use crate::trace;
 
 #[derive(Debug, Error)]
@@ -363,9 +364,14 @@ impl Storage for FilesystemStorage {
 
     fn open_object(&self, kind: ObjectKind, id: &str) -> Result<Box<dyn Read + Send>> {
         let path = self.object_path(kind, id)?;
-        Ok(Box::new(
-            File::open(&path).with_context(|| format!("read {}", path.display()))?,
-        ))
+        let file = File::open(&path)
+            .map_err(|source| ObjectUnavailable {
+                storage: "directory",
+                id: id.to_owned(),
+                source: Some(source),
+            })
+            .with_context(|| format!("read {}", path.display()))?;
+        Ok(Box::new(file))
     }
 
     fn read_head(&self) -> Result<Option<String>> {
@@ -505,7 +511,9 @@ fn read_bounded_head_file(path: &Path) -> Result<Option<Vec<u8>>> {
         Err(error) => return Err(error.into()),
     };
     if file.metadata()?.len() > MAX_STORAGE_HEAD_BYTES {
-        bail!("recovery outer-head byte budget exhausted")
+        bail!(BudgetExhausted(
+            "recovery outer-head byte budget exhausted".to_owned()
+        ))
     }
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
@@ -1051,7 +1059,9 @@ impl GitStorage {
         let size = String::from_utf8(size.stdout)?.trim().parse::<u64>()?;
         if size > max_bytes {
             if name == "HEAD" {
-                bail!("recovery outer-head byte budget exhausted")
+                bail!(BudgetExhausted(
+                    "recovery outer-head byte budget exhausted".to_owned()
+                ))
             }
             bail!("carrier {name} exceeds its size budget")
         }
@@ -1135,7 +1145,9 @@ impl GitStorage {
                 .checked_add(length as u64)
                 .context("historical carrier object size overflow")?;
             if next_length > max_bytes {
-                bail!("carrier recovery manifest byte budget exhausted")
+                bail!(BudgetExhausted(
+                    "carrier recovery manifest byte budget exhausted".to_owned()
+                ))
             }
             bytes.extend_from_slice(&output.stdout);
         }
@@ -1342,12 +1354,17 @@ impl Storage for GitStorage {
                 trace: trace::Io::new("carrier_object_read"),
             }));
         }
+        let unavailable = || ObjectUnavailable {
+            storage: "carrier",
+            id: id.to_owned(),
+            source: None,
+        };
         let Some(commit) = git_rev_parse(self.root(), "HEAD")? else {
-            bail!("carrier object {id} is unavailable")
+            bail!(unavailable())
         };
         let chunks = self
             .chunk_entries_at(&commit, kind, id)?
-            .with_context(|| format!("carrier object {id} is unavailable"))?;
+            .ok_or_else(unavailable)?;
         Ok(Box::new(GitChunkReader::new(self.root(), chunks)?))
     }
 
@@ -1469,7 +1486,9 @@ impl Storage for GitStorage {
     ) -> Result<Option<RecoveryHistory>> {
         let commits = self.commit_history(max_commits)?;
         if commits.len() > max_commits {
-            bail!("carrier recovery outer-commit budget exhausted")
+            bail!(BudgetExhausted(
+                "carrier recovery outer-commit budget exhausted".to_owned()
+            ))
         }
         let mut history = RecoveryHistory::default();
         let mut total_bytes = 0_u64;
@@ -1495,7 +1514,9 @@ impl Storage for GitStorage {
                         .checked_add(bytes.len() as u64)
                         .context("carrier recovery manifest byte count overflow")?;
                     if total_bytes > max_manifest_bytes {
-                        bail!("carrier recovery manifest byte budget exhausted")
+                        bail!(BudgetExhausted(
+                            "carrier recovery manifest byte budget exhausted".to_owned()
+                        ))
                     }
                     history.manifests.insert(id.clone(), bytes);
                 }
@@ -1508,7 +1529,9 @@ impl Storage for GitStorage {
     fn restore_historical_object(&self, kind: ObjectKind, id: &str) -> Result<bool> {
         let commits = self.commit_history(MAX_RECOVERY_OUTER_COMMITS)?;
         if commits.len() > MAX_RECOVERY_OUTER_COMMITS {
-            bail!("carrier recovery outer-commit budget exhausted")
+            bail!(BudgetExhausted(
+                "carrier recovery outer-commit budget exhausted".to_owned()
+            ))
         }
         for commit in commits {
             if self.restore_object_at(&commit, kind, id)? {

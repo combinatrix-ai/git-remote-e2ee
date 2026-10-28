@@ -2009,3 +2009,155 @@ fn failed_ref_in_a_helper_push_batch_is_not_published_by_the_next_ref() {
         "{stderr}"
     );
 }
+
+#[test]
+fn carrier_recovery_classifies_missing_head_manifest_as_unavailable() {
+    let temporary = tempfile::tempdir().unwrap();
+    let _cache = isolated_cache(&temporary);
+    let carrier = temporary.path().join("carrier.git");
+    let source = temporary.path().join("source");
+    let returning = temporary.path().join("returning");
+    init_source(&source, "first content");
+    init_source(&returning, "returning local content");
+
+    let owner = KeyFile::generate();
+    init_carrier(temporary.path(), &carrier, &owner);
+    let repository = EncryptedRepository::new(
+        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        owner.clone(),
+    );
+    repository
+        .push_ref(&source, "refs/heads/main", false)
+        .unwrap();
+    repository.fetch_into(&returning, "private").unwrap();
+
+    fs::write(source.join("note.md"), "second content\n").unwrap();
+    git(&source, &["commit", "-q", "-am", "second"], false);
+    let repository = EncryptedRepository::new(
+        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        owner.clone(),
+    );
+    repository
+        .push_ref(&source, "refs/heads/main", false)
+        .unwrap();
+    let (head_id, _) = repository.current_manifest().unwrap();
+
+    edit_carrier(
+        &carrier,
+        &temporary.path().join("carrier-edit"),
+        |workdir| {
+            fs::remove_dir_all(workdir.join("manifests").join(&head_id[..2]).join(&head_id))
+                .unwrap();
+        },
+    );
+
+    let recover = |publish| {
+        EncryptedRepository::new(
+            GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+            owner.clone(),
+        )
+        .recover(
+            &returning,
+            RecoveryOptions {
+                publish,
+                base: None,
+                discard_newer: false,
+                accept_stale_floor: false,
+            },
+        )
+        .unwrap()
+    };
+    let report = recover(false);
+    assert_eq!(
+        report.classification,
+        RecoveryClass::Unavailable,
+        "{}",
+        report.reason
+    );
+
+    let published = recover(true);
+    assert_eq!(published.classification, RecoveryClass::Unavailable);
+    assert!(published.published_manifest.is_none());
+    assert!(published.blocked_reason.is_some());
+    let carrier_head = git(&carrier, &["show", "refs/heads/main:HEAD"], false);
+    assert_eq!(carrier_head, head_id);
+}
+
+#[test]
+fn carrier_recovery_refuses_to_skip_a_historical_head_with_missing_objects() {
+    let temporary = tempfile::tempdir().unwrap();
+    let _cache = isolated_cache(&temporary);
+    let carrier = temporary.path().join("carrier.git");
+    let source = temporary.path().join("source");
+    let returning = temporary.path().join("returning");
+    init_source(&source, "floor content");
+    init_source(&returning, "returning local content");
+
+    let owner = KeyFile::generate();
+    init_carrier(temporary.path(), &carrier, &owner);
+    let repository = EncryptedRepository::new(
+        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        owner.clone(),
+    );
+    repository
+        .push_ref(&source, "refs/heads/main", false)
+        .unwrap();
+    repository.fetch_into(&returning, "private").unwrap();
+    let (floor_id, floor) = repository.current_manifest().unwrap();
+
+    let uncommitted = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let genesis_id = floor.previous.clone().unwrap();
+    let genesis_bytes = uncommitted
+        .get_object(ObjectKind::Manifest, &genesis_id)
+        .unwrap();
+    let genesis_key =
+        unwrap_generation_key(&peek_manifest_header(&genesis_bytes).unwrap(), &owner).unwrap();
+    let genesis = open_manifest(&genesis_bytes, &genesis_key).unwrap();
+    let policy =
+        PolicyState::parse(genesis.manifest().introduced_policy.as_deref().unwrap()).unwrap();
+    let newer_id =
+        create_writer_successor(&uncommitted, &owner, &policy, &floor_id, floor.refs.clone());
+
+    edit_carrier(
+        &carrier,
+        &temporary.path().join("carrier-edit"),
+        |workdir| {
+            fs::write(workdir.join("HEAD"), format!("{newer_id}\n")).unwrap();
+        },
+    );
+    let junk_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let junk = b"invalid successor";
+    let junk_id = object_id(junk);
+    junk_storage
+        .put_object_if_absent(ObjectKind::Manifest, &junk_id, junk)
+        .unwrap();
+    junk_storage
+        .compare_and_swap_head(Some(&newer_id), &junk_id)
+        .unwrap();
+
+    let report = EncryptedRepository::new(
+        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        owner.clone(),
+    )
+    .recover(
+        &returning,
+        RecoveryOptions {
+            publish: true,
+            base: None,
+            discard_newer: false,
+            accept_stale_floor: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(report.classification, RecoveryClass::Invalid);
+    assert!(report.published_manifest.is_none());
+    let blocked = report.blocked_reason.unwrap();
+    assert!(
+        blocked.contains(&format!(
+            "historical carrier head {newer_id} is unavailable"
+        )),
+        "{blocked}"
+    );
+    let carrier_head = git(&carrier, &["show", "refs/heads/main:HEAD"], false);
+    assert_eq!(carrier_head, junk_id);
+}
