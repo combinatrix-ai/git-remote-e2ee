@@ -448,3 +448,86 @@ fn unsupported_upstream_operations_fail_without_publication() {
     assert_eq!(after_namespace.generation, generation);
     assert!(!after_namespace.refs.contains_key("refs/notes/review"));
 }
+
+#[test]
+fn relative_clone_paths_keep_working_inside_the_clone() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    initialize_git(&source);
+    let (storage, key_path, _) = setup_remote(temporary.path());
+    configure_remote(&source, &storage, &key_path);
+    commit_file(&source, "first", "first");
+    git(&source, &["push", "private", "main"], true);
+
+    let mut command = Command::new("git");
+    command.current_dir(temporary.path()).args([
+        "-c",
+        "e2ee.key=repository.key.json",
+        "clone",
+        "-q",
+        "e2ee::storage",
+        "clone",
+    ]);
+    add_helper_to_path(&mut command);
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "clone stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let clone = temporary.path().join("clone");
+    let configured_url = git(&clone, &["config", "--get", "remote.origin.url"], false);
+    let configured_key = git(
+        &clone,
+        &["config", "--get", "remote.origin.e2ee-key"],
+        false,
+    );
+    let storage_url = configured_url.strip_prefix("e2ee::").unwrap();
+    assert!(Path::new(storage_url).is_absolute(), "{configured_url}");
+    assert!(Path::new(&configured_key).is_absolute(), "{configured_key}");
+    assert_eq!(
+        fs::canonicalize(storage_url).unwrap(),
+        fs::canonicalize(&storage).unwrap()
+    );
+    assert_eq!(
+        fs::canonicalize(&configured_key).unwrap(),
+        fs::canonicalize(&key_path).unwrap()
+    );
+
+    let second = commit_file(&source, "second", "second");
+    git(&source, &["push", "private", "main"], true);
+    git(&clone, &["fetch", "origin"], true);
+    assert_eq!(git(&clone, &["rev-parse", "origin/main"], false), second);
+}
+
+#[test]
+fn stale_push_is_reported_as_an_ordinary_git_rejection() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let clone = temporary.path().join("clone");
+    initialize_git(&source);
+    let (storage, key_path, key) = setup_remote(temporary.path());
+    configure_remote(&source, &storage, &key_path);
+    commit_file(&source, "first", "first");
+    git(&source, &["push", "private", "main"], true);
+    clone_remote(&clone, &storage, &key_path);
+    let published = commit_file(&source, "second", "second");
+    git(&source, &["push", "private", "main"], true);
+
+    commit_file(&clone, "diverged", "diverged");
+    let rejected = git_output(&clone, &["push", "origin", "main"], true);
+    assert!(!rejected.status.success());
+    let stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert!(
+        stderr.contains("[rejected]") && stderr.contains("(fetch first)"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("remote rejected"), "{stderr}");
+    assert!(stderr.contains("git pull"), "{stderr}");
+    let repository = EncryptedRepository::new(FilesystemStorage::new(&storage), key);
+    assert_eq!(
+        repository.verify().unwrap().refs["refs/heads/main"],
+        published
+    );
+}

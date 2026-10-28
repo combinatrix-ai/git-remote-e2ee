@@ -104,3 +104,29 @@ fn device_add_parses_roles_and_device_list_uses_role_names() {
     let owner_id = owner.device_id().unwrap();
     assert!(output.contains(&format!("{owner_id} role=admin status=active")));
 }
+
+#[test]
+fn init_accepts_relative_storage_and_key_paths() {
+    let temporary = tempfile::tempdir().unwrap();
+    KeyFile::generate()
+        .write_new(&temporary.path().join("owner.key.json"))
+        .unwrap();
+
+    let initialized = Command::new(env!("CARGO_BIN_EXE_git-e2ee"))
+        .current_dir(temporary.path())
+        .args(["init", "--storage", "storage", "--key", "owner.key.json"])
+        .output()
+        .unwrap();
+    assert!(
+        initialized.status.success(),
+        "git-e2ee init: {}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+    assert!(
+        temporary
+            .path()
+            .join("owner.key.json.admin-state.json")
+            .is_file(),
+        "init must leave the administrator pin next to the key"
+    );
+}

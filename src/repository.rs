@@ -32,6 +32,29 @@ const MAX_RECOVERY_CRYPTO_OPERATIONS: u64 = 1_000_000;
 const MAX_REJECTED_HEADS: usize = 16;
 const STALE_FLOOR_WARNING: &str = "Updates after this floor may be omitted. This may also omit revocations and disclose subsequently published content to devices excluded by a newer policy.";
 
+#[derive(Debug, thiserror::Error)]
+pub enum PushRejection {
+    #[error("non-fast-forward update rejected for {0}")]
+    NonFastForward(String),
+    #[error("remote tip for {0} is missing locally; fetch first")]
+    FetchFirst(String),
+    #[error("tag {0} already exists; use --force to move it")]
+    AlreadyExists(String),
+}
+
+impl PushRejection {
+    /// The status text Git's transport layer recognizes in a remote-helper
+    /// `error <ref> <status>` line, which turns the result into an ordinary
+    /// `[rejected]` entry with Git's own advice.
+    pub fn git_status(&self) -> &'static str {
+        match self {
+            Self::NonFastForward(_) => "non-fast forward",
+            Self::FetchFirst(_) => "fetch first",
+            Self::AlreadyExists(_) => "already exists",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryClass {
@@ -603,20 +626,20 @@ impl<S: Storage> EncryptedRepository<S> {
             git::ensure_branch_target(repo, destination_ref, &next_object)?;
         }
         if ref_kind == git::InnerRefKind::Tag && old_object.is_some() && !force {
-            bail!("tag {destination_ref} already exists; use --force to move it")
+            return Err(PushRejection::AlreadyExists(destination_ref.to_owned()).into());
         }
         let non_fast_forward = if ref_kind == git::InnerRefKind::Branch
             && let Some(old_object) = old_object
         {
             if !git::object_exists(repo, old_object)? {
-                bail!("remote tip for {destination_ref} is missing locally; fetch first")
+                return Err(PushRejection::FetchFirst(destination_ref.to_owned()).into());
             }
             !git::is_ancestor(repo, old_object, &next_object)?
         } else {
             false
         };
         if non_fast_forward && !force {
-            bail!("non-fast-forward update rejected for {destination_ref}")
+            return Err(PushRejection::NonFastForward(destination_ref.to_owned()).into());
         }
         Ok((current, Some(next_object), non_fast_forward))
     }
@@ -1901,10 +1924,11 @@ fn persist_client_state(path: &Path, state: &ClientState) -> Result<()> {
     crate::persist::durability_checkpoint(crate::persist::STAGE_AFTER_FILE_FLUSH);
     fs::rename(&temporary, path)?;
     crate::persist::durability_checkpoint(crate::persist::STAGE_AFTER_NAME_PUBLISH);
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .context("client state path has no parent")?;
+    let parent = match path.parent() {
+        Some(parent) if parent.as_os_str().is_empty() => Path::new("."),
+        Some(parent) => parent,
+        None => bail!("client state path has no parent"),
+    };
     crate::persist::sync_directory(parent)
         .with_context(|| format!("sync directory {}", parent.display()))?;
     Ok(())
