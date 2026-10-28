@@ -62,7 +62,7 @@ fn two_devices_can_decrypt_and_push_independently() {
     let key_a = KeyFile::generate();
     let key_b = KeyFile::generate_for_repository(key_a.repository_root.clone()).unwrap();
     let repo_a = EncryptedRepository::new(FilesystemStorage::new(&remote), key_a.clone());
-    repo_a.initialize().unwrap();
+    repo_a.initialize("owner").unwrap();
     repo_a.pin_admin_state(&admin_pin).unwrap();
     let first = commit(&source_a, "from a\n", "from a");
     repo_a
@@ -71,6 +71,7 @@ fn two_devices_can_decrypt_and_push_independently() {
     repo_a
         .add_device(
             key_b.public_device().unwrap(),
+            "device-1",
             DeviceRoles::collaborator(),
             &admin_pin,
         )
@@ -114,7 +115,7 @@ fn revoked_reader_cannot_reach_later_history_but_keeps_prior_snapshot() {
     let key_b = KeyFile::generate_for_repository(key_a.repository_root.clone()).unwrap();
     let key_c = KeyFile::generate_for_repository(key_a.repository_root.clone()).unwrap();
     let repo_a = EncryptedRepository::new(FilesystemStorage::new(&remote), key_a.clone());
-    repo_a.initialize().unwrap();
+    repo_a.initialize("owner").unwrap();
     repo_a.pin_admin_state(&admin_pin).unwrap();
     let before = commit(&source, "before revoke\n", "before revoke");
     repo_a.push_ref(&source, "refs/heads/main", false).unwrap();
@@ -124,6 +125,7 @@ fn revoked_reader_cannot_reach_later_history_but_keeps_prior_snapshot() {
     repo_a
         .add_device(
             key_b.public_device().unwrap(),
+            "device-2",
             DeviceRoles::collaborator(),
             &admin_pin,
         )
@@ -212,6 +214,7 @@ fn revoked_reader_cannot_reach_later_history_but_keeps_prior_snapshot() {
     repo_a
         .add_device(
             key_c.public_device().unwrap(),
+            "device-3",
             DeviceRoles::collaborator(),
             &admin_pin,
         )
@@ -246,7 +249,7 @@ fn connected_membership_observation_pins_and_rejects_replay() {
     let key_a = KeyFile::generate();
     let key_b = KeyFile::generate_for_repository(key_a.repository_root.clone()).unwrap();
     let repository = EncryptedRepository::new(FilesystemStorage::new(&remote), key_a);
-    repository.initialize().unwrap();
+    repository.initialize("owner").unwrap();
     repository.pin_admin_state(&admin_pin).unwrap();
     commit(&source, "one\n", "one");
     repository
@@ -261,6 +264,7 @@ fn connected_membership_observation_pins_and_rejects_replay() {
     repository
         .add_device(
             key_b.public_device().unwrap(),
+            "device-4",
             DeviceRoles::collaborator(),
             &admin_pin,
         )
@@ -300,11 +304,12 @@ fn administrative_pin_rejects_policy_rollback() {
     let first = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
     let second = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
     let repository = EncryptedRepository::new(FilesystemStorage::new(&remote), owner);
-    let genesis = repository.initialize().unwrap();
+    let genesis = repository.initialize("owner").unwrap();
     repository.pin_admin_state(&pin).unwrap();
     repository
         .add_device(
             first.public_device().unwrap(),
+            "device-5",
             DeviceRoles::collaborator(),
             &pin,
         )
@@ -315,6 +320,7 @@ fn administrative_pin_rejects_policy_rollback() {
         repository
             .add_device(
                 second.public_device().unwrap(),
+                "device-6",
                 DeviceRoles::collaborator(),
                 &pin,
             )
@@ -334,11 +340,12 @@ fn non_admin_device_cannot_change_policy() {
     let admin_pin = temp.path().join("a-admin-state.json");
     let non_admin_pin = temp.path().join("b-admin-state.json");
     let repo_a = EncryptedRepository::new(FilesystemStorage::new(&remote), key_a);
-    repo_a.initialize().unwrap();
+    repo_a.initialize("owner").unwrap();
     repo_a.pin_admin_state(&admin_pin).unwrap();
     repo_a
         .add_device(
             key_b.public_device().unwrap(),
+            "device-7",
             DeviceRoles::collaborator(),
             &admin_pin,
         )
@@ -348,6 +355,7 @@ fn non_admin_device_cannot_change_policy() {
         repo_b
             .add_device(
                 key_c.public_device().unwrap(),
+                "device-8",
                 DeviceRoles::collaborator(),
                 &non_admin_pin,
             )
@@ -367,11 +375,12 @@ fn read_only_device_cannot_add_or_revoke_devices() {
         KeyFile::generate_for_repository(owner_key.repository_root.clone()).unwrap();
     let admin_pin = temp.path().join("owner-admin-state.json");
     let owner = EncryptedRepository::new(FilesystemStorage::new(&remote), owner_key);
-    owner.initialize().unwrap();
+    owner.initialize("owner").unwrap();
     owner.pin_admin_state(&admin_pin).unwrap();
     owner
         .add_device(
             reader_key.public_device().unwrap(),
+            "device-9",
             DeviceRoles::reader(),
             &admin_pin,
         )
@@ -383,6 +392,7 @@ fn read_only_device_cannot_add_or_revoke_devices() {
         reader
             .add_device(
                 candidate_key.public_device().unwrap(),
+                "device-10",
                 DeviceRoles::collaborator(),
                 &admin_pin,
             )

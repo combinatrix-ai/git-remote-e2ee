@@ -10,8 +10,8 @@ use crate::crypto::{
     verify_domain,
 };
 
-pub const POLICY_FORMAT_VERSION: u32 = 5;
-const POLICY_SIGNATURE_DOMAIN: &[u8] = b"git-remote-e2ee policy v5\0";
+pub const POLICY_FORMAT_VERSION: u32 = 6;
+const POLICY_SIGNATURE_DOMAIN: &[u8] = b"git-remote-e2ee policy v6\0";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -52,6 +52,7 @@ impl DeviceRoles {
 pub struct DeviceRecord {
     #[serde(flatten)]
     pub public: PublicDevice,
+    pub label: String,
     pub roles: DeviceRoles,
     pub revoked_at: Option<u64>,
 }
@@ -96,7 +97,7 @@ pub struct PolicyState {
 }
 
 impl PolicyState {
-    pub fn genesis(key: &KeyFile) -> Result<(Self, Vec<u8>)> {
+    pub fn genesis(key: &KeyFile, owner_label: &str) -> Result<(Self, Vec<u8>)> {
         let public = key.public_device()?;
         let body = PolicyBody {
             format_version: POLICY_FORMAT_VERSION,
@@ -106,6 +107,7 @@ impl PolicyState {
             admin_threshold: 1,
             devices: vec![DeviceRecord {
                 public,
+                label: owner_label.to_owned(),
                 roles: DeviceRoles::owner(),
                 revoked_at: None,
             }],
@@ -216,6 +218,9 @@ impl PolicyState {
             if new.public != old.public {
                 bail!("policy changed a device's public identity")
             }
+            if new.label != old.label {
+                bail!("policy changed a device's label")
+            }
             if old.revoked_at.is_some() && new.revoked_at != old.revoked_at {
                 bail!("policy changed or reactivated a revoked device")
             }
@@ -284,12 +289,55 @@ impl PolicyState {
     }
 }
 
+pub const MAX_DEVICE_LABEL_BYTES: usize = 64;
+
+/// Labels are an administrator's claim for humans reading `device-list`; they
+/// never select or authorize anything. Rejecting invisible and bidirectional
+/// formatting characters keeps two labels from rendering identically.
+pub fn validate_device_label(label: &str) -> Result<()> {
+    if label.is_empty() || label.len() > MAX_DEVICE_LABEL_BYTES {
+        bail!("device label must be 1 to {MAX_DEVICE_LABEL_BYTES} bytes")
+    }
+    if label.trim() != label {
+        bail!("device label must not start or end with whitespace")
+    }
+    if let Some(character) = label.chars().find(|&c| is_control_or_invisible(c)) {
+        bail!(
+            "device label contains control or invisible character U+{:04X}",
+            u32::from(character)
+        )
+    }
+    Ok(())
+}
+
+fn is_control_or_invisible(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{00AD}'
+                | '\u{061C}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{206F}'
+                | '\u{FEFF}'
+        )
+}
+
 fn validate_devices(devices: &[DeviceRecord]) -> Result<()> {
     let mut ids = HashSet::new();
+    let mut active_labels = HashSet::new();
     for device in devices {
         validate_public_device(&device.public)?;
         if !ids.insert(&device.public.device_id) {
             bail!("policy contains a duplicate device id")
+        }
+        validate_device_label(&device.label)?;
+        if device.active() && !active_labels.insert(device.label.as_str()) {
+            bail!(
+                "device label {:?} is already used by an active device",
+                device.label
+            )
         }
         if device.roles.writer && !device.roles.reader {
             bail!("writer devices must also be readers")
@@ -337,7 +385,7 @@ mod tests {
     #[test]
     fn genesis_is_self_signed_and_contains_no_content_key() {
         let key = KeyFile::generate();
-        let (policy, bytes) = PolicyState::genesis(&key).unwrap();
+        let (policy, bytes) = PolicyState::genesis(&key, "owner").unwrap();
         let parsed = PolicyState::parse(&bytes).unwrap();
         parsed.validate_genesis(&key.repository_root).unwrap();
         assert_eq!(parsed.id, policy.id);
@@ -348,7 +396,7 @@ mod tests {
     fn successor_is_authorized_by_parent_admin() {
         let admin = KeyFile::generate();
         let outsider = KeyFile::generate_for_repository(admin.repository_root.clone()).unwrap();
-        let (parent, _) = PolicyState::genesis(&admin).unwrap();
+        let (parent, _) = PolicyState::genesis(&admin, "owner").unwrap();
         let result = PolicyState::successor(&parent, parent.body.devices.clone(), &outsider);
         assert!(result.is_ok());
         let (unauthorized, _) = result.unwrap();
@@ -358,7 +406,7 @@ mod tests {
     #[test]
     fn writers_and_administrators_must_also_be_readers() {
         let owner = KeyFile::generate();
-        let (parent, _) = PolicyState::genesis(&owner).unwrap();
+        let (parent, _) = PolicyState::genesis(&owner, "owner").unwrap();
         for roles in [
             DeviceRoles {
                 reader: false,
@@ -375,6 +423,7 @@ mod tests {
             let mut devices = parent.body.devices.clone();
             devices.push(DeviceRecord {
                 public: added.public_device().unwrap(),
+                label: added.device_id().unwrap(),
                 roles,
                 revoked_at: None,
             });
@@ -386,7 +435,7 @@ mod tests {
     fn genesis_cannot_be_substituted_under_a_known_repository_root() {
         let expected = KeyFile::generate();
         let attacker = KeyFile::generate();
-        let (substitute, _) = PolicyState::genesis(&attacker).unwrap();
+        let (substitute, _) = PolicyState::genesis(&attacker, "owner").unwrap();
         assert!(
             substitute
                 .validate_genesis(&expected.repository_root)
@@ -397,11 +446,12 @@ mod tests {
     #[test]
     fn successor_rejects_incorrect_revocation_generation() {
         let owner = KeyFile::generate();
-        let (parent, _) = PolicyState::genesis(&owner).unwrap();
+        let (parent, _) = PolicyState::genesis(&owner, "owner").unwrap();
         let collaborator = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
         let mut devices = parent.body.devices.clone();
         devices.push(DeviceRecord {
             public: collaborator.public_device().unwrap(),
+            label: collaborator.device_id().unwrap(),
             roles: DeviceRoles::collaborator(),
             revoked_at: None,
         });
@@ -422,10 +472,11 @@ mod tests {
     fn successor_cannot_reactivate_a_revoked_device() {
         let owner = KeyFile::generate();
         let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
-        let (genesis, _) = PolicyState::genesis(&owner).unwrap();
+        let (genesis, _) = PolicyState::genesis(&owner, "owner").unwrap();
         let mut devices = genesis.body.devices.clone();
         devices.push(DeviceRecord {
             public: reader.public_device().unwrap(),
+            label: reader.device_id().unwrap(),
             roles: DeviceRoles::collaborator(),
             revoked_at: None,
         });
@@ -457,5 +508,106 @@ mod tests {
             error.contains("changed or reactivated"),
             "unexpected error: {error}"
         );
+    }
+
+    /// Signs a body the way a malicious administrator's modified client would,
+    /// skipping the checks `create` runs, and returns the bytes a receiver sees.
+    fn sign_unchecked(body: &PolicyBody, signer: &KeyFile) -> Vec<u8> {
+        let exact_body = serde_json::to_vec(body).unwrap();
+        serde_json::to_vec(&PolicyObject {
+            body: BASE64.encode(&exact_body),
+            signatures: vec![PolicySignature {
+                device_id: signer.device_id().unwrap(),
+                signature: BASE64.encode(
+                    signer
+                        .sign_domain(POLICY_SIGNATURE_DOMAIN, &exact_body)
+                        .unwrap(),
+                ),
+            }],
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn received_genesis_with_an_invalid_owner_label_is_rejected() {
+        let owner = KeyFile::generate();
+        let (genesis, _) = PolicyState::genesis(&owner, "owner").unwrap();
+        for label in [
+            "",
+            " owner",
+            "own\u{202E}er",
+            "a\u{200B}",
+            "x\ny",
+            &"a".repeat(65),
+        ] {
+            let mut body = genesis.body.clone();
+            body.devices[0].label = label.to_owned();
+            let received = PolicyState::parse(&sign_unchecked(&body, &owner))
+                .and_then(|policy| policy.validate_genesis(&owner.repository_root));
+            assert!(received.is_err(), "accepted owner label {label:?}");
+        }
+        assert!(PolicyState::genesis(&owner, "own\u{FEFF}er").is_err());
+    }
+
+    #[test]
+    fn received_successor_with_a_duplicate_active_label_is_rejected() {
+        let owner = KeyFile::generate();
+        let (genesis, _) = PolicyState::genesis(&owner, "laptop").unwrap();
+        let twin = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
+        let mut body = genesis.body.clone();
+        body.generation = 1;
+        body.previous = Some(genesis.id.clone());
+        body.devices.push(DeviceRecord {
+            public: twin.public_device().unwrap(),
+            label: "laptop".to_owned(),
+            roles: DeviceRoles::collaborator(),
+            revoked_at: None,
+        });
+        let received = PolicyState::parse(&sign_unchecked(&body, &owner))
+            .and_then(|policy| policy.validate_successor(&genesis));
+        let error = received.unwrap_err().to_string();
+        assert!(error.contains("already used"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn successor_cannot_relabel_an_existing_device() {
+        let owner = KeyFile::generate();
+        let (genesis, _) = PolicyState::genesis(&owner, "laptop").unwrap();
+        let mut devices = genesis.body.devices.clone();
+        devices[0].label = "renamed".to_owned();
+        let (relabeled, bytes) = PolicyState::successor(&genesis, devices, &owner).unwrap();
+        let received = PolicyState::parse(&bytes).unwrap();
+        assert_eq!(received.id, relabeled.id);
+        let error = received
+            .validate_successor(&genesis)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("label"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn a_revoked_label_is_free_for_a_new_device() {
+        let owner = KeyFile::generate();
+        let old = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
+        let new = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
+        let (genesis, _) = PolicyState::genesis(&owner, "laptop").unwrap();
+        let mut devices = genesis.body.devices.clone();
+        devices.push(DeviceRecord {
+            public: old.public_device().unwrap(),
+            label: "phone".to_owned(),
+            roles: DeviceRoles::reader(),
+            revoked_at: Some(1),
+        });
+        devices.push(DeviceRecord {
+            public: new.public_device().unwrap(),
+            label: "phone".to_owned(),
+            roles: DeviceRoles::reader(),
+            revoked_at: None,
+        });
+        let (_, bytes) = PolicyState::successor(&genesis, devices, &owner).unwrap();
+        PolicyState::parse(&bytes)
+            .unwrap()
+            .validate_successor(&genesis)
+            .unwrap();
     }
 }

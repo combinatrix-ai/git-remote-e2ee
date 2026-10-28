@@ -898,6 +898,7 @@ mod tests {
         let mut devices = parent.body.devices.clone();
         devices.push(DeviceRecord {
             public: reader.public_device().unwrap(),
+            label: reader.device_id().unwrap(),
             roles: DeviceRoles::collaborator(),
             revoked_at: None,
         });
@@ -990,11 +991,12 @@ mod tests {
         let owner = KeyFile::generate();
         let reader_a = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
         let reader_b = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
-        let (genesis, genesis_bytes) = PolicyState::genesis(&owner).unwrap();
+        let (genesis, genesis_bytes) = PolicyState::genesis(&owner, "owner").unwrap();
         let mut devices = genesis.body.devices.clone();
         for reader in [&reader_a, &reader_b] {
             devices.push(DeviceRecord {
                 public: reader.public_device().unwrap(),
+                label: reader.device_id().unwrap(),
                 roles: DeviceRoles::collaborator(),
                 revoked_at: None,
             });
@@ -1023,6 +1025,7 @@ mod tests {
             let extra = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
             five_readers_devices.push(DeviceRecord {
                 public: extra.public_device().unwrap(),
+                label: extra.device_id().unwrap(),
                 roles: DeviceRoles::collaborator(),
                 revoked_at: None,
             });
@@ -1053,7 +1056,7 @@ mod tests {
     #[test]
     fn predecessor_link_must_match_parent_commitment() {
         let owner = KeyFile::generate();
-        let (policy, policy_bytes) = PolicyState::genesis(&owner).unwrap();
+        let (policy, policy_bytes) = PolicyState::genesis(&owner, "owner").unwrap();
         let parent_key = random_key();
         let parent = Manifest::genesis(owner.repository_root.clone(), &policy, policy_bytes);
         let parent_bytes = seal_manifest(
@@ -1097,7 +1100,7 @@ mod tests {
     fn malicious_writer_cannot_replace_a_reader_envelope_with_garbage() {
         let owner = KeyFile::generate();
         let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
-        let (genesis, _) = PolicyState::genesis(&owner).unwrap();
+        let (genesis, _) = PolicyState::genesis(&owner, "owner").unwrap();
         let policy = add_reader(&owner, &genesis, &reader);
         let generation_key = random_key();
         let valid = writer_manifest(&reader, &policy, &generation_key);
@@ -1129,10 +1132,11 @@ mod tests {
     fn reader_only_device_cannot_sign_an_ordinary_manifest() {
         let owner = KeyFile::generate();
         let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
-        let (genesis, _) = PolicyState::genesis(&owner).unwrap();
+        let (genesis, _) = PolicyState::genesis(&owner, "owner").unwrap();
         let mut devices = genesis.body.devices.clone();
         devices.push(DeviceRecord {
             public: reader.public_device().unwrap(),
+            label: reader.device_id().unwrap(),
             roles: DeviceRoles::reader(),
             revoked_at: None,
         });
@@ -1153,7 +1157,7 @@ mod tests {
     fn reader_trials_all_envelopes_and_reports_inactive_membership_clearly() {
         let owner = KeyFile::generate();
         let outsider = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
-        let (policy, bytes) = PolicyState::genesis(&owner).unwrap();
+        let (policy, bytes) = PolicyState::genesis(&owner, "owner").unwrap();
         let manifest = Manifest::genesis(owner.repository_root.clone(), &policy, bytes);
         let encrypted = seal_manifest(
             &owner,
@@ -1198,7 +1202,7 @@ mod tests {
     fn audit_rejects_missing_duplicate_extra_and_revoked_reader_entries() {
         let owner = KeyFile::generate();
         let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
-        let (parent, _) = PolicyState::genesis(&owner).unwrap();
+        let (parent, _) = PolicyState::genesis(&owner, "owner").unwrap();
         let policy = add_reader(&owner, &parent, &reader);
         let generation_key = random_key();
         let valid = writer_manifest(&owner, &policy, &generation_key);

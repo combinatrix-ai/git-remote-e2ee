@@ -46,8 +46,11 @@ never be committed.
 
 The CLI keeps an administrative continuity pin per repository root at
 `$XDG_STATE_HOME/git-e2ee/<repository-root>/admin-state.json` (by default under
-`~/.local/state`). Moving or renaming the key file keeps the pin. Back up that
-file together with the key.
+`~/.local/state`). `device-add`, `device-revoke`, and `device-list` all check
+the storage head against this pin and then advance it, so storage cannot show
+an older membership list, for example one that hides a revocation, once you
+have seen a newer one. Moving or renaming the key file keeps the pin. Back up
+that file together with the key.
 
 Inside a Git repository, the continuity pin is likewise kept per repository
 root at `.git/git-remote-e2ee/<repository-root>/state.json`, not per Git remote
@@ -78,7 +81,9 @@ git push -u origin main
 initializes the storage, adds it as the Git remote `origin`, and records the key
 as `remote.origin.e2ee-key`. If `origin` already exists, `init` stops before
 creating anything; pick another name with `--name private`. Pass
-`--key <path>` to use an existing key or to create the new key elsewhere. Run
+`--key <path>` to use an existing key or to create the new key elsewhere.
+`--label <label>` names this device in `device-list`; it defaults to the
+machine's hostname, or `owner` when the hostname is not a valid label. Run
 outside a Git repository, `init` only creates the key and the storage.
 
 The carrier holds only this outer structure:
@@ -153,8 +158,15 @@ git-e2ee device-export \
   --output machine-b.public.json
 
 # Machine A, inside its clone, after receiving only machine-b.public.json
-git-e2ee device-add origin machine-b.public.json
+git-e2ee device-add origin machine-b.public.json --label machine-b
 ```
+
+`--label` is required. It names the device in `device-list` and is stored in
+the policy, which travels only inside the encrypted manifest body. A label is
+1 to 64 bytes of UTF-8 with no leading or trailing whitespace and no control
+or invisible formatting characters (such as zero-width spaces or bidirectional
+overrides). It must differ from every active device's label; a revoked
+device's label can be reused. A label never changes once added.
 
 Commands that act on existing storage (`verify`, `device-add`, `device-list`,
 `device-revoke`, `recover`) take a target. Inside a clone it can be a Git remote
@@ -171,15 +183,32 @@ Machine B can then clone with its own key, as shown above.
 `device-add --role` grants one of three roles: `read` can clone, fetch, and
 pull; `write` adds push access; and `admin` also allows device membership
 changes. The default is `write`. For example, add a read-only device with
-`--role read`. `device-list` prints the same role names.
+`--role read`.
+
+`device-list` prints one line per device, current and revoked, and marks the
+device whose key you used with `*`:
+
+```text
+* 3f9c…e1a0  laptop     role=admin  status=active
+  8b02…77d4  machine-b  role=write  status=active
+  c51e…0b9f  old-phone  role=read   status=revoked
+```
+
+The real output shows each full 64-character device ID, separated from the
+label and fields by two spaces.
 
 ## Revoke a device
 
-`git-e2ee device-list` prints opaque device IDs. Revoke one with:
+Find the device in `git-e2ee device-list` by its label, then revoke it by its
+full device ID:
 
 ```console
 git-e2ee device-revoke origin <device-id>
 ```
+
+A label is the claim of the administrator who added the device, made for
+people reading the list. It never selects a device or authorizes anything;
+commands take the device ID, and authority comes only from the signed roles.
 
 Adding or revoking a device publishes a fresh generation key in a single
 compare-and-swap. The new generation carries one small envelope per active

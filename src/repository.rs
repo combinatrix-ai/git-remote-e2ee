@@ -207,11 +207,11 @@ impl<S: Storage> EncryptedRepository<S> {
         Self { storage, key }
     }
 
-    pub fn initialize(&self) -> Result<String> {
+    pub fn initialize(&self, owner_label: &str) -> Result<String> {
         if self.storage.read_head()?.is_some() {
             bail!("encrypted repository is already initialized")
         }
-        let (policy, policy_bytes) = PolicyState::genesis(&self.key)?;
+        let (policy, policy_bytes) = PolicyState::genesis(&self.key, owner_label)?;
         let generation_key = random_key();
         let genesis = Manifest::genesis(self.key.repository_root.clone(), &policy, policy_bytes);
         self.commit_manifest(
@@ -227,6 +227,7 @@ impl<S: Storage> EncryptedRepository<S> {
     pub fn add_device(
         &self,
         public: PublicDevice,
+        label: &str,
         roles: DeviceRoles,
         pin_path: &Path,
     ) -> Result<(String, String)> {
@@ -241,6 +242,7 @@ impl<S: Storage> EncryptedRepository<S> {
         let mut devices = current.policy.body.devices.clone();
         devices.push(DeviceRecord {
             public,
+            label: label.to_owned(),
             roles,
             revoked_at: None,
         });
@@ -313,6 +315,17 @@ impl<S: Storage> EncryptedRepository<S> {
     }
 
     pub fn pin_admin_state(&self, pin_path: &Path) -> Result<()> {
+        self.advance_admin_pin(pin_path).map(drop)
+    }
+
+    /// Returns the current membership only after the head passes the local
+    /// continuity pin, so storage cannot hide a revocation by serving an
+    /// older, validly signed policy.
+    pub fn list_devices(&self, pin_path: &Path) -> Result<Vec<DeviceRecord>> {
+        Ok(self.advance_admin_pin(pin_path)?.policy.body.devices)
+    }
+
+    fn advance_admin_pin(&self, pin_path: &Path) -> Result<OpenedState> {
         let _pin_lock = ClientStateLock::acquire(pin_path)?;
         let chain = self.current_chain()?;
         let current = chain.first().context("manifest chain is empty")?;
@@ -324,18 +337,8 @@ impl<S: Storage> EncryptedRepository<S> {
             &current.id,
             &current.manifest,
             &BTreeMap::new(),
-        )
-    }
-
-    pub fn list_devices(&self) -> Result<Vec<DeviceRecord>> {
-        Ok(self
-            .current_chain()?
-            .into_iter()
-            .next()
-            .context("manifest chain is empty")?
-            .policy
-            .body
-            .devices)
+        )?;
+        Ok(current.clone())
     }
 
     fn publish_policy_transition(

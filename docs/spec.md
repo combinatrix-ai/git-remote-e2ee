@@ -64,9 +64,9 @@ The v5 format uses:
 - XChaCha20-Poly1305 STREAM with a big-endian 32-bit counter for packs;
 - SHA-256 for content IDs and generation-key commitments.
 
-The v5 domain strings are `git-remote-e2ee subkey derivation v5\0`,
+The domain strings are `git-remote-e2ee subkey derivation v5\0`,
 `git-remote-e2ee generation key commitment v5\0`,
-`git-remote-e2ee manifest v5\0`, and `git-remote-e2ee policy v5\0`.
+`git-remote-e2ee manifest v5\0`, and `git-remote-e2ee policy v6\0`.
 `sign_domain` signs `domain || SHA-256(exact_bytes)` with Ed25519. Symmetric
 XChaCha20-Poly1305 envelopes are encoded as
 `E2EES05\0 || nonce_24 || ciphertext`. Subkey kind values are
@@ -181,10 +181,26 @@ encrypted.
 
 A policy contains:
 
-- format version 5, repository root, generation, and previous policy ID;
+- format version 6, repository root, generation, and previous policy ID;
 - administrator threshold and signature array;
-- immutable historical device records with public keys, roles, and optional
-  revocation generation.
+- immutable historical device records with public keys, a label, roles, and
+  optional revocation generation.
+
+A device label is a human-readable name chosen by the administrator who adds
+the device. It is confidential to readers because the policy travels only
+inside the encrypted manifest body, and it is covered by the policy signature.
+Labels MUST NOT select or authorize anything; device IDs and roles do. Every
+received policy, genesis and successor alike, MUST be rejected unless each
+label:
+
+- is 1 to 64 bytes of UTF-8 with no leading or trailing whitespace;
+- contains no Unicode control character (general category Cc) and none of the
+  invisible or formatting characters U+00AD, U+061C, U+180E, U+200B–U+200F,
+  U+202A–U+202E, U+2060–U+206F, or U+FEFF;
+- differs, by exact case-sensitive comparison, from the label of every other
+  active record (a revoked record's label may be reused);
+- equals the label of the same record in the parent policy, when the record
+  already existed there.
 
 Roles are:
 

@@ -99,7 +99,7 @@ fn init_carrier(root: &Path, carrier: &Path, key: &KeyFile) {
         GitStorage::open(carrier.to_str().unwrap()).unwrap(),
         key.clone(),
     )
-    .initialize()
+    .initialize("owner")
     .unwrap();
 }
 
@@ -873,11 +873,12 @@ fn carrier_recovery_chooses_legitimate_descendant_and_restores_deleted_ciphertex
         GitStorage::open(carrier.to_str().unwrap()).unwrap(),
         owner.clone(),
     );
-    repository.initialize().unwrap();
+    repository.initialize("owner").unwrap();
     repository.pin_admin_state(&admin_pin).unwrap();
     let (reader_policy_manifest, _) = repository
         .add_device(
             reader.public_device().unwrap(),
+            "device-1",
             DeviceRoles::reader(),
             &admin_pin,
         )
@@ -1071,11 +1072,12 @@ fn carrier_recovery_offers_hidden_legitimate_content_descendant() {
         GitStorage::open(carrier.to_str().unwrap()).unwrap(),
         owner.clone(),
     );
-    repository.initialize().unwrap();
+    repository.initialize("owner").unwrap();
     repository.pin_admin_state(&admin_pin).unwrap();
     let (floor_id, _) = repository
         .add_device(
             reader.public_device().unwrap(),
+            "device-2",
             DeviceRoles::reader(),
             &admin_pin,
         )
@@ -1223,11 +1225,12 @@ fn carrier_recovery_refuses_history_with_a_merge_hiding_a_legitimate_state() {
         GitStorage::open(carrier.to_str().unwrap()).unwrap(),
         owner.clone(),
     );
-    repository.initialize().unwrap();
+    repository.initialize("owner").unwrap();
     repository.pin_admin_state(&admin_pin).unwrap();
     let (floor_id, _) = repository
         .add_device(
             reader.public_device().unwrap(),
+            "device-3",
             DeviceRoles::reader(),
             &admin_pin,
         )
@@ -1337,11 +1340,12 @@ fn carrier_recovery_refuses_conflicting_authenticated_descendants() {
         GitStorage::open(carrier.to_str().unwrap()).unwrap(),
         owner.clone(),
     );
-    repository.initialize().unwrap();
+    repository.initialize("owner").unwrap();
     repository.pin_admin_state(&admin_pin).unwrap();
     let (floor_id, _) = repository
         .add_device(
             reader.public_device().unwrap(),
+            "device-4",
             DeviceRoles::reader(),
             &admin_pin,
         )
@@ -1452,11 +1456,12 @@ fn carrier_recovery_loses_cas_without_retrying_when_another_writer_publishes() {
         GitStorage::open(carrier.to_str().unwrap()).unwrap(),
         owner.clone(),
     );
-    repository.initialize().unwrap();
+    repository.initialize("owner").unwrap();
     repository.pin_admin_state(&admin_pin).unwrap();
     let (floor_id, _) = repository
         .add_device(
             reader.public_device().unwrap(),
+            "device-5",
             DeviceRoles::reader(),
             &admin_pin,
         )
@@ -1713,7 +1718,7 @@ fn carrier_branch_fragment_selects_the_branch_through_the_helper() {
     );
     let location = format!("{}#vault", carrier.display());
     EncryptedRepository::new(GitStorage::open(&location).unwrap(), key.clone())
-        .initialize()
+        .initialize("owner")
         .unwrap();
 
     let url = format!("e2ee::{location}");
@@ -1769,7 +1774,7 @@ fn carrier_init_refuses_an_existing_branch_and_another_branch_works() {
         GitStorage::open(carrier.to_str().unwrap()).unwrap(),
         key.clone(),
     )
-    .initialize()
+    .initialize("owner")
     .unwrap_err();
     assert!(
         format!("{refused:#}").contains(&format!(
@@ -1787,10 +1792,10 @@ fn carrier_init_refuses_an_existing_branch_and_another_branch_works() {
         .filter(|entry| entry.as_ref().unwrap().path().is_dir())
         .count();
     assert_eq!(caches, 2, "each branch of one remote has its own cache");
-    encrypted.initialize().unwrap();
+    encrypted.initialize("owner").unwrap();
     assert!(
         encrypted
-            .initialize()
+            .initialize("owner")
             .unwrap_err()
             .to_string()
             .contains("already initialized")
