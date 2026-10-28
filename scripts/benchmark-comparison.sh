@@ -258,7 +258,7 @@ git -C "$work/e2ee-new-client" config maintenance.auto false
 "$git_e2ee" init --storage "$work/e2ee-storage" \
   --key "$work/repository.key.json" >/dev/null
 if [[ $e2ee_push_mode == native ]]; then
-  git -C "$work/source" remote add private "e2ee::$work/e2ee-storage"
+  git -C "$work/source" remote add private "e2ee::dir:$work/e2ee-storage"
   git -C "$work/source" config remote.private.e2ee-key "$work/repository.key.json"
   e2ee_push_command=(
     env "PATH=$project_root/target/release:$PATH"

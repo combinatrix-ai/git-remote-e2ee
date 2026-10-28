@@ -108,7 +108,7 @@ git-e2ee carrier-init \
   --key ~/.config/git-e2ee/notes.key.json
 
 cd my-notes
-git remote add private 'e2ee::git+https://github.com/you/notes-encrypted.git'
+git remote add private 'e2ee::https://github.com/you/notes-encrypted.git'
 git config remote.private.e2ee-key ~/.config/git-e2ee/notes.key.json
 git push -u private main
 ```
@@ -118,7 +118,7 @@ else, pass a key once:
 
 ```console
 git -c e2ee.key="$HOME/.config/git-e2ee/notes.key.json" clone \
-  'e2ee::git+https://github.com/you/notes-encrypted.git' my-notes
+  'e2ee::https://github.com/you/notes-encrypted.git' my-notes
 ```
 
 The key file stays on your machine; never commit it, and keep a backup

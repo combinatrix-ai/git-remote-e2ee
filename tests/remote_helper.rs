@@ -43,7 +43,7 @@ fn git(repo: &Path, args: &[&str], with_helper: bool) -> String {
 }
 
 fn configure_remote(repo: &Path, remote_path: &Path, key_path: &Path) {
-    let remote_url = format!("e2ee::{}", remote_path.display());
+    let remote_url = format!("e2ee::dir:{}", remote_path.display());
     let key_path = key_path.to_string_lossy();
     git(repo, &["remote", "add", "private", &remote_url], false);
     git(
@@ -98,7 +98,7 @@ fn native_git_push_and_fetch_use_the_remote_helper() {
     git(&source, &["commit", "-q", "-m", "initial"], false);
     let source_head = git(&source, &["rev-parse", "HEAD"], false);
 
-    let remote_url = format!("e2ee::{}", remote_path.display());
+    let remote_url = format!("e2ee::dir:{}", remote_path.display());
     let key_path = key_path.to_string_lossy();
     git(&source, &["remote", "add", "private", &remote_url], false);
     git(
@@ -174,8 +174,8 @@ fn concurrent_helper_processes_preserve_the_client_state_floor() {
     git(&source, &["push", "private", "main"], true);
     let (expected_head, expected_manifest) = encrypted.current_manifest().unwrap();
 
-    let current_url = format!("e2ee::{}", remote_path.display());
-    let stale_url = format!("e2ee::{}", stale_remote.display());
+    let current_url = format!("e2ee::dir:{}", remote_path.display());
+    let stale_url = format!("e2ee::dir:{}", stale_remote.display());
     let helper = env!("CARGO_BIN_EXE_git-remote-e2ee");
     let mut children = Vec::new();
     for remote_url in [&stale_url, &stale_url, &current_url, &current_url] {
@@ -248,7 +248,7 @@ fn native_git_dry_run_does_not_mutate_remote() {
     fs::write(source.join("note.md"), "dry run only\n").unwrap();
     git(&source, &["add", "note.md"], false);
     git(&source, &["commit", "-q", "-m", "initial"], false);
-    let remote_url = format!("e2ee::{}", remote_path.display());
+    let remote_url = format!("e2ee::dir:{}", remote_path.display());
     let key_path = key_path.to_string_lossy();
     git(&source, &["remote", "add", "private", &remote_url], false);
     git(

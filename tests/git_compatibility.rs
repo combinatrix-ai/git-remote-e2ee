@@ -69,7 +69,7 @@ fn setup_remote(root: &Path) -> (std::path::PathBuf, std::path::PathBuf, KeyFile
 }
 
 fn configure_remote(repo: &Path, storage: &Path, key_path: &Path) {
-    let url = format!("e2ee::{}", storage.display());
+    let url = format!("e2ee::dir:{}", storage.display());
     git(repo, &["remote", "add", "private", &url], false);
     git(
         repo,
@@ -90,7 +90,7 @@ fn clone_remote(destination: &Path, storage: &Path, key_path: &Path) {
             &format!("e2ee.key={}", key_path.display()),
             "clone",
             "-q",
-            &format!("e2ee::{}", storage.display()),
+            &format!("e2ee::dir:{}", storage.display()),
         ])
         .arg(destination);
     add_helper_to_path(&mut command);
@@ -465,7 +465,7 @@ fn relative_clone_paths_keep_working_inside_the_clone() {
         "e2ee.key=repository.key.json",
         "clone",
         "-q",
-        "e2ee::storage",
+        "e2ee::dir:storage",
         "clone",
     ]);
     add_helper_to_path(&mut command);
@@ -483,7 +483,7 @@ fn relative_clone_paths_keep_working_inside_the_clone() {
         &["config", "--get", "remote.origin.e2ee-key"],
         false,
     );
-    let storage_url = configured_url.strip_prefix("e2ee::").unwrap();
+    let storage_url = configured_url.strip_prefix("e2ee::dir:").unwrap();
     assert!(Path::new(storage_url).is_absolute(), "{configured_url}");
     assert!(Path::new(&configured_key).is_absolute(), "{configured_key}");
     assert_eq!(

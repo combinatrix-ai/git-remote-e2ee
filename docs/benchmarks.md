@@ -68,7 +68,7 @@ The sections below record earlier runs and the investigation that led here.
 
 This compares plain Git over `file://` with `--no-local`, `git-remote-gcrypt`
 using its Git backend (`gcrypt::file://...`), and E2EE using its carrier-Git
-backend (`e2ee::git+file://...`). Initial encryption is a separate local
+backend (`e2ee::file://...`). Initial encryption is a separate local
 backend baseline: plain Git pushes to a local bare repository, while gcrypt
 and E2EE use their local-directory backends.
 
