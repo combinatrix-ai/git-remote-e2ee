@@ -1025,21 +1025,13 @@ impl GitStorage {
         }
     }
 
-    fn head_at_commit(&self, commit: Option<&str>) -> Result<Option<String>> {
-        let Some(commit) = commit else {
-            return Ok(None);
-        };
-        let output = carrier_git_command()
-            .arg("-C")
-            .arg(self.root())
-            .args(["show", &format!("{commit}:HEAD")])
-            .output()?;
-        if !output.status.success() {
-            return Ok(None);
-        }
-        let value = String::from_utf8(output.stdout)?.trim().to_owned();
-        validate_id(&value)?;
-        Ok(Some(value))
+    /// The manifest ID a conflicting remote tip names, for diagnostics only:
+    /// a tip whose HEAD is missing or malformed still wins the conflict.
+    fn conflicting_head(&self, commit: Option<&str>) -> Option<String> {
+        let bytes = self.head_bytes_at_commit(commit?).ok()??;
+        let value = String::from_utf8(bytes).ok()?.trim().to_owned();
+        validate_id(&value).ok()?;
+        Some(value)
     }
 
     fn head_bytes_at_commit(&self, commit: &str) -> Result<Option<Vec<u8>>> {
@@ -1198,14 +1190,36 @@ impl GitStorage {
         Ok(true)
     }
 
+    /// Publishes `next` on top of `base_commit`. On failure the checkout is
+    /// restored to `base_commit`, so later reads through this storage never
+    /// see an unpublished HEAD and later publications never carry it.
     fn publish_checkout_head(
         &self,
         next: &str,
         expected: Option<String>,
-        genesis: bool,
+        base_commit: &Option<String>,
         cache: &mut CarrierCache,
     ) -> Result<String> {
-        self.write_checkout_head(next, genesis)?;
+        let result = self.commit_and_push_head(next, expected, base_commit, cache);
+        if let Err(error) = result {
+            return Err(match self.restore_checkout(base_commit) {
+                Ok(()) => error,
+                Err(restore) => error.context(format!(
+                    "restoring the carrier checkout after a failed publication also failed: {restore:#}"
+                )),
+            });
+        }
+        result
+    }
+
+    fn commit_and_push_head(
+        &self,
+        next: &str,
+        expected: Option<String>,
+        base_commit: &Option<String>,
+        cache: &mut CarrierCache,
+    ) -> Result<String> {
+        self.write_checkout_head(next, base_commit.is_none())?;
         let add_timer = trace::Span::new("carrier_git_add");
         stage_carrier_checkout(self.root(), &cache.path.join("objects"))?;
         drop(add_timer);
@@ -1225,17 +1239,78 @@ impl GitStorage {
             .args(["push", "--quiet", "origin"])
             .arg(format!("HEAD:refs/heads/{}", self.branch))
             .output()?;
-        if !push.status.success() {
-            let latest = cache.refresh(&self.remote, &self.branch)?;
-            return Err(CasConflict {
-                expected,
-                actual: self.head_at_commit(latest.as_deref())?,
-            }
-            .into());
-        }
         drop(push_timer);
+        if !push.status.success() {
+            let push_error = anyhow::anyhow!(
+                "git push carrier branch failed: {}",
+                String::from_utf8_lossy(&push.stderr).trim()
+            );
+            // Only an observed move of the remote tip is a lost race; a push
+            // refused for any other reason leaves the tip at `base_commit`.
+            let Ok(latest) = cache.refresh(&self.remote, &self.branch) else {
+                return Err(push_error);
+            };
+            if latest.as_deref() != Some(new_commit.as_str()) {
+                if latest == *base_commit {
+                    return Err(push_error);
+                }
+                return Err(CasConflict {
+                    expected,
+                    actual: self.conflicting_head(latest.as_deref()),
+                }
+                .into());
+            }
+        }
         cache.update_published_tip(&new_commit)?;
         Ok(new_commit)
+    }
+
+    /// Points the local branch and index back at `base_commit` and removes
+    /// every working-tree file the failed publication added or changed.
+    fn restore_checkout(&self, base_commit: &Option<String>) -> Result<()> {
+        let root = self.root();
+        let local_ref = format!("refs/heads/{}", self.branch);
+        match base_commit {
+            Some(commit) => {
+                git_command(root, &["update-ref", &local_ref, commit])?;
+                git_command(root, &["read-tree", commit])?;
+            }
+            None => {
+                if git_rev_parse(root, &local_ref)?.is_some() {
+                    git_command(root, &["update-ref", "-d", &local_ref])?;
+                }
+                git_command(root, &["read-tree", "--empty"])?;
+            }
+        }
+        // The checkout is sparse: a missing HEAD file falls back to the
+        // committed one.
+        match fs::remove_file(root.join("HEAD")) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+            _ => {}
+        }
+        let untracked = carrier_git_command()
+            .arg("-C")
+            .arg(root)
+            .args([
+                "ls-files",
+                "--others",
+                "-z",
+                "--",
+                "README.md",
+                "FORMAT",
+                "manifests",
+                "packs",
+            ])
+            .output()?;
+        ensure_git_success(&untracked, "git ls-files carrier checkout")?;
+        for path in untracked.stdout.split(|byte| *byte == 0) {
+            if path.is_empty() {
+                continue;
+            }
+            let path = std::str::from_utf8(path).context("carrier checkout path is not UTF-8")?;
+            fs::remove_file(root.join(path))?;
+        }
+        Ok(())
     }
 }
 
@@ -1295,7 +1370,7 @@ impl Storage for GitStorage {
         if remote_tip != state.base_commit {
             return Err(CasConflict {
                 expected: expected.map(ToOwned::to_owned),
-                actual: self.head_at_commit(remote_tip.as_deref())?,
+                actual: self.conflicting_head(remote_tip.as_deref()),
             }
             .into());
         }
@@ -1313,7 +1388,7 @@ impl Storage for GitStorage {
         let new_commit = self.publish_checkout_head(
             next,
             expected.map(ToOwned::to_owned),
-            state.base_commit.is_none(),
+            &state.base_commit,
             &mut cache,
         )?;
         state.base_commit = Some(new_commit);
@@ -1360,7 +1435,7 @@ impl Storage for GitStorage {
         if remote_tip != expected_tip {
             return Err(CasConflict {
                 expected: observed.head_id.clone(),
-                actual: self.head_at_commit(remote_tip.as_deref())?,
+                actual: self.conflicting_head(remote_tip.as_deref()),
             }
             .into());
         }
@@ -1381,12 +1456,8 @@ impl Storage for GitStorage {
         if actual_bytes.is_none() {
             self.refuse_foreign_branch(&expected_tip)?;
         }
-        let new_commit = self.publish_checkout_head(
-            next,
-            observed.head_id.clone(),
-            expected_tip.is_none(),
-            &mut cache,
-        )?;
+        let new_commit =
+            self.publish_checkout_head(next, observed.head_id.clone(), &expected_tip, &mut cache)?;
         state.base_commit = Some(new_commit);
         Ok(())
     }
