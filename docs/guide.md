@@ -38,7 +38,8 @@ helper saves the absolute form in the remote's configuration.
 
 ## Keys
 
-`git-e2ee keygen` writes a private device key file. The first key created for a
+`git-e2ee keygen` writes a private device key file, by default to
+`$XDG_CONFIG_HOME/git-e2ee/keys/<repository-root>.json`. The first key created for a
 repository is its administrator. The key path is stored only in local Git
 configuration. The key file is never written to the encrypted remote and must
 never be committed.
@@ -61,17 +62,20 @@ Any ordinary Git repository can carry the ciphertext: GitHub, GitLab, or a bare
 repository. It may be empty or contain unrelated branches. `git-remote-e2ee`
 uses its own `git-remote-e2ee` branch.
 
-```console
-git-e2ee keygen --output /safe/place/carrier.key.json
-git-e2ee carrier-init \
-  --remote https://git.example/user/encrypted-carrier.git \
-  --key /safe/place/carrier.key.json
+Run `init` inside the repository you want to protect:
 
-git remote add private \
-  'e2ee::https://git.example/user/encrypted-carrier.git'
-git config remote.private.e2ee-key /safe/place/carrier.key.json
-git push -u private main
+```console
+git-e2ee init https://git.example/user/encrypted-carrier.git
+git push -u origin main
 ```
+
+`init` creates an administrator key at
+`$XDG_CONFIG_HOME/git-e2ee/keys/<repository-root>.json` (default `~/.config`),
+initializes the storage, adds it as the Git remote `origin`, and records the key
+as `remote.origin.e2ee-key`. If `origin` already exists, `init` stops before
+creating anything; pick another name with `--name private`. Pass
+`--key <path>` to use an existing key or to create the new key elsewhere. Run
+outside a Git repository, `init` only creates the key and the storage.
 
 The carrier holds only this outer structure:
 
@@ -104,14 +108,8 @@ and metadata only: no keys, plaintext, or decrypted data.
 A local or mounted directory can hold the encrypted repository:
 
 ```console
-git-e2ee keygen --output /safe/place/repository.key.json
-git-e2ee init \
-  --storage /srv/encrypted/example \
-  --key /safe/place/repository.key.json
-
-git remote add private 'e2ee::dir:/srv/encrypted/example'
-git config remote.private.e2ee-key /safe/place/repository.key.json
-git push -u private main
+git-e2ee init e2ee::dir:/srv/encrypted/example
+git push -u origin main
 ```
 
 Do not point two machines at the same directory through a file-sync service.
@@ -123,7 +121,7 @@ service does not provide across machines. Use the carrier-Git backend instead.
 Supply the key path once:
 
 ```console
-git -c e2ee.key=/safe/place/carrier.key.json clone \
+git -c e2ee.key=/safe/place/notes.key.json clone \
   'e2ee::https://git.example/user/encrypted-carrier.git'
 ```
 
@@ -138,18 +136,23 @@ Substitute the repository root printed by A's `keygen`.
 
 ```console
 # Machine B
-git-e2ee keygen \
-  --repository-root <repository-root> \
-  --output /safe/place/machine-b.key.json
+git-e2ee keygen --repository-root <repository-root>
 git-e2ee device-export \
-  --key /safe/place/machine-b.key.json \
+  --key ~/.config/git-e2ee/keys/<repository-root>.json \
   --output machine-b.public.json
 
-# Machine A, after receiving only machine-b.public.json
-git-e2ee device-add \
-  --remote https://git.example/user/encrypted-carrier.git \
-  --key /safe/place/carrier.key.json \
-  --device machine-b.public.json
+# Machine A, inside its clone, after receiving only machine-b.public.json
+git-e2ee device-add origin machine-b.public.json
+```
+
+Commands that act on existing storage (`verify`, `device-add`, `device-list`,
+`device-revoke`, `recover`) take a target. Inside a clone it can be a Git remote
+name such as `origin`, and the URL and key come from that remote's
+configuration. Anywhere, it can be a storage URL with `--key`:
+
+```console
+git-e2ee device-list e2ee::https://git.example/user/encrypted-carrier.git \
+  --key /safe/place/notes.key.json
 ```
 
 Machine B can then clone with its own key, as shown above.
@@ -157,19 +160,14 @@ Machine B can then clone with its own key, as shown above.
 `device-add --role` grants one of three roles: `read` can clone, fetch, and
 pull; `write` adds push access; and `admin` also allows device membership
 changes. The default is `write`. For example, add a read-only device with
-`--role read`. `device-list` prints the same role names. For the directory
-backend, use `--storage <directory>` instead of `--remote <carrier-url>` with
-`device-add`, `device-list`, and `device-revoke`.
+`--role read`. `device-list` prints the same role names.
 
 ## Revoke a device
 
 `git-e2ee device-list` prints opaque device IDs. Revoke one with:
 
 ```console
-git-e2ee device-revoke \
-  --remote https://git.example/user/encrypted-carrier.git \
-  --key /safe/place/carrier.key.json \
-  --device-id <device-id>
+git-e2ee device-revoke origin <device-id>
 ```
 
 Adding or revoking a device publishes a fresh generation key in a single
@@ -195,13 +193,10 @@ known good state for that remote. The default command prints a report and does
 not publish or advance the continuity floor:
 
 ```console
-git-e2ee recover \
-  --remote https://git.example/user/encrypted-carrier.git \
-  --key /safe/place/carrier.key.json \
-  --repo /work/my-clone
+cd /work/my-clone
+git-e2ee recover origin
 ```
 
-For a directory backend, use `--storage <directory>` instead of `--remote`.
 The local floor is read from
 `<repo>/.git/git-remote-e2ee/<repository-root>/state.json`; use a repository
 that previously fetched or pushed. The remote name does not matter. A fresh clone has no floor,
@@ -218,11 +213,7 @@ report but cannot publish recovery.
 To publish from the default base, add `--publish`:
 
 ```console
-git-e2ee recover \
-  --remote https://git.example/user/encrypted-carrier.git \
-  --key /safe/place/carrier.key.json \
-  --repo /work/my-clone \
-  --publish
+git-e2ee recover origin --publish
 ```
 
 The default base is the newest authenticated descendant found after the local

@@ -1,6 +1,7 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command as Process;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use git_remote_e2ee::crypto::{KeyFile, PublicDevice};
@@ -9,6 +10,7 @@ use git_remote_e2ee::repository::{
     EncryptedRepository, RecoveryOptions, RecoveryReport, admin_state_path,
 };
 use git_remote_e2ee::storage::{FilesystemStorage, GitStorage};
+use git_remote_e2ee::url::StorageUrl;
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -34,32 +36,82 @@ impl From<DeviceRole> for DeviceRoles {
     }
 }
 
+/// Commands that act on existing storage take a TARGET: a Git remote name such
+/// as `origin`, whose URL and key come from Git config, or a storage URL such
+/// as `e2ee::https://host/you/repo.git` or `e2ee::dir:/srv/repo`.
 #[derive(Subcommand)]
 enum Command {
+    /// Create a private device key
     Keygen {
+        /// Defaults to $XDG_CONFIG_HOME/git-e2ee/keys/<repository-root>.json
         #[arg(long)]
-        output: PathBuf,
+        output: Option<PathBuf>,
+        /// Create a key for another device of an existing repository
         #[arg(long)]
         repository_root: Option<String>,
     },
+    /// Write the public half of a device key, to send to an administrator
     DeviceExport {
         #[arg(long)]
         key: PathBuf,
         #[arg(long)]
         output: PathBuf,
     },
+    /// Initialize encrypted storage; inside a Git repository, also add it as a remote
     Init {
+        /// Storage URL, for example https://host/you/repo.git or e2ee::dir:/srv/repo
+        url: String,
+        /// Key to use; created there if missing. Defaults to a new key under
+        /// $XDG_CONFIG_HOME/git-e2ee/keys/
         #[arg(long)]
-        storage: PathBuf,
-        #[arg(long)]
-        key: PathBuf,
+        key: Option<PathBuf>,
+        /// Name of the Git remote to add
+        #[arg(long, default_value = "origin")]
+        name: String,
     },
-    CarrierInit {
+    /// Check the whole manifest chain and every pack
+    Verify {
+        target: String,
         #[arg(long)]
-        remote: String,
-        #[arg(long)]
-        key: PathBuf,
+        key: Option<PathBuf>,
     },
+    DeviceAdd {
+        target: String,
+        /// Public device file from `git-e2ee device-export`
+        device: PathBuf,
+        #[arg(long, value_enum, default_value = "write")]
+        role: DeviceRole,
+        #[arg(long)]
+        key: Option<PathBuf>,
+    },
+    DeviceRevoke {
+        target: String,
+        device_id: String,
+        #[arg(long)]
+        key: Option<PathBuf>,
+    },
+    DeviceList {
+        target: String,
+        #[arg(long)]
+        key: Option<PathBuf>,
+    },
+    Recover {
+        target: String,
+        #[arg(long)]
+        key: Option<PathBuf>,
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        #[arg(long)]
+        publish: bool,
+        #[arg(long, requires = "publish")]
+        base: Option<String>,
+        #[arg(long, requires = "publish")]
+        discard_newer: bool,
+        #[arg(long, requires = "publish")]
+        accept_stale_floor: bool,
+    },
+    /// Push without the remote helper; kept for benchmarks
+    #[command(hide = true)]
     Push {
         #[arg(long)]
         storage: PathBuf,
@@ -72,6 +124,8 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Fetch without the remote helper; kept for benchmarks
+    #[command(hide = true)]
     Fetch {
         #[arg(long)]
         storage: PathBuf,
@@ -82,60 +136,60 @@ enum Command {
         #[arg(long, default_value = "origin")]
         remote_name: String,
     },
-    Verify {
-        #[arg(long)]
-        storage: PathBuf,
-        #[arg(long)]
-        key: PathBuf,
-    },
-    DeviceAdd {
-        #[arg(long, conflicts_with = "remote", required_unless_present = "remote")]
-        storage: Option<PathBuf>,
-        #[arg(long, conflicts_with = "storage", required_unless_present = "storage")]
-        remote: Option<String>,
-        #[arg(long)]
-        key: PathBuf,
-        #[arg(long)]
-        device: PathBuf,
-        #[arg(long, value_enum, default_value = "write")]
-        role: DeviceRole,
-    },
-    DeviceRevoke {
-        #[arg(long, conflicts_with = "remote", required_unless_present = "remote")]
-        storage: Option<PathBuf>,
-        #[arg(long, conflicts_with = "storage", required_unless_present = "storage")]
-        remote: Option<String>,
-        #[arg(long)]
-        key: PathBuf,
-        #[arg(long)]
-        device_id: String,
-    },
-    DeviceList {
-        #[arg(long, conflicts_with = "remote", required_unless_present = "remote")]
-        storage: Option<PathBuf>,
-        #[arg(long, conflicts_with = "storage", required_unless_present = "storage")]
-        remote: Option<String>,
-        #[arg(long)]
-        key: PathBuf,
-    },
-    Recover {
-        #[arg(long, conflicts_with = "remote", required_unless_present = "remote")]
-        storage: Option<PathBuf>,
-        #[arg(long, conflicts_with = "storage", required_unless_present = "storage")]
-        remote: Option<String>,
-        #[arg(long)]
-        key: PathBuf,
-        #[arg(long, default_value = ".")]
-        repo: PathBuf,
-        #[arg(long)]
-        publish: bool,
-        #[arg(long, requires = "publish")]
-        base: Option<String>,
-        #[arg(long, requires = "publish")]
-        discard_newer: bool,
-        #[arg(long, requires = "publish")]
-        accept_stale_floor: bool,
-    },
+}
+
+struct Target {
+    storage: StorageUrl,
+    key: PathBuf,
+}
+
+impl Target {
+    fn resolve(target: &str, key: Option<PathBuf>) -> Result<Self> {
+        let configured = if target.starts_with("e2ee::") {
+            None
+        } else {
+            git_config(&format!("remote.{target}.url"), false)?
+        };
+        let (url, configured_key) = match configured {
+            Some(url) if url.starts_with("e2ee::") => {
+                let key = git_config(&format!("remote.{target}.e2ee-key"), true)?;
+                (url, key.map(PathBuf::from))
+            }
+            Some(url) => bail!("Git remote {target} is not an e2ee:: remote ({url})"),
+            None if target.starts_with("e2ee::") || target.contains(['/', ':']) => {
+                (target.to_owned(), None)
+            }
+            None => bail!(
+                "no Git remote named {target}; give a storage URL such as e2ee::https://host/you/repo.git"
+            ),
+        };
+        let key = key
+            .or(configured_key)
+            .with_context(|| format!("no key configured for {target}; pass --key <path>"))?;
+        Ok(Self {
+            storage: StorageUrl::parse(&url)?,
+            key,
+        })
+    }
+}
+
+/// Opens the target's storage with its key and evaluates `$body` with the
+/// repository bound to `$repository`, whichever backend the URL names.
+macro_rules! with_repository {
+    ($target:expr, |$repository:ident| $body:expr) => {{
+        let target: &Target = $target;
+        let key = KeyFile::read(&target.key)?;
+        match &target.storage {
+            StorageUrl::Directory(path) => {
+                let $repository = EncryptedRepository::new(FilesystemStorage::new(path), key);
+                $body
+            }
+            StorageUrl::Git(remote) => {
+                let $repository = EncryptedRepository::new(GitStorage::open(remote)?, key);
+                $body
+            }
+        }
+    }};
 }
 
 fn main() -> Result<()> {
@@ -148,6 +202,10 @@ fn main() -> Result<()> {
             let key = match repository_root {
                 Some(root) => KeyFile::generate_for_repository(root)?,
                 None => KeyFile::generate(),
+            };
+            let output = match output {
+                Some(path) => path,
+                None => default_key_path(&key.repository_root)?,
             };
             key.write_new(&output)?;
             println!(
@@ -165,44 +223,48 @@ fn main() -> Result<()> {
                 output.display()
             );
         }
-        Command::Init { storage, key } => {
-            let pin = admin_pin_path(&key)?;
-            let repository = open_repository(storage, key)?;
-            let head = repository.initialize()?;
-            repository.pin_admin_state(&pin)?;
-            println!("{head}");
+        Command::Init { url, key, name } => {
+            let storage = StorageUrl::parse(&url)?;
+            let in_repository = inside_git_repository()?;
+            if in_repository && git_config(&format!("remote.{name}.url"), false)?.is_some() {
+                bail!("Git remote {name} already exists; choose another name with --name")
+            }
+            let key = match key {
+                Some(path) if path.exists() => path,
+                requested => {
+                    let generated = KeyFile::generate();
+                    let path = match requested {
+                        Some(path) => path,
+                        None => default_key_path(&generated.repository_root)?,
+                    };
+                    generated.write_new(&path)?;
+                    println!("created key {} (administrator)", path.display());
+                    path
+                }
+            };
+            let target = Target {
+                storage,
+                key: std::path::absolute(key)?,
+            };
+            let pin = admin_pin_path(&target.key)?;
+            with_repository!(&target, |repository| {
+                repository.initialize()?;
+                repository.pin_admin_state(&pin)?;
+            });
+            println!("initialized {}", target.storage);
+            if in_repository {
+                run_git(&["remote", "add", &name, &target.storage.to_string()])?;
+                run_git(&[
+                    "config",
+                    &format!("remote.{name}.e2ee-key"),
+                    &target.key.to_string_lossy(),
+                ])?;
+                println!("added remote {name}");
+            }
         }
-        Command::CarrierInit { remote, key } => {
-            let pin = admin_pin_path(&key)?;
-            let repository =
-                EncryptedRepository::new(GitStorage::open(&remote)?, KeyFile::read(&key)?);
-            let head = repository.initialize()?;
-            repository.pin_admin_state(&pin)?;
-            println!("{head}");
-        }
-        Command::Push {
-            storage,
-            key,
-            repo,
-            reference,
-            force,
-        } => {
-            let repository = open_repository(storage, key)?;
-            println!("{}", repository.push_ref(&repo, &reference, force)?);
-        }
-        Command::Fetch {
-            storage,
-            key,
-            repo,
-            remote_name,
-        } => {
-            let repository = open_repository(storage, key)?;
-            let manifest = repository.fetch_into(&repo, &remote_name)?;
-            println!("fetched generation {}", manifest.generation);
-        }
-        Command::Verify { storage, key } => {
-            let repository = open_repository(storage, key)?;
-            let manifest = repository.verify()?;
+        Command::Verify { target, key } => {
+            let target = Target::resolve(&target, key)?;
+            let manifest = with_repository!(&target, |repository| repository.verify()?);
             println!(
                 "verified generation {} ({} refs, {} packs)",
                 manifest.generation,
@@ -211,65 +273,36 @@ fn main() -> Result<()> {
             );
         }
         Command::DeviceAdd {
-            storage,
-            remote,
-            key,
+            target,
             device,
             role,
+            key,
         } => {
-            let pin = admin_pin_path(&key)?;
+            let target = Target::resolve(&target, key)?;
+            let pin = admin_pin_path(&target.key)?;
             let public = PublicDevice::read(&device)?;
             let device_id = public.device_id.clone();
             let roles = DeviceRoles::from(role);
-            let (manifest, policy) = match (storage, remote) {
-                (Some(storage), None) => {
-                    EncryptedRepository::new(FilesystemStorage::new(storage), KeyFile::read(&key)?)
-                        .add_device(public, roles, &pin)?
-                }
-                (None, Some(remote)) => {
-                    EncryptedRepository::new(GitStorage::open(&remote)?, KeyFile::read(&key)?)
-                        .add_device(public, roles, &pin)?
-                }
-                _ => unreachable!("clap requires exactly one backend"),
-            };
+            let (manifest, policy) = with_repository!(&target, |repository| {
+                repository.add_device(public, roles, &pin)?
+            });
             println!("added {device_id}; manifest {manifest}; policy {policy}");
         }
         Command::DeviceRevoke {
-            storage,
-            remote,
-            key,
+            target,
             device_id,
+            key,
         } => {
-            let pin = admin_pin_path(&key)?;
-            let (manifest, policy) = match (storage, remote) {
-                (Some(storage), None) => {
-                    EncryptedRepository::new(FilesystemStorage::new(storage), KeyFile::read(&key)?)
-                        .revoke_device(&device_id, &pin)?
-                }
-                (None, Some(remote)) => {
-                    EncryptedRepository::new(GitStorage::open(&remote)?, KeyFile::read(&key)?)
-                        .revoke_device(&device_id, &pin)?
-                }
-                _ => unreachable!("clap requires exactly one backend"),
-            };
+            let target = Target::resolve(&target, key)?;
+            let pin = admin_pin_path(&target.key)?;
+            let (manifest, policy) = with_repository!(&target, |repository| {
+                repository.revoke_device(&device_id, &pin)?
+            });
             println!("revoked {device_id}; manifest {manifest}; policy {policy}");
         }
-        Command::DeviceList {
-            storage,
-            remote,
-            key,
-        } => {
-            let devices = match (storage, remote) {
-                (Some(storage), None) => {
-                    EncryptedRepository::new(FilesystemStorage::new(storage), KeyFile::read(&key)?)
-                        .list_devices()?
-                }
-                (None, Some(remote)) => {
-                    EncryptedRepository::new(GitStorage::open(&remote)?, KeyFile::read(&key)?)
-                        .list_devices()?
-                }
-                _ => unreachable!("clap requires exactly one backend"),
-            };
+        Command::DeviceList { target, key } => {
+            let target = Target::resolve(&target, key)?;
+            let devices = with_repository!(&target, |repository| repository.list_devices()?);
             for device in devices {
                 println!(
                     "{} role={} status={}",
@@ -280,8 +313,7 @@ fn main() -> Result<()> {
             }
         }
         Command::Recover {
-            storage,
-            remote,
+            target,
             key,
             repo,
             publish,
@@ -289,27 +321,91 @@ fn main() -> Result<()> {
             discard_newer,
             accept_stale_floor,
         } => {
-            let key = KeyFile::read(&key)?;
+            let target = Target::resolve(&target, key)?;
             let options = RecoveryOptions {
                 publish,
                 base: base.as_deref(),
                 discard_newer,
                 accept_stale_floor,
             };
-            let report = match (storage, remote) {
-                (Some(storage), None) => {
-                    EncryptedRepository::new(FilesystemStorage::new(storage), key)
-                        .recover(&repo, options)?
-                }
-                (None, Some(remote)) => EncryptedRepository::new(GitStorage::open(&remote)?, key)
-                    .recover(&repo, options)?,
-                _ => unreachable!("clap requires exactly one backend"),
-            };
+            let report =
+                with_repository!(&target, |repository| repository.recover(&repo, options)?);
             print_recovery_report(&report);
-            if publish && let Some(reason) = report.blocked_reason.as_deref() {
-                bail!("recovery refused: {reason}")
-            }
         }
+        Command::Push {
+            storage,
+            key,
+            repo,
+            reference,
+            force,
+        } => {
+            let repository =
+                EncryptedRepository::new(FilesystemStorage::new(storage), KeyFile::read(&key)?);
+            println!("{}", repository.push_ref(&repo, &reference, force)?);
+        }
+        Command::Fetch {
+            storage,
+            key,
+            repo,
+            remote_name,
+        } => {
+            let repository =
+                EncryptedRepository::new(FilesystemStorage::new(storage), KeyFile::read(&key)?);
+            let manifest = repository.fetch_into(&repo, &remote_name)?;
+            println!("fetched generation {}", manifest.generation);
+        }
+    }
+    Ok(())
+}
+
+fn default_key_path(repository_root: &str) -> Result<PathBuf> {
+    let config_home = match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(path) if !path.is_empty() => PathBuf::from(path),
+        _ => PathBuf::from(
+            std::env::var_os("HOME").context("HOME is unset and XDG_CONFIG_HOME is unset")?,
+        )
+        .join(".config"),
+    };
+    let directory = config_home.join("git-e2ee/keys");
+    std::fs::create_dir_all(&directory)
+        .with_context(|| format!("create {}", directory.display()))?;
+    Ok(directory.join(format!("{repository_root}.json")))
+}
+
+fn admin_pin_path(key: &Path) -> Result<PathBuf> {
+    admin_state_path(&KeyFile::read(key)?.repository_root)
+}
+
+fn inside_git_repository() -> Result<bool> {
+    Ok(Process::new("git")
+        .args(["rev-parse", "--git-dir"])
+        .output()?
+        .status
+        .success())
+}
+
+fn git_config(key: &str, path: bool) -> Result<Option<String>> {
+    let mut command = Process::new("git");
+    command.arg("config");
+    if path {
+        command.arg("--path");
+    }
+    let output = command.args(["--get", key]).output()?;
+    if output.status.success() {
+        Ok(Some(String::from_utf8(output.stdout)?.trim().to_owned()))
+    } else {
+        Ok(None)
+    }
+}
+
+fn run_git(args: &[&str]) -> Result<()> {
+    let output = Process::new("git").args(args).output()?;
+    if !output.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
     }
     Ok(())
 }
@@ -386,20 +482,6 @@ fn role_name(roles: &DeviceRoles) -> &'static str {
     }
 }
 
-fn admin_pin_path(key: &std::path::Path) -> Result<PathBuf> {
-    admin_state_path(&KeyFile::read(key)?.repository_root)
-}
-
-fn open_repository(
-    storage: PathBuf,
-    key: PathBuf,
-) -> Result<EncryptedRepository<FilesystemStorage>> {
-    Ok(EncryptedRepository::new(
-        FilesystemStorage::new(storage),
-        KeyFile::read(&key)?,
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use clap::Parser;
@@ -412,8 +494,7 @@ mod tests {
         let cli = Cli::try_parse_from([
             "git-e2ee",
             "recover",
-            "--storage",
-            "/tmp/carrier",
+            "e2ee::dir:/tmp/storage",
             "--key",
             "/tmp/key.json",
         ])
@@ -431,24 +512,12 @@ mod tests {
         }
 
         assert!(
-            Cli::try_parse_from([
-                "git-e2ee",
-                "recover",
-                "--storage",
-                "/tmp/carrier",
-                "--key",
-                "/tmp/key.json",
-                "--discard-newer",
-            ])
-            .is_err()
+            Cli::try_parse_from(["git-e2ee", "recover", "origin", "--discard-newer",]).is_err()
         );
         let cli = Cli::try_parse_from([
             "git-e2ee",
             "recover",
-            "--remote",
-            "carrier.git",
-            "--key",
-            "key.json",
+            "e2ee::https://host/carrier.git",
             "--publish",
             "--base",
             "deadbeef",

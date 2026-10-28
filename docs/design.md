@@ -383,7 +383,7 @@ require the current tip to be a single-parent child of it.
 
 ### Current implementation
 
-`git-e2ee recover` accepts `--remote <carrier-url>` or `--storage <directory>`,
+`git-e2ee recover` takes a target (a Git remote name or a storage URL),
 plus `--key` and `--repo`. The repository defaults to `.`; the continuity floor
 is read from `.git/git-remote-e2ee/<repository-root>/state.json`, where the root
 comes from the key file. Without `--publish`, the command

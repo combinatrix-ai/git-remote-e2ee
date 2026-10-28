@@ -38,6 +38,7 @@ fi
 
 work_parent=${TMPDIR:-/tmp}
 work=$(mktemp -d "$work_parent/git-remote-e2ee-bench.XXXXXX")
+export XDG_STATE_HOME="$work/xdg-state" XDG_CONFIG_HOME="$work/xdg-config"
 cleanup() {
   if [[ ${BENCH_KEEP_WORK:-0} == 1 ]]; then
     echo "benchmark work directory retained at $work" >&2
@@ -132,7 +133,7 @@ git -C "$work/source" remote remove origin
 
 mkdir -p "$work/storage"
 "$git_e2ee" keygen --output "$work/repository.key.json" >/dev/null
-"$git_e2ee" init --storage "$work/storage" --key "$work/repository.key.json" >/dev/null
+(cd "$work" && "$git_e2ee" init "e2ee::dir:$work/storage" --key "$work/repository.key.json" >/dev/null)
 
 run_phase initial_push "$git_e2ee" push \
   --storage "$work/storage" --key "$work/repository.key.json" \
@@ -147,7 +148,7 @@ run_phase fresh_fetch "$git_e2ee" fetch \
   --storage "$work/storage" --key "$work/repository.key.json" \
   --repo "$work/destination" --remote-name benchmark
 run_phase verify "$git_e2ee" verify \
-  --storage "$work/storage" --key "$work/repository.key.json"
+  "e2ee::dir:$work/storage" --key "$work/repository.key.json"
 
 old_head=$(git -C "$work/source" rev-parse "$source_ref")
 tree=$(git -C "$work/source" rev-parse "$old_head^{tree}")

@@ -1340,8 +1340,7 @@ fn init_with_relative_storage_creates_the_store_in_the_child_cwd() {
         &work,
         &[
             "init",
-            "--storage",
-            "relative-store",
+            "e2ee::dir:relative-store",
             "--key",
             key_path.to_str().unwrap(),
         ],
@@ -1364,8 +1363,7 @@ fn relative_dotdot_storage_follows_the_filesystem() {
         &nested,
         &[
             "init",
-            "--storage",
-            "../sibling-store",
+            "e2ee::dir:../sibling-store",
             "--key",
             key_path.to_str().unwrap(),
         ],
@@ -1386,8 +1384,7 @@ fn relative_dotdot_storage_follows_the_filesystem() {
             &work,
             &[
                 "init",
-                "--storage",
-                "link/../dotdot-store",
+                "e2ee::dir:link/../dotdot-store",
                 "--key",
                 key_path.to_str().unwrap(),
             ],
