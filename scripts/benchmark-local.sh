@@ -185,7 +185,6 @@ final_storage_logical=$(tree_logical_bytes "$work/storage")
 final_pack_logical=$(tree_logical_bytes "$work/storage/packs")
 final_pack_files=$(find "$work/storage/packs" -type f | wc -l | tr -d ' ')
 manifest_files=$(find "$work/storage/manifests" -type f | wc -l | tr -d ' ')
-policy_files=$(find "$work/storage/policies" -type f | wc -l | tr -d ' ')
 crate_sha=$(git -C "$project_root" rev-parse HEAD)
 if [[ -n $(git -C "$project_root" status --porcelain=v1) ]]; then
   crate_dirty=true
@@ -214,8 +213,7 @@ cat >"$results_dir/summary.json" <<JSON
   "pack_logical_after_incremental_push_bytes": $final_pack_logical,
   "pack_files_after_initial_push": $initial_pack_files,
   "pack_files_after_incremental_push": $final_pack_files,
-  "manifest_files": $manifest_files,
-  "policy_files": $policy_files
+  "manifest_files": $manifest_files
 }
 JSON
 

@@ -142,6 +142,20 @@ fn init_refuses_an_existing_remote_before_creating_anything() {
 }
 
 #[test]
+fn failed_init_removes_the_key_it_created() {
+    let sandbox = Sandbox::new();
+    let url = format!("e2ee::dir:{}", sandbox.path().join("storage").display());
+
+    success(&sandbox.e2ee(sandbox.path(), &["init", &url]));
+    assert_eq!(sandbox.keys().len(), 1);
+
+    let second = sandbox.e2ee(sandbox.path(), &["init", &url]);
+    assert!(!second.status.success());
+    let keys = sandbox.keys();
+    assert_eq!(keys.len(), 1, "{keys:?}");
+}
+
+#[test]
 fn verify_takes_a_carrier_url_outside_a_repository() {
     let sandbox = Sandbox::new();
     let carrier = sandbox.path().join("carrier.git");
