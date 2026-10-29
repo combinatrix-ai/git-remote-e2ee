@@ -15,7 +15,9 @@ use git_remote_e2ee::manifest::{
     unwrap_generation_key, wrap_predecessor_key,
 };
 use git_remote_e2ee::policy::{DeviceRoles, PolicyState};
-use git_remote_e2ee::repository::{EncryptedRepository, RecoveryClass, RecoveryOptions, RefChange};
+use git_remote_e2ee::repository::{
+    EncryptedRepository, PushRejection, RecoveryClass, RecoveryOptions, RefChange,
+};
 use git_remote_e2ee::storage::{CasConflict, GitStorage, ObjectKind, Storage};
 
 static CACHE_ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -474,6 +476,62 @@ fn carrier_git_allows_exactly_one_concurrent_writer() {
         ),
         "2"
     );
+}
+
+#[test]
+fn stale_carrier_views_on_one_machine_refresh_instead_of_reporting_rollback() {
+    let temporary = tempfile::tempdir().unwrap();
+    let _cache = isolated_cache(&temporary);
+    let carrier = temporary.path().join("carrier.git");
+    let source_a = temporary.path().join("source-a");
+    let source_b = temporary.path().join("source-b");
+    let fetched = temporary.path().join("fetched");
+    init_source(&source_a, "writer a");
+    init_source(&source_b, "writer b");
+    git(
+        temporary.path(),
+        &["init", "-q", fetched.to_str().unwrap()],
+        false,
+    );
+    let key = KeyFile::generate();
+    init_carrier(temporary.path(), &carrier, &key);
+    let open = || {
+        EncryptedRepository::new(
+            GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+            key.clone(),
+            support::state_dir(),
+        )
+    };
+    let update = RefChange::Update {
+        source: "refs/heads/main",
+        force: false,
+    };
+
+    let stale_fetch = open();
+    let stale_push_main = open();
+    let stale_push_new = open();
+    open().push(&source_a, "refs/heads/main", update).unwrap();
+    assert_eq!(support::read_floor(&key.repository_root)["generation"], 1);
+
+    let manifest = stale_fetch.fetch_into(&fetched, "private").unwrap();
+    assert_eq!(manifest.generation, 1);
+
+    let error = stale_push_main
+        .push(&source_b, "refs/heads/main", update)
+        .unwrap_err();
+    let rejected_as_fetch_first = error
+        .downcast_ref::<PushRejection>()
+        .is_some_and(|rejection| rejection.git_status() == "fetch first")
+        || error.downcast_ref::<CasConflict>().is_some();
+    assert!(rejected_as_fetch_first, "{error:#}");
+
+    stale_push_new
+        .push(&source_b, "refs/heads/writer-b", update)
+        .unwrap();
+    let manifest = open().verify().unwrap();
+    assert_eq!(manifest.generation, 2);
+    assert!(manifest.refs.contains_key("refs/heads/main"));
+    assert!(manifest.refs.contains_key("refs/heads/writer-b"));
 }
 
 #[test]

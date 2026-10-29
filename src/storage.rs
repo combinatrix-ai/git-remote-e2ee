@@ -93,6 +93,13 @@ pub trait Storage {
     }
 
     fn read_head(&self) -> Result<Option<String>>;
+
+    /// Replaces a cached view of storage with the current one and reports
+    /// whether the head may have changed. Backends that read live need not.
+    fn refresh(&self) -> Result<bool> {
+        Ok(false)
+    }
+
     fn compare_and_swap_head(&self, expected: Option<&str>, next: &str) -> Result<()>;
 
     fn observe_head(&self) -> Result<HeadObservation> {
@@ -1376,6 +1383,21 @@ impl Storage for GitStorage {
         // `open` refreshed the remote before constructing this checkout; CAS
         // refreshes again before trusting this snapshot for a write.
         self.local_head()
+    }
+
+    fn refresh(&self) -> Result<bool> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("carrier state lock poisoned"))?;
+        let mut cache = CarrierCache::lock(&self.remote, &self.branch)?;
+        let remote_tip = cache.refresh(&self.remote, &self.branch)?;
+        if remote_tip == state.base_commit {
+            return Ok(false);
+        }
+        self.restore_checkout(&remote_tip)?;
+        state.base_commit = remote_tip;
+        Ok(true)
     }
 
     fn compare_and_swap_head(&self, expected: Option<&str>, next: &str) -> Result<()> {

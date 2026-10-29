@@ -260,11 +260,21 @@ impl<S: Storage> EncryptedRepository<S> {
     }
 
     /// Authenticates the storage chain and requires it to pass through the
-    /// machine floor.
+    /// machine floor. Another process on this machine may have advanced the
+    /// floor after this storage view was opened, so a view that fails the
+    /// floor is refreshed once before the failure counts as a rollback.
     fn pinned_chain(&self, floor: &FloorGuard) -> Result<Vec<OpenedState>> {
+        let floor = floor.read()?;
         let chain = self.current_chain()?;
-        validate_pinned_head(&chain, floor.read()?.as_ref())?;
-        Ok(chain)
+        match validate_pinned_head(&chain, floor.as_ref()) {
+            Ok(()) => Ok(chain),
+            Err(error) if !self.storage.refresh()? => Err(error),
+            Err(_) => {
+                let chain = self.current_chain()?;
+                validate_pinned_head(&chain, floor.as_ref())?;
+                Ok(chain)
+            }
+        }
     }
 
     pub fn initialize(&self, owner_label: &str) -> Result<String> {
@@ -539,7 +549,7 @@ impl<S: Storage> EncryptedRepository<S> {
     ) -> Result<(OpenedState, Option<String>, bool)> {
         git::ensure_repository(repo)?;
         let ref_kind = git::validate_inner_ref(repo, destination_ref)?;
-        let chain = self.current_chain()?;
+        let chain = self.pinned_chain(floor)?;
         let current = chain.first().context("manifest chain is empty")?.clone();
         let device_id = self.key.device_id()?;
         if !current.policy.is_active_writer(&device_id) {
@@ -548,7 +558,6 @@ impl<S: Storage> EncryptedRepository<S> {
             }
             bail!("device is not an active writer")
         }
-        validate_pinned_head(&chain, floor.read()?.as_ref())?;
         for reference in current.manifest.refs.keys() {
             git::validate_inner_ref(repo, reference)?;
         }
