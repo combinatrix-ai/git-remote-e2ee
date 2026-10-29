@@ -5,7 +5,9 @@ use anyhow::{Context, Result, bail};
 use git_remote_e2ee::continuity::default_state_dir;
 use git_remote_e2ee::crypto::KeyFile;
 use git_remote_e2ee::gitcmd::GitRepository;
-use git_remote_e2ee::repository::{EncryptedRepository, PushRejection, ReadOnlyDevice, RefChange};
+use git_remote_e2ee::repository::{
+    EncryptedRepository, PushMode, PushRejection, ReadOnlyDevice, RefChange, RefOutcome, RefPush,
+};
 use git_remote_e2ee::storage::{CasConflict, FilesystemStorage, GitStorage, Storage};
 use git_remote_e2ee::url::StorageUrl;
 
@@ -146,46 +148,76 @@ fn process_push_batch<S: git_remote_e2ee::storage::Storage>(
         commands.push(line);
     }
 
-    for command in commands {
-        let spec = command
-            .strip_prefix("push ")
-            .expect("validated push command");
-        let (force, spec) = match spec.strip_prefix('+') {
-            Some(spec) => (true, spec),
-            None => (false, spec),
-        };
-        let (source, destination) = spec
-            .split_once(':')
-            .context("push refspec must contain ':'")?;
-        let change = if source.is_empty() {
-            RefChange::Delete
-        } else {
-            RefChange::Update { source, force }
-        };
-        let result = if dry_run {
-            repository.check_push(local_repository, destination, change)
-        } else {
-            repository
-                .push(local_repository, destination, change)
-                .map(drop)
-        };
-        match result {
-            Ok(()) => writeln!(output, "ok {destination}")?,
-            Err(error) if error.is::<ReadOnlyDevice>() => {
-                let message = format!(
-                    "this device is read-only for {remote_name}; ask an administrator for the write role"
-                );
-                writeln!(output, "error {destination} {message}")?;
-                eprintln!("e2ee: {destination}: {message}");
+    let pushes = commands
+        .iter()
+        .map(String::as_str)
+        .map(parse_push)
+        .collect::<Result<Vec<_>>>()?;
+    let mode = if dry_run {
+        PushMode::DryRun
+    } else {
+        PushMode::Publish
+    };
+    match repository.push(local_repository, &pushes, mode) {
+        Err(error) => {
+            for push in &pushes {
+                report_push_error(output, remote_name, push.destination, &error)?;
             }
-            Err(error) => {
-                writeln!(output, "error {destination} {}", push_status(&error))?;
-                eprintln!("e2ee: {destination}: {}", single_line(&error));
+        }
+        Ok(outcome) => {
+            for (push, result) in pushes.iter().zip(&outcome.refs) {
+                match (result, &outcome.publication) {
+                    (RefOutcome::Accepted, Ok(_)) => writeln!(output, "ok {}", push.destination)?,
+                    (RefOutcome::Rejected(error), _) | (RefOutcome::Accepted, Err(error)) => {
+                        report_push_error(output, remote_name, push.destination, error)?
+                    }
+                }
             }
         }
     }
     writeln!(output)?;
     output.flush()?;
+    Ok(())
+}
+
+fn parse_push(command: &str) -> Result<RefPush<'_>> {
+    let spec = command
+        .strip_prefix("push ")
+        .expect("validated push command");
+    let (force, spec) = match spec.strip_prefix('+') {
+        Some(spec) => (true, spec),
+        None => (false, spec),
+    };
+    let (source, destination) = spec
+        .split_once(':')
+        .context("push refspec must contain ':'")?;
+    let change = if source.is_empty() {
+        RefChange::Delete
+    } else {
+        RefChange::Update { source, force }
+    };
+    Ok(RefPush {
+        destination,
+        change,
+    })
+}
+
+fn report_push_error(
+    output: &mut impl Write,
+    remote_name: &str,
+    destination: &str,
+    error: &anyhow::Error,
+) -> Result<()> {
+    if error.is::<ReadOnlyDevice>() {
+        let message = format!(
+            "this device is read-only for {remote_name}; ask an administrator for the write role"
+        );
+        writeln!(output, "error {destination} {message}")?;
+        eprintln!("e2ee: {destination}: {message}");
+    } else {
+        writeln!(output, "error {destination} {}", push_status(error))?;
+        eprintln!("e2ee: {destination}: {}", single_line(error));
+    }
     Ok(())
 }
 
@@ -290,5 +322,20 @@ fn configured_path(local: &GitRepository, key: &str) -> Result<Option<PathBuf>> 
         Ok(Some(String::from_utf8(output.stdout)?.trim().into()))
     } else {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lost_compare_and_swap_is_reported_as_fetch_first() {
+        let error = anyhow::Error::new(CasConflict {
+            expected: Some("a".repeat(64)),
+            actual: Some("b".repeat(64)),
+        })
+        .context("publish manifest");
+        assert_eq!(push_status(&error), "fetch first");
     }
 }

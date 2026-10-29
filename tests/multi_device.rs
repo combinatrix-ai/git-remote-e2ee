@@ -1,7 +1,9 @@
+mod support;
 use git_remote_e2ee::gitcmd::GitRepository;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use support::PushRef;
 
 use git_remote_e2ee::crypto::KeyFile;
 use git_remote_e2ee::policy::DeviceRoles;
@@ -60,7 +62,7 @@ fn two_devices_can_decrypt_and_push_independently() {
     repo_a.initialize("owner").unwrap();
     let first = commit(&source_a, "from a\n", "from a");
     repo_a
-        .push(
+        .push_ref(
             &GitRepository::open(&source_a).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -95,7 +97,7 @@ fn two_devices_can_decrypt_and_push_independently() {
     );
     let second = commit(&source_b, "from b\n", "from b");
     repo_b
-        .push(
+        .push_ref(
             &GitRepository::open(&source_b).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -136,7 +138,7 @@ fn revoked_reader_cannot_reach_later_history_but_keeps_prior_snapshot() {
     repo_a.initialize("owner").unwrap();
     let before = commit(&source, "before revoke\n", "before revoke");
     repo_a
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -147,7 +149,7 @@ fn revoked_reader_cannot_reach_later_history_but_keeps_prior_snapshot() {
         .unwrap();
     let before_tip = commit(&source, "second pack\n", "second pack");
     repo_a
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -191,7 +193,7 @@ fn revoked_reader_cannot_reach_later_history_but_keeps_prior_snapshot() {
 
     let after = commit(&source, "after revoke secret\n", "after revoke");
     repo_a
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -221,7 +223,7 @@ fn revoked_reader_cannot_reach_later_history_but_keeps_prior_snapshot() {
 
     commit(&client_b, "revoked writer\n", "revoked writer");
     let push_error = repo_b
-        .push(
+        .push_ref(
             &GitRepository::open(&client_b).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -319,7 +321,7 @@ fn connected_membership_observation_pins_and_rejects_replay() {
     repository.initialize("owner").unwrap();
     commit(&source, "one\n", "one");
     repository
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -364,7 +366,7 @@ fn connected_membership_observation_pins_and_rejects_replay() {
     fs::write(remote.join("HEAD"), after_membership).unwrap();
     commit(&source, "two\n", "two");
     repository
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {

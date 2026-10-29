@@ -1,5 +1,6 @@
 use git_remote_e2ee::gitcmd::GitRepository;
 mod support;
+use support::PushRef;
 
 use std::env;
 use std::fs;
@@ -254,7 +255,7 @@ fn concurrent_helper_processes_preserve_the_client_state_floor() {
 }
 
 #[test]
-fn native_git_dry_run_does_not_mutate_remote() {
+fn native_git_dry_run_batch_does_not_mutate_remote() {
     let temporary = tempfile::tempdir().unwrap();
     let source = temporary.path().join("source");
     let remote_path = temporary.path().join("remote");
@@ -282,14 +283,11 @@ fn native_git_dry_run_does_not_mutate_remote() {
         false,
     );
 
+    git(&source, &["branch", "feature"], false);
+    git(&source, &["tag", "-a", "v1", "-m", "v1"], false);
     git(
         &source,
-        &[
-            "push",
-            "--dry-run",
-            "private",
-            "refs/heads/main:refs/heads/main",
-        ],
+        &["push", "--dry-run", "private", "main", "feature", "v1"],
         true,
     );
     let manifest = encrypted.verify().unwrap();
@@ -439,7 +437,7 @@ fn native_git_fetch_rejects_same_generation_manifest_fork() {
     );
     fork.initialize("owner").unwrap();
     let fork_head = fork
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -661,5 +659,203 @@ fn native_git_fetch_reimports_packs_after_local_objects_are_pruned() {
             false
         ),
         "second"
+    );
+}
+
+struct Helper {
+    _temporary: tempfile::TempDir,
+    source: std::path::PathBuf,
+    remote_path: std::path::PathBuf,
+    key_path: std::path::PathBuf,
+    encrypted: EncryptedRepository<FilesystemStorage>,
+}
+
+fn helper_repository() -> Helper {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let remote_path = temporary.path().join("remote");
+    let key_path = temporary.path().join("repository.key.json");
+    initialize_git(&source);
+    let key = KeyFile::generate();
+    key.write_new(&key_path).unwrap();
+    let encrypted = EncryptedRepository::new(
+        FilesystemStorage::new(&remote_path),
+        key,
+        support::state_dir(),
+    );
+    encrypted.initialize("owner").unwrap();
+    configure_remote(&source, &remote_path, &key_path);
+    Helper {
+        _temporary: temporary,
+        source,
+        remote_path,
+        key_path,
+        encrypted,
+    }
+}
+
+fn commit_file(repo: &Path, name: &str, contents: &[u8], message: &str) -> String {
+    fs::write(repo.join(name), contents).unwrap();
+    git(repo, &["add", name], false);
+    git(repo, &["commit", "-q", "-m", message], false);
+    git(repo, &["rev-parse", "HEAD"], false)
+}
+
+/// A fresh repository fetching every branch and tag from the helper's storage.
+fn fresh_clone(helper: &Helper) -> std::path::PathBuf {
+    let clone = helper.source.with_file_name("fresh-clone");
+    initialize_git(&clone);
+    configure_remote(&clone, &helper.remote_path, &helper.key_path);
+    git(&clone, &["fetch", "-q", "--tags", "private"], true);
+    clone
+}
+
+#[test]
+fn native_git_push_of_many_refs_publishes_one_generation() {
+    let helper = helper_repository();
+    let source = &helper.source;
+    commit_file(source, "note.md", b"first\n", "first");
+    git(source, &["tag", "light"], false);
+    let main = commit_file(source, "note.md", b"second\n", "second");
+    git(source, &["branch", "feature"], false);
+    git(
+        source,
+        &["tag", "-a", "annotated", "-m", "annotated"],
+        false,
+    );
+    git(source, &["checkout", "-q", "-b", "topic"], false);
+    let topic = commit_file(source, "topic.md", b"topic\n", "topic");
+
+    git(
+        source,
+        &[
+            "push", "-q", "private", "main", "feature", "topic", "--tags",
+        ],
+        true,
+    );
+
+    let manifest = helper.encrypted.verify().unwrap();
+    assert_eq!(manifest.generation, 1);
+    assert_eq!(manifest.total_pack_count, 1);
+    assert_eq!(manifest.refs.len(), 5, "{:?}", manifest.refs);
+    let clone = fresh_clone(&helper);
+    for (reference, expected) in [
+        ("refs/remotes/private/main", &main),
+        ("refs/remotes/private/feature", &main),
+        ("refs/remotes/private/topic", &topic),
+        (
+            "refs/tags/light",
+            &git(source, &["rev-parse", "light"], false),
+        ),
+        (
+            "refs/tags/annotated",
+            &git(source, &["rev-parse", "annotated"], false),
+        ),
+    ] {
+        assert_eq!(&git(&clone, &["rev-parse", reference], false), expected);
+    }
+    git(
+        &clone,
+        &["fsck", "--connectivity-only", "--no-dangling"],
+        false,
+    );
+}
+
+#[test]
+fn helper_push_batch_reports_rejected_refs_and_publishes_the_rest_once() {
+    let helper = helper_repository();
+    let source = &helper.source;
+    commit_file(source, "note.md", b"first\n", "first");
+    git(source, &["tag", "v1"], false);
+    git(source, &["push", "-q", "private", "main", "v1"], true);
+    let parent = helper.encrypted.verify().unwrap();
+
+    git(
+        source,
+        &["commit", "-q", "--amend", "-m", "rewritten"],
+        false,
+    );
+    git(source, &["tag", "-f", "v1"], false);
+    git(source, &["branch", "topic"], false);
+    let url = format!("e2ee::dir:{}", helper.remote_path.display());
+    let output = Command::new(env!("CARGO_BIN_EXE_git-remote-e2ee"))
+        .args(["private", &url])
+        .current_dir(source)
+        .env("XDG_STATE_HOME", support::state_home())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            child.stdin.take().unwrap().write_all(
+                b"push refs/heads/main:refs/heads/main\n\
+                  push refs/tags/v1:refs/tags/v1\n\
+                  push refs/heads/topic:refs/heads/topic\n\n",
+            )?;
+            child.wait_with_output()
+        })
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "error refs/heads/main non-fast forward\n\
+         error refs/tags/v1 already exists\n\
+         ok refs/heads/topic\n\n"
+    );
+
+    let manifest = helper.encrypted.verify().unwrap();
+    assert_eq!(manifest.generation, parent.generation + 1);
+    let mut expected = parent.refs.clone();
+    expected.insert(
+        "refs/heads/topic".to_owned(),
+        git(source, &["rev-parse", "topic"], false),
+    );
+    assert_eq!(manifest.refs, expected);
+}
+
+#[test]
+fn native_git_force_push_packs_only_the_rewritten_commits() {
+    let helper = helper_repository();
+    let source = &helper.source;
+    // Distinct incompressible blobs, so the full history's pack is large.
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    for index in 0..20 {
+        let blob: Vec<u8> = (0..16 * 1024)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect();
+        commit_file(source, &format!("blob-{index}"), &blob, "history");
+    }
+    git(source, &["push", "-q", "private", "main"], true);
+    let history_pack = helper.encrypted.verify().unwrap().new_packs[0].plaintext_size;
+
+    git(source, &["reset", "-q", "--hard", "HEAD~1"], false);
+    let forced = commit_file(source, "note.md", b"rewritten\n", "rewritten");
+    git(source, &["push", "-q", "--force", "private", "main"], true);
+
+    let manifest = helper.encrypted.verify().unwrap();
+    assert_eq!(manifest.generation, 2);
+    let forced_pack = manifest.new_packs[0].plaintext_size;
+    assert!(
+        forced_pack * 50 < history_pack,
+        "force push packed {forced_pack} bytes against a {history_pack}-byte history"
+    );
+    let clone = fresh_clone(&helper);
+    assert_eq!(
+        git(&clone, &["rev-parse", "refs/remotes/private/main"], false),
+        forced
+    );
+    git(
+        &clone,
+        &["fsck", "--connectivity-only", "--no-dangling"],
+        false,
     );
 }
