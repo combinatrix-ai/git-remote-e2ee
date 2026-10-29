@@ -477,7 +477,13 @@ protocol; explicit full verification remains available to check local storage.
 observed storage head as valid, invalid, unverifiable, unsupported, unavailable,
 or discontinuous. Recovery publication is permitted only for an invalid head.
 Unverifiable, unsupported, unavailable, and discontinuous heads MUST never be
-overridden. In particular, a device that cannot open the current envelope
+overridden. A head is invalid only when its content is positively proven bad:
+a content-ID, decryption, key-commitment, or signature failure, malformed
+bytes, or a failed semantic validation. Any other failure MUST be classified
+unverifiable. A manifest or policy whose format version, authorization
+variant, or administrator threshold is unknown is unsupported, and the version
+MUST be read before the full schema so a future schema is not mistaken for
+malformed bytes. In particular, a device that cannot open the current envelope
 MUST NOT recover from an older floor, because the head may be a valid
 revocation. A signer ID extracted before successful signature verification
 MUST be labelled as a claim, not as the signer.
@@ -494,7 +500,11 @@ content ID matches, so a corrupt copy cannot hide an older valid one. Bytes
 read from rejected copies count against the byte budget.
 Discovery MUST report authenticated descendants and replays. If authenticated
 descendants conflict, recovery MUST refuse to choose a fork. A replayed older
-manifest MUST NOT be treated as a newer candidate. Directory storage has no
+manifest MUST NOT be treated as a newer candidate. A historical head in the
+floor's authenticated chain is a replay and MUST be recognised without opening
+it, because a device added after genesis cannot open older generations. Any
+other historical head that is not proven invalid and is not an authenticated
+descendant of the floor MUST block publication. Directory storage has no
 outer history and MUST offer only the pinned floor.
 
 The default base MUST be the newest validated descendant of the floor, or the

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
@@ -64,6 +65,221 @@ impl Storage for OverBudgetHistoryStorage {
             manifests: Default::default(),
         }))
     }
+}
+
+/// Serves a fixed carrier-like outer history over directory storage.
+#[derive(Clone)]
+struct FixedHistoryStorage {
+    inner: FilesystemStorage,
+    heads: Vec<String>,
+    manifests: BTreeMap<String, Vec<u8>>,
+}
+
+impl Storage for FixedHistoryStorage {
+    fn begin_object(&self, kind: ObjectKind) -> Result<Box<dyn ObjectStage>> {
+        self.inner.begin_object(kind)
+    }
+
+    fn open_object(&self, kind: ObjectKind, id: &str) -> Result<Box<dyn Read + Send>> {
+        self.inner.open_object(kind, id)
+    }
+
+    fn read_head(&self) -> Result<Option<String>> {
+        self.inner.read_head()
+    }
+
+    fn compare_and_swap_head(&self, expected: Option<&str>, next: &str) -> Result<()> {
+        self.inner.compare_and_swap_head(expected, next)
+    }
+
+    fn recovery_history(
+        &self,
+        _max_commits: usize,
+        _max_manifest_bytes: u64,
+    ) -> Result<Option<RecoveryHistory>> {
+        Ok(Some(RecoveryHistory {
+            commits: self
+                .heads
+                .iter()
+                .enumerate()
+                .map(|(index, head)| RecoveryCommit {
+                    commit_id: format!("commit-{index}"),
+                    head_id: Some(head.clone()),
+                })
+                .collect(),
+            manifests: self.manifests.clone(),
+        }))
+    }
+}
+
+/// A repository whose floor is genesis and whose storage head is malformed.
+fn floor_with_malformed_head(
+    temporary: &Path,
+) -> (
+    KeyFile,
+    FilesystemStorage,
+    std::path::PathBuf,
+    String,
+    String,
+) {
+    let repo = temporary.join("repo");
+    initialize_git(&repo);
+    let key = KeyFile::generate();
+    let storage = FilesystemStorage::new(temporary.join("storage"));
+    let repository = EncryptedRepository::new(storage.clone(), key.clone());
+    repository.initialize("owner").unwrap();
+    repository.fetch_into(&repo, "encrypted").unwrap();
+    let floor = storage.read_head().unwrap().unwrap();
+    let junk = b"malformed successor";
+    let junk_id = object_id(junk);
+    storage
+        .put_object_if_absent(ObjectKind::Manifest, &junk_id, junk)
+        .unwrap();
+    storage
+        .compare_and_swap_head(Some(&floor), &junk_id)
+        .unwrap();
+    (key, storage, repo, floor, junk_id)
+}
+
+fn manifest_with_header(header: serde_json::Value) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "header": base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(&header).unwrap()),
+        "sealed_header_ciphertext": "",
+        "body_ciphertext": ""
+    }))
+    .unwrap()
+}
+
+fn publish_recovery<S: Storage>(
+    repository: &EncryptedRepository<S>,
+    repo: &Path,
+) -> Result<git_remote_e2ee::repository::RecoveryReport> {
+    repository.recover(
+        repo,
+        RecoveryOptions {
+            publish: true,
+            base: None,
+            discard_newer: false,
+            accept_stale_floor: true,
+        },
+    )
+}
+
+#[test]
+fn recovery_budget_exhaustion_inside_candidate_discovery_is_fatal() {
+    let temporary = tempfile::tempdir().unwrap();
+    let (key, storage, repo, floor, junk_id) = floor_with_malformed_head(temporary.path());
+    let oversized = manifest_with_header(serde_json::json!({
+        "format_version": 5,
+        "repository_root": key.repository_root,
+        "generation": 1,
+        "previous": floor,
+        "key_commitment": "0".repeat(64),
+        "generation_key_envelopes": [
+            {"encapsulated_key": "", "ciphertext": "A".repeat(36 * 1024 * 1024)},
+            {"encapsulated_key": "", "ciphertext": ""},
+            {"encapsulated_key": "", "ciphertext": ""},
+            {"encapsulated_key": "", "ciphertext": ""}
+        ],
+        "body_digest": "0".repeat(64),
+        "sealed_header_digest": "0".repeat(64)
+    }));
+    let oversized_id = object_id(&oversized);
+    let recovery = EncryptedRepository::new(
+        FixedHistoryStorage {
+            inner: storage.clone(),
+            heads: vec![junk_id.clone(), oversized_id.clone(), floor.clone()],
+            manifests: BTreeMap::from([(oversized_id, oversized)]),
+        },
+        key,
+    );
+
+    let error = publish_recovery(&recovery, &repo).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("byte budget exhausted"),
+        "{error:#}"
+    );
+    assert_eq!(
+        storage.read_head().unwrap().as_deref(),
+        Some(junk_id.as_str())
+    );
+    assert_eq!(client_state(&repo)["head_id"], floor);
+}
+
+#[test]
+fn recovery_refuses_to_skip_a_discontinuous_historical_head() {
+    let temporary = tempfile::tempdir().unwrap();
+    let (key, storage, repo, floor, junk_id) = floor_with_malformed_head(temporary.path());
+    let foreign_storage = FilesystemStorage::new(temporary.path().join("foreign"));
+    EncryptedRepository::new(foreign_storage.clone(), KeyFile::generate())
+        .initialize("foreign")
+        .unwrap();
+    let foreign_id = foreign_storage.read_head().unwrap().unwrap();
+    let foreign = foreign_storage
+        .get_object(ObjectKind::Manifest, &foreign_id)
+        .unwrap();
+    let recovery = EncryptedRepository::new(
+        FixedHistoryStorage {
+            inner: storage.clone(),
+            heads: vec![junk_id.clone(), foreign_id.clone(), floor.clone()],
+            manifests: BTreeMap::from([(foreign_id.clone(), foreign)]),
+        },
+        key,
+    );
+
+    let report = publish_recovery(&recovery, &repo).unwrap();
+    assert_eq!(report.classification, RecoveryClass::Invalid);
+    assert!(report.published_manifest.is_none());
+    let blocked = report.blocked_reason.unwrap();
+    assert!(
+        blocked.contains(&format!(
+            "historical carrier head {foreign_id} is discontinuous"
+        )),
+        "{blocked}"
+    );
+    assert_eq!(
+        storage.read_head().unwrap().as_deref(),
+        Some(junk_id.as_str())
+    );
+    assert_eq!(client_state(&repo)["head_id"], floor);
+}
+
+#[test]
+fn recover_refuses_a_head_with_a_future_manifest_schema() {
+    let temporary = tempfile::tempdir().unwrap();
+    let (key, storage, repo, floor, junk_id) = floor_with_malformed_head(temporary.path());
+    let future = manifest_with_header(serde_json::json!({
+        "format_version": 6,
+        "repository_root": key.repository_root,
+        "generation": 1,
+        "previous": floor,
+        "key_commitments": ["0".repeat(64)],
+        "admin_quorum": 2,
+        "generation_key_envelopes": [],
+        "body_digest": "0".repeat(64)
+    }));
+    let future_id = object_id(&future);
+    storage
+        .put_object_if_absent(ObjectKind::Manifest, &future_id, &future)
+        .unwrap();
+    storage
+        .compare_and_swap_head(Some(&junk_id), &future_id)
+        .unwrap();
+
+    let report = publish_recovery(&EncryptedRepository::new(storage.clone(), key), &repo).unwrap();
+    assert_eq!(
+        report.classification,
+        RecoveryClass::Unsupported,
+        "{}",
+        report.reason
+    );
+    assert!(report.published_manifest.is_none());
+    assert_eq!(
+        storage.read_head().unwrap().as_deref(),
+        Some(future_id.as_str())
+    );
+    assert_eq!(client_state(&repo)["head_id"], floor);
 }
 
 impl Storage for BarrierStorage {

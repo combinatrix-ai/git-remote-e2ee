@@ -161,14 +161,35 @@ impl PolicyState {
     }
 
     pub fn parse(bytes: &[u8]) -> Result<Self> {
+        #[derive(Deserialize)]
+        struct ObjectProbe {
+            body: String,
+        }
+        #[derive(Deserialize)]
+        struct BodyProbe {
+            format_version: u64,
+        }
+        // Probe the version before the full schema, so a future format is
+        // reported as unsupported instead of malformed.
+        let probe: ObjectProbe = serde_json::from_slice(bytes).context("parse policy object")?;
+        let probe_body = BASE64.decode(probe.body).context("decode policy body")?;
+        let version: BodyProbe =
+            serde_json::from_slice(&probe_body).context("parse policy format version")?;
+        if version.format_version != u64::from(POLICY_FORMAT_VERSION) {
+            bail!(Unsupported(format!(
+                "unsupported policy format {}",
+                version.format_version
+            )))
+        }
         let object: PolicyObject = serde_json::from_slice(bytes).context("parse policy object")?;
         let exact_body = BASE64.decode(object.body).context("decode policy body")?;
         let body: PolicyBody = serde_json::from_slice(&exact_body).context("parse policy body")?;
-        if body.format_version != POLICY_FORMAT_VERSION {
-            bail!(Unsupported(format!(
-                "unsupported policy format {}",
-                body.format_version
-            )))
+        match body.admin_threshold {
+            0 => bail!("policy administrator threshold must be at least one"),
+            1 => {}
+            threshold => bail!(Unsupported(format!(
+                "unsupported policy administrator threshold {threshold}"
+            ))),
         }
         validate_devices(&body.devices)?;
         validate_device_roots(&body)?;
@@ -534,6 +555,45 @@ mod tests {
             }],
         })
         .unwrap()
+    }
+
+    fn is_unsupported(result: Result<PolicyState>) -> bool {
+        result
+            .unwrap_err()
+            .chain()
+            .any(|cause| cause.is::<Unsupported>())
+    }
+
+    #[test]
+    fn a_future_policy_schema_is_unsupported_not_malformed() {
+        let owner = KeyFile::generate();
+        let (genesis, _) = PolicyState::genesis(&owner, "owner").unwrap();
+        let mut body = serde_json::to_value(&genesis.body).unwrap();
+        body["format_version"] = serde_json::json!(POLICY_FORMAT_VERSION + 1);
+        body["admin_quorum"] = serde_json::json!({"threshold": 2});
+        body.as_object_mut().unwrap().remove("admin_threshold");
+        let future = serde_json::to_vec(&serde_json::json!({
+            "body": BASE64.encode(serde_json::to_vec(&body).unwrap()),
+            "signatures": [],
+            "quorum_certificate": null
+        }))
+        .unwrap();
+        assert!(is_unsupported(PolicyState::parse(&future)));
+    }
+
+    #[test]
+    fn a_multi_admin_threshold_is_unsupported_and_zero_is_invalid() {
+        let owner = KeyFile::generate();
+        let (genesis, _) = PolicyState::genesis(&owner, "owner").unwrap();
+        let mut body = genesis.body.clone();
+        body.admin_threshold = 2;
+        assert!(is_unsupported(PolicyState::parse(&sign_unchecked(
+            &body, &owner
+        ))));
+        body.admin_threshold = 0;
+        assert!(!is_unsupported(PolicyState::parse(&sign_unchecked(
+            &body, &owner
+        ))));
     }
 
     #[test]

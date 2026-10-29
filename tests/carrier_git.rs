@@ -2230,3 +2230,95 @@ fn carrier_history_reads_skip_corrupt_copies_for_an_older_valid_one() {
             .unwrap()
     );
 }
+
+/// The writer joins after genesis, so the heads that predate it are sealed
+/// to readers it never was. Recovery from a malformed HEAD must still work.
+fn recover_junk_head_after_later_writer_push(recover_as_owner: bool) {
+    let temporary = tempfile::tempdir().unwrap();
+    let _cache = isolated_cache(&temporary);
+    let carrier = temporary.path().join("carrier.git");
+    let owner_checkout = temporary.path().join("owner");
+    let writer_checkout = temporary.path().join("writer");
+    init_source(&owner_checkout, "owner content");
+    init_source(&writer_checkout, "writer content");
+
+    let owner = KeyFile::generate();
+    let writer = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
+    let admin_pin = temporary.path().join("owner.admin-state.json");
+    init_carrier(temporary.path(), &carrier, &owner);
+    let open = |key: &KeyFile| {
+        EncryptedRepository::new(
+            GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+            key.clone(),
+        )
+    };
+    open(&owner).pin_admin_state(&admin_pin).unwrap();
+    open(&owner)
+        .add_device(
+            writer.public_device().unwrap(),
+            "writer",
+            DeviceRoles::collaborator(),
+            &admin_pin,
+        )
+        .unwrap();
+    open(&writer)
+        .push_update_for_remote(
+            &writer_checkout,
+            "origin",
+            "refs/heads/main",
+            "refs/heads/main",
+            false,
+        )
+        .unwrap();
+    open(&owner).fetch_into(&owner_checkout, "origin").unwrap();
+    let (floor_id, _) = open(&owner).current_manifest().unwrap();
+
+    edit_carrier(
+        &carrier,
+        &temporary.path().join("carrier-edit"),
+        |workdir| {
+            fs::write(workdir.join("HEAD"), "junk\n").unwrap();
+        },
+    );
+
+    let (key, checkout) = if recover_as_owner {
+        (&owner, &owner_checkout)
+    } else {
+        (&writer, &writer_checkout)
+    };
+    let recover = |publish| {
+        open(key)
+            .recover(
+                checkout,
+                RecoveryOptions {
+                    publish,
+                    base: None,
+                    discard_newer: false,
+                    accept_stale_floor: false,
+                },
+            )
+            .unwrap()
+    };
+    let report = recover(false);
+    assert_eq!(report.classification, RecoveryClass::Invalid);
+    assert_eq!(report.blocked_reason, None);
+    assert_eq!(report.default_base.as_deref(), Some(floor_id.as_str()));
+    assert_eq!(report.replays.len(), 2, "{:?}", report.replays);
+
+    let published = recover(true);
+    assert_eq!(published.blocked_reason, None);
+    let recovered_id = published.published_manifest.unwrap();
+    let (head, manifest) = open(key).current_manifest().unwrap();
+    assert_eq!(head, recovered_id);
+    assert_eq!(manifest.previous.as_deref(), Some(floor_id.as_str()));
+}
+
+#[test]
+fn carrier_recovery_works_for_the_owner() {
+    recover_junk_head_after_later_writer_push(true);
+}
+
+#[test]
+fn carrier_recovery_works_for_a_writer_added_after_genesis() {
+    recover_junk_head_after_later_writer_push(false);
+}

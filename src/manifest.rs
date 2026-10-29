@@ -328,7 +328,55 @@ pub fn seal_manifest(
     })?)
 }
 
+/// Checks the format version before the full schema, so a future format is
+/// reported as unsupported instead of malformed.
+fn require_supported_format(encrypted: &[u8]) -> Result<()> {
+    #[derive(Deserialize)]
+    struct EnvelopeProbe {
+        header: String,
+    }
+    #[derive(Deserialize)]
+    struct HeaderProbe {
+        format_version: u64,
+    }
+    let envelope: EnvelopeProbe =
+        serde_json::from_slice(encrypted).context("parse manifest envelope")?;
+    let header = BASE64
+        .decode(envelope.header)
+        .context("decode manifest header")?;
+    let probe: HeaderProbe =
+        serde_json::from_slice(&header).context("parse manifest format version")?;
+    if probe.format_version != u64::from(FORMAT_VERSION) {
+        bail!(Unsupported(format!(
+            "unsupported manifest format {}",
+            probe.format_version
+        )))
+    }
+    Ok(())
+}
+
+/// Checks the transition discriminator before the full sealed-header schema.
+fn require_supported_authorization(exact_sealed_content: &[u8]) -> Result<()> {
+    #[derive(Deserialize)]
+    struct AuthorizationProbe {
+        authorization: String,
+    }
+    let probe: AuthorizationProbe = serde_json::from_slice(exact_sealed_content)
+        .context("parse sealed manifest authorization")?;
+    let known = serde_json::from_value::<ManifestAuthorization>(serde_json::Value::String(
+        probe.authorization.clone(),
+    ));
+    if known.is_err() {
+        bail!(Unsupported(format!(
+            "unsupported manifest authorization {:?}",
+            probe.authorization
+        )))
+    }
+    Ok(())
+}
+
 pub fn peek_manifest_header(encrypted: &[u8]) -> Result<ManifestHeader> {
+    require_supported_format(encrypted)?;
     let envelope: ManifestEnvelope =
         serde_json::from_slice(encrypted).context("parse manifest envelope")?;
     let exact_header = BASE64
@@ -369,6 +417,7 @@ pub fn unwrap_generation_key(header: &ManifestHeader, key: &KeyFile) -> Result<S
 }
 
 pub fn open_manifest(encrypted: &[u8], generation_key: &[u8; 32]) -> Result<OpenedManifest> {
+    require_supported_format(encrypted)?;
     let envelope: ManifestEnvelope =
         serde_json::from_slice(encrypted).context("parse manifest envelope")?;
     let exact_header = BASE64
@@ -405,6 +454,7 @@ pub fn open_manifest(encrypted: &[u8], generation_key: &[u8; 32]) -> Result<Open
     if hex::encode(Sha256::digest(&exact_sealed_content)) != header.sealed_header_digest {
         bail!("sealed manifest header digest mismatch")
     }
+    require_supported_authorization(&exact_sealed_content)?;
     let content: SealedHeaderContent =
         serde_json::from_slice(&exact_sealed_content).context("parse sealed manifest content")?;
     if serde_json::to_vec(&content)? != exact_sealed_content {
@@ -942,6 +992,19 @@ mod tests {
         generation_key: &[u8; 32],
         edit: impl FnOnce(&mut ManifestHeader, &mut SealedHeaderContent),
     ) -> Vec<u8> {
+        rewrite_signed_sealed_content(encrypted, signer, generation_key, |header, exact| {
+            let mut content: SealedHeaderContent = serde_json::from_slice(exact).unwrap();
+            edit(header, &mut content);
+            *exact = serde_json::to_vec(&content).unwrap();
+        })
+    }
+
+    fn rewrite_signed_sealed_content(
+        encrypted: &[u8],
+        signer: &KeyFile,
+        generation_key: &[u8; 32],
+        edit: impl FnOnce(&mut ManifestHeader, &mut Vec<u8>),
+    ) -> Vec<u8> {
         let mut envelope: ManifestEnvelope = serde_json::from_slice(encrypted).unwrap();
         let mut header_bytes = BASE64.decode(&envelope.header).unwrap();
         let mut header: ManifestHeader = serde_json::from_slice(&header_bytes).unwrap();
@@ -956,10 +1019,8 @@ mod tests {
         .unwrap();
         let sealed_bytes = open_with_key(&sealed_key, &sealed_ciphertext, &header_bytes).unwrap();
         let mut sealed: SealedHeaderEnvelope = serde_json::from_slice(&sealed_bytes).unwrap();
-        let mut content: SealedHeaderContent =
-            serde_json::from_slice(&BASE64.decode(&sealed.content).unwrap()).unwrap();
-        edit(&mut header, &mut content);
-        let exact_content = serde_json::to_vec(&content).unwrap();
+        let mut exact_content = BASE64.decode(&sealed.content).unwrap();
+        edit(&mut header, &mut exact_content);
         header.sealed_header_digest = hex::encode(Sha256::digest(&exact_content));
         header_bytes = serde_json::to_vec(&header).unwrap();
         let body_ciphertext = BASE64.decode(&envelope.body_ciphertext).unwrap();
@@ -1340,6 +1401,51 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    fn is_unsupported(result: Result<impl std::fmt::Debug>) -> bool {
+        result
+            .unwrap_err()
+            .chain()
+            .any(|cause| cause.is::<Unsupported>())
+    }
+
+    #[test]
+    fn a_future_header_schema_is_unsupported_not_malformed() {
+        let owner = KeyFile::generate();
+        let (policy, _) = PolicyState::genesis(&owner, "owner").unwrap();
+        let generation_key = random_key();
+        let valid = writer_manifest(&owner, &policy, &generation_key);
+        let mut envelope: serde_json::Value = serde_json::from_slice(&valid).unwrap();
+        let mut header: serde_json::Value =
+            serde_json::from_slice(&BASE64.decode(envelope["header"].as_str().unwrap()).unwrap())
+                .unwrap();
+        header["format_version"] = serde_json::json!(FORMAT_VERSION + 1);
+        header["admin_quorum"] = serde_json::json!(2);
+        header.as_object_mut().unwrap().remove("key_commitment");
+        envelope["header"] = BASE64.encode(serde_json::to_vec(&header).unwrap()).into();
+        envelope["future_part"] = "".into();
+        let future = serde_json::to_vec(&envelope).unwrap();
+
+        assert!(is_unsupported(peek_manifest_header(&future)));
+        assert!(is_unsupported(open_manifest(&future, &generation_key)));
+    }
+
+    #[test]
+    fn an_unknown_authorization_variant_is_unsupported_not_malformed() {
+        let owner = KeyFile::generate();
+        let (policy, _) = PolicyState::genesis(&owner, "owner").unwrap();
+        let generation_key = random_key();
+        let valid = writer_manifest(&owner, &policy, &generation_key);
+        let future = rewrite_signed_sealed_content(&valid, &owner, &generation_key, |_, exact| {
+            let mut content: serde_json::Value = serde_json::from_slice(exact).unwrap();
+            content["authorization"] = "quorum_transition".into();
+            content["quorum_signatures"] = serde_json::json!([]);
+            *exact = serde_json::to_vec(&content).unwrap();
+        });
+
+        assert!(peek_manifest_header(&future).is_ok());
+        assert!(is_unsupported(open_manifest(&future, &generation_key)));
     }
 
     #[test]
