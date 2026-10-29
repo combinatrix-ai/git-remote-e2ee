@@ -1,3 +1,4 @@
+use git_remote_e2ee::gitcmd::GitRepository;
 mod support;
 
 use std::env;
@@ -170,7 +171,9 @@ fn concurrent_helper_processes_preserve_the_client_state_floor() {
     encrypted.initialize("owner").unwrap();
     configure_remote(&source, &remote_path, &key_path);
     configure_remote(&destination, &remote_path, &key_path);
-    encrypted.fetch_into(&destination, "private").unwrap();
+    encrypted
+        .fetch_into(&GitRepository::open(&destination).unwrap(), "private")
+        .unwrap();
 
     fs::write(source.join("note.md"), "first\n").unwrap();
     git(&source, &["add", "note.md"], false);
@@ -437,7 +440,7 @@ fn native_git_fetch_rejects_same_generation_manifest_fork() {
     fork.initialize("owner").unwrap();
     let fork_head = fork
         .push(
-            &source,
+            &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
                 source: "refs/heads/main",

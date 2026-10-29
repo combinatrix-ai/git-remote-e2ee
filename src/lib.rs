@@ -3,6 +3,7 @@ pub mod continuity;
 pub mod crypto;
 pub mod error;
 pub mod git;
+pub mod gitcmd;
 pub mod manifest;
 mod persist;
 pub mod policy;

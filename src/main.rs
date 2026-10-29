@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use git_remote_e2ee::continuity::default_state_dir;
 use git_remote_e2ee::crypto::{KeyFile, PublicDevice};
+use git_remote_e2ee::gitcmd::GitRepository;
 use git_remote_e2ee::policy::{DeviceRoles, validate_device_label};
 use git_remote_e2ee::repository::{
     EncryptedRepository, InitializeError, RecoveryOptions, RecoveryReport,
@@ -106,8 +107,10 @@ enum Command {
         target: String,
         #[arg(long)]
         key: Option<PathBuf>,
-        #[arg(long, default_value = ".")]
-        repo: PathBuf,
+        /// Repository whose remotes, key, and recovery state apply. Defaults
+        /// to the repository Git selects for the current directory
+        #[arg(long)]
+        repo: Option<PathBuf>,
         #[arg(long)]
         publish: bool,
         #[arg(long, requires = "publish")]
@@ -125,22 +128,29 @@ struct Target {
 }
 
 impl Target {
-    fn resolve(target: &str, key: Option<PathBuf>) -> Result<Self> {
-        let configured = if target.starts_with("e2ee::") {
-            None
-        } else {
-            git_config(&format!("remote.{target}.url"), false)?
+    /// Resolves a remote name through `repository`'s configuration, or takes
+    /// `target` as a storage URL.
+    fn resolve(
+        target: &str,
+        key: Option<PathBuf>,
+        repository: Option<&GitRepository>,
+    ) -> Result<Self> {
+        let configured = match repository {
+            Some(repository) if !target.starts_with("e2ee::") => {
+                git_config(repository, &format!("remote.{target}.url"), false)?
+            }
+            _ => None,
         };
-        let (url, configured_key) = match configured {
-            Some(url) if url.starts_with("e2ee::") => {
-                let key = git_config(&format!("remote.{target}.e2ee-key"), true)?;
+        let (url, configured_key) = match (configured, repository) {
+            (Some(url), Some(repository)) if url.starts_with("e2ee::") => {
+                let key = git_config(repository, &format!("remote.{target}.e2ee-key"), true)?;
                 (url, key.map(PathBuf::from))
             }
-            Some(url) => bail!("Git remote {target} is not an e2ee:: remote ({url})"),
-            None if target.starts_with("e2ee::") || target.contains(['/', ':']) => {
+            (Some(url), _) => bail!("Git remote {target} is not an e2ee:: remote ({url})"),
+            (None, _) if target.starts_with("e2ee::") || target.contains(['/', ':']) => {
                 (target.to_owned(), None)
             }
-            None => bail!(
+            (None, _) => bail!(
                 "no Git remote named {target}; give a storage URL such as e2ee::https://host/you/repo.git"
             ),
         };
@@ -219,8 +229,10 @@ fn main() -> Result<()> {
                 None => default_owner_label(),
             };
             validate_device_label(&label)?;
-            let in_repository = inside_git_repository()?;
-            if in_repository && git_config(&format!("remote.{name}.url"), false)?.is_some() {
+            let local = GitRepository::from_environment()?;
+            if let Some(local) = &local
+                && git_config(local, &format!("remote.{name}.url"), false)?.is_some()
+            {
                 bail!("Git remote {name} already exists; choose another name with --name")
             }
             let mut created_key = None;
@@ -263,18 +275,25 @@ fn main() -> Result<()> {
                 }
             };
             println!("initialized {}", target.storage);
-            if in_repository {
-                run_git(&["remote", "add", &name, &target.storage.to_string()])?;
-                run_git(&[
-                    "config",
-                    &format!("remote.{name}.e2ee-key"),
-                    &target.key.to_string_lossy(),
-                ])?;
+            if let Some(local) = &local {
+                run_git(
+                    local,
+                    &["remote", "add", &name, &target.storage.to_string()],
+                )?;
+                run_git(
+                    local,
+                    &[
+                        "config",
+                        &format!("remote.{name}.e2ee-key"),
+                        &target.key.to_string_lossy(),
+                    ],
+                )?;
                 println!("added remote {name}");
             }
         }
         Command::Verify { target, key } => {
-            let target = Target::resolve(&target, key)?;
+            let target =
+                Target::resolve(&target, key, GitRepository::from_environment()?.as_ref())?;
             let manifest = with_repository!(&target, |repository| repository.verify()?);
             println!(
                 "verified generation {} ({} refs, {} packs)",
@@ -290,7 +309,8 @@ fn main() -> Result<()> {
             role,
             key,
         } => {
-            let target = Target::resolve(&target, key)?;
+            let target =
+                Target::resolve(&target, key, GitRepository::from_environment()?.as_ref())?;
             let public = PublicDevice::read(&device)?;
             let device_id = public.device_id.clone();
             let roles = DeviceRoles::from(role);
@@ -304,13 +324,15 @@ fn main() -> Result<()> {
             device_id,
             key,
         } => {
-            let target = Target::resolve(&target, key)?;
+            let target =
+                Target::resolve(&target, key, GitRepository::from_environment()?.as_ref())?;
             let (manifest, policy) = with_repository!(&target, |repository| repository
                 .revoke_device(&device_id)?);
             println!("revoked {device_id}; manifest {manifest}; policy {policy}");
         }
         Command::DeviceList { target, key } => {
-            let target = Target::resolve(&target, key)?;
+            let target =
+                Target::resolve(&target, key, GitRepository::from_environment()?.as_ref())?;
             let own_id = KeyFile::read(&target.key)?.device_id()?;
             let devices = with_repository!(&target, |repository| repository.list_devices()?);
             for device in devices {
@@ -337,7 +359,9 @@ fn main() -> Result<()> {
             discard_newer,
             accept_stale_floor,
         } => {
-            let target = Target::resolve(&target, key)?;
+            let local = GitRepository::resolve(repo.as_deref())?
+                .context("recover needs a Git repository; run it inside one or pass --repo")?;
+            let target = Target::resolve(&target, key, Some(&local))?;
             let options = RecoveryOptions {
                 publish,
                 base: base.as_deref(),
@@ -345,7 +369,7 @@ fn main() -> Result<()> {
                 accept_stale_floor,
             };
             let report =
-                with_repository!(&target, |repository| repository.recover(&repo, options)?);
+                with_repository!(&target, |repository| repository.recover(&local, options)?);
             print_recovery_report(&report);
         }
     }
@@ -377,16 +401,8 @@ fn default_owner_label() -> String {
         .unwrap_or_else(|| "owner".to_owned())
 }
 
-fn inside_git_repository() -> Result<bool> {
-    Ok(Process::new("git")
-        .args(["rev-parse", "--git-dir"])
-        .output()?
-        .status
-        .success())
-}
-
-fn git_config(key: &str, path: bool) -> Result<Option<String>> {
-    let mut command = Process::new("git");
+fn git_config(repository: &GitRepository, key: &str, path: bool) -> Result<Option<String>> {
+    let mut command = repository.git();
     command.arg("config");
     if path {
         command.arg("--path");
@@ -399,8 +415,8 @@ fn git_config(key: &str, path: bool) -> Result<Option<String>> {
     }
 }
 
-fn run_git(args: &[&str]) -> Result<()> {
-    let output = Process::new("git").args(args).output()?;
+fn run_git(repository: &GitRepository, args: &[&str]) -> Result<()> {
+    let output = repository.git().args(args).output()?;
     if !output.status.success() {
         bail!(
             "git {} failed: {}",

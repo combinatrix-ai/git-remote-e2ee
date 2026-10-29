@@ -1,3 +1,4 @@
+use git_remote_e2ee::gitcmd::GitRepository;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -60,7 +61,7 @@ fn two_devices_can_decrypt_and_push_independently() {
     let first = commit(&source_a, "from a\n", "from a");
     repo_a
         .push(
-            &source_a,
+            &GitRepository::open(&source_a).unwrap(),
             "refs/heads/main",
             RefChange::Update {
                 source: "refs/heads/main",
@@ -81,7 +82,9 @@ fn two_devices_can_decrypt_and_push_independently() {
         key_b.clone(),
         temp.path().join("b-machine"),
     );
-    repo_b.fetch_into(&source_b, "e2ee").unwrap();
+    repo_b
+        .fetch_into(&GitRepository::open(&source_b).unwrap(), "e2ee")
+        .unwrap();
     assert_eq!(
         git(&source_b, &["rev-parse", "refs/remotes/e2ee/main"]),
         first
@@ -93,7 +96,7 @@ fn two_devices_can_decrypt_and_push_independently() {
     let second = commit(&source_b, "from b\n", "from b");
     repo_b
         .push(
-            &source_b,
+            &GitRepository::open(&source_b).unwrap(),
             "refs/heads/main",
             RefChange::Update {
                 source: "refs/heads/main",
@@ -104,7 +107,9 @@ fn two_devices_can_decrypt_and_push_independently() {
 
     let destination = temp.path().join("destination");
     initialize_git(&destination);
-    repo_a.fetch_into(&destination, "e2ee").unwrap();
+    repo_a
+        .fetch_into(&GitRepository::open(&destination).unwrap(), "e2ee")
+        .unwrap();
     assert_eq!(
         git(&destination, &["rev-parse", "refs/remotes/e2ee/main"]),
         second
@@ -132,7 +137,7 @@ fn revoked_reader_cannot_reach_later_history_but_keeps_prior_snapshot() {
     let before = commit(&source, "before revoke\n", "before revoke");
     repo_a
         .push(
-            &source,
+            &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
                 source: "refs/heads/main",
@@ -143,7 +148,7 @@ fn revoked_reader_cannot_reach_later_history_but_keeps_prior_snapshot() {
     let before_tip = commit(&source, "second pack\n", "second pack");
     repo_a
         .push(
-            &source,
+            &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
                 source: "refs/heads/main",
@@ -165,7 +170,9 @@ fn revoked_reader_cannot_reach_later_history_but_keeps_prior_snapshot() {
         key_b.clone(),
         temp.path().join("b-machine"),
     );
-    repo_b.fetch_into(&client_b, "e2ee").unwrap();
+    repo_b
+        .fetch_into(&GitRepository::open(&client_b).unwrap(), "e2ee")
+        .unwrap();
     assert_eq!(
         git(&client_b, &["show", "refs/remotes/e2ee/main:note.md"]),
         "second pack"
@@ -185,7 +192,7 @@ fn revoked_reader_cannot_reach_later_history_but_keeps_prior_snapshot() {
     let after = commit(&source, "after revoke secret\n", "after revoke");
     repo_a
         .push(
-            &source,
+            &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
                 source: "refs/heads/main",
@@ -199,7 +206,7 @@ fn revoked_reader_cannot_reach_later_history_but_keeps_prior_snapshot() {
     }
 
     let fetch_error = repo_b
-        .fetch_into(&client_b, "e2ee")
+        .fetch_into(&GitRepository::open(&client_b).unwrap(), "e2ee")
         .unwrap_err()
         .to_string();
     assert!(
@@ -215,7 +222,7 @@ fn revoked_reader_cannot_reach_later_history_but_keeps_prior_snapshot() {
     commit(&client_b, "revoked writer\n", "revoked writer");
     let push_error = repo_b
         .push(
-            &client_b,
+            &GitRepository::open(&client_b).unwrap(),
             "refs/heads/main",
             RefChange::Update {
                 source: "refs/heads/main",
@@ -238,7 +245,10 @@ fn revoked_reader_cannot_reach_later_history_but_keeps_prior_snapshot() {
         temp.path().join("b-machine"),
     );
     old_repo_b
-        .fetch_into(&snapshot_destination, "snapshot")
+        .fetch_into(
+            &GitRepository::open(&snapshot_destination).unwrap(),
+            "snapshot",
+        )
         .unwrap();
     assert_eq!(
         git(
@@ -270,7 +280,9 @@ fn revoked_reader_cannot_reach_later_history_but_keeps_prior_snapshot() {
         key_c,
         temp.path().join("c-machine"),
     );
-    let manifest = repo_c.fetch_into(&destination, "e2ee").unwrap();
+    let manifest = repo_c
+        .fetch_into(&GitRepository::open(&destination).unwrap(), "e2ee")
+        .unwrap();
     repo_c.verify().unwrap();
     assert_eq!(manifest.total_pack_count, 3);
     assert_eq!(
@@ -308,7 +320,7 @@ fn connected_membership_observation_pins_and_rejects_replay() {
     commit(&source, "one\n", "one");
     repository
         .push(
-            &source,
+            &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
                 source: "refs/heads/main",
@@ -316,7 +328,9 @@ fn connected_membership_observation_pins_and_rejects_replay() {
             },
         )
         .unwrap();
-    client_view.fetch_into(&client, "e2ee").unwrap();
+    client_view
+        .fetch_into(&GitRepository::open(&client).unwrap(), "e2ee")
+        .unwrap();
     let before_membership = fs::read_to_string(remote.join("HEAD")).unwrap();
 
     // The membership change keeps every ref, so the client already holds a
@@ -329,7 +343,9 @@ fn connected_membership_observation_pins_and_rejects_replay() {
             DeviceRoles::collaborator(),
         )
         .unwrap();
-    let observed = client_view.observe_manifest(&client).unwrap();
+    let observed = client_view
+        .observe_manifest(&GitRepository::open(&client).unwrap())
+        .unwrap();
     assert_eq!(observed.generation, 2);
     let state_path = client_machine.join(&root).join("continuity.json");
     let state: serde_json::Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
@@ -338,7 +354,9 @@ fn connected_membership_observation_pins_and_rejects_replay() {
     let after_membership = fs::read_to_string(remote.join("HEAD")).unwrap();
 
     fs::write(remote.join("HEAD"), &before_membership).unwrap();
-    let error = client_view.observe_manifest(&client).unwrap_err();
+    let error = client_view
+        .observe_manifest(&GitRepository::open(&client).unwrap())
+        .unwrap_err();
     assert!(format!("{error:#}").contains("rolled back"), "{error:#}");
     let state: serde_json::Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
     assert_eq!(state["generation"], 2);
@@ -347,7 +365,7 @@ fn connected_membership_observation_pins_and_rejects_replay() {
     commit(&source, "two\n", "two");
     repository
         .push(
-            &source,
+            &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
                 source: "refs/heads/main",
@@ -355,7 +373,9 @@ fn connected_membership_observation_pins_and_rejects_replay() {
             },
         )
         .unwrap();
-    client_view.fetch_into(&client, "e2ee").unwrap();
+    client_view
+        .fetch_into(&GitRepository::open(&client).unwrap(), "e2ee")
+        .unwrap();
     assert_eq!(
         git(&client, &["show", "refs/remotes/e2ee/main:note.md"]),
         "two"

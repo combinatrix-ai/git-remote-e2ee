@@ -1,29 +1,16 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Write};
-use std::path::Path;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 
 use anyhow::{Context, Result, bail};
 
+use crate::gitcmd::GitRepository;
 use crate::trace;
 
-pub fn ensure_repository(repo: &Path) -> Result<()> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["rev-parse", "--git-dir"])
-        .output()?;
-    if !output.status.success() {
-        bail!("{} is not a Git repository", repo.display())
-    }
-    Ok(())
-}
-
-pub fn has_complete_object_graph(repo: &Path) -> bool {
-    let shallow = match Command::new("git")
-        .arg("-C")
-        .arg(repo)
+pub fn has_complete_object_graph(repo: &GitRepository) -> bool {
+    let shallow = match repo
+        .git()
         .args(["rev-parse", "--is-shallow-repository"])
         .output()
     {
@@ -34,9 +21,8 @@ pub fn has_complete_object_graph(repo: &Path) -> bool {
         return false;
     }
 
-    let partial = match Command::new("git")
-        .arg("-C")
-        .arg(repo)
+    let partial = match repo
+        .git()
         .args([
             "config",
             "--local",
@@ -52,7 +38,7 @@ pub fn has_complete_object_graph(repo: &Path) -> bool {
     partial.status.code() == Some(1) && partial.stdout.is_empty()
 }
 
-pub fn resolve_ref(repo: &Path, reference: &str) -> Result<String> {
+pub fn resolve_ref(repo: &GitRepository, reference: &str) -> Result<String> {
     git_text(repo, &["rev-parse", "--verify", reference])
 }
 
@@ -62,7 +48,7 @@ pub enum InnerRefKind {
     Tag,
 }
 
-pub fn validate_inner_ref(repo: &Path, reference: &str) -> Result<InnerRefKind> {
+pub fn validate_inner_ref(repo: &GitRepository, reference: &str) -> Result<InnerRefKind> {
     let kind = if reference.starts_with("refs/heads/") {
         InnerRefKind::Branch
     } else if reference.starts_with("refs/tags/") {
@@ -72,18 +58,14 @@ pub fn validate_inner_ref(repo: &Path, reference: &str) -> Result<InnerRefKind> 
             "unsupported ref namespace for {reference}; only refs/heads/* and refs/tags/* are supported"
         )
     };
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["check-ref-format", reference])
-        .output()?;
+    let output = repo.git().args(["check-ref-format", reference]).output()?;
     if !output.status.success() {
         bail!("invalid Git ref name {reference}")
     }
     Ok(kind)
 }
 
-pub fn ensure_branch_target(repo: &Path, reference: &str, object: &str) -> Result<()> {
+pub fn ensure_branch_target(repo: &GitRepository, reference: &str, object: &str) -> Result<()> {
     let target = resolve_tag_chain(repo, reference, object, "pushed")?;
     if target.kind != "commit" {
         bail!("branch ref {reference} must resolve to a commit")
@@ -91,10 +73,9 @@ pub fn ensure_branch_target(repo: &Path, reference: &str, object: &str) -> Resul
     Ok(())
 }
 
-pub fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(repo)
+pub fn is_ancestor(repo: &GitRepository, ancestor: &str, descendant: &str) -> Result<bool> {
+    let status = repo
+        .git()
         .args(["merge-base", "--is-ancestor", ancestor, descendant])
         .status()?;
     match status.code() {
@@ -104,12 +85,8 @@ pub fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bool
     }
 }
 
-pub fn object_exists(repo: &Path, object: &str) -> Result<bool> {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["cat-file", "-e", object])
-        .status()?;
+pub fn object_exists(repo: &GitRepository, object: &str) -> Result<bool> {
+    let status = repo.git().args(["cat-file", "-e", object]).status()?;
     match status.code() {
         Some(0) => Ok(true),
         Some(1) => Ok(false),
@@ -159,13 +136,12 @@ impl Drop for PackSource {
 }
 
 pub fn start_incremental_pack(
-    repo: &Path,
+    repo: &GitRepository,
     new_refs: &BTreeMap<String, String>,
     old_refs: &BTreeMap<String, String>,
 ) -> Result<PackSource> {
-    let shallow = Command::new("git")
-        .arg("-C")
-        .arg(repo)
+    let shallow = repo
+        .git()
         .args(["rev-parse", "--is-shallow-repository"])
         .output()?;
     if !shallow.status.success() {
@@ -176,9 +152,8 @@ pub fn start_incremental_pack(
     }
     let timer = trace::Span::new("git_pack_objects_stream_lifetime");
     let stderr = tempfile::tempfile().context("create pack-objects stderr file")?;
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(repo)
+    let mut child = repo
+        .git()
         .args(["pack-objects", "--stdout", "--revs"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -259,12 +234,11 @@ impl Drop for PackImporter {
     }
 }
 
-pub fn start_pack_import(repo: &Path) -> Result<PackImporter> {
+pub fn start_pack_import(repo: &GitRepository) -> Result<PackImporter> {
     let timer = trace::Span::new("git_index_pack");
     let stderr = tempfile::tempfile().context("create index-pack stderr file")?;
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(repo)
+    let mut child = repo
+        .git()
         .args(["index-pack", "--stdin"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -290,7 +264,7 @@ fn read_process_error(file: &mut File) -> String {
 }
 
 pub fn ensure_refs_connected_since(
-    repo: &Path,
+    repo: &GitRepository,
     refs: &BTreeMap<String, String>,
     verified_refs: &BTreeMap<String, String>,
 ) -> Result<()> {
@@ -334,11 +308,8 @@ pub fn ensure_refs_connected_since(
     if commit_roots.is_empty() {
         return Ok(());
     }
-    let mut command = Command::new("git");
-    command
-        .arg("-C")
-        .arg(repo)
-        .args(["rev-list", "--objects", "--missing=print"]);
+    let mut command = repo.git();
+    command.args(["rev-list", "--objects", "--missing=print"]);
     for object in &commit_roots {
         command.arg(object);
     }
@@ -372,7 +343,12 @@ struct RefTarget {
     kind: String,
 }
 
-fn resolve_tag_chain(repo: &Path, reference: &str, object: &str, label: &str) -> Result<RefTarget> {
+fn resolve_tag_chain(
+    repo: &GitRepository,
+    reference: &str,
+    object: &str,
+    label: &str,
+) -> Result<RefTarget> {
     let mut current = object.to_owned();
     let mut seen = HashSet::new();
     loop {
@@ -416,14 +392,13 @@ fn resolve_tag_chain(repo: &Path, reference: &str, object: &str, label: &str) ->
     }
 }
 
-fn cat_file_type(repo: &Path, object: &str) -> Result<String> {
+fn cat_file_type(repo: &GitRepository, object: &str) -> Result<String> {
     git_text(repo, &["cat-file", "-t", object])
 }
 
-fn ensure_tree_connected(repo: &Path, reference: &str, tree: &str) -> Result<()> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
+fn ensure_tree_connected(repo: &GitRepository, reference: &str, tree: &str) -> Result<()> {
+    let output = repo
+        .git()
         .args(["ls-tree", "-r", "-t", "-z", "--full-tree", tree])
         .output()?;
     if !output.status.success() {
@@ -461,10 +436,9 @@ fn ensure_tree_connected(repo: &Path, reference: &str, tree: &str) -> Result<()>
     Ok(())
 }
 
-pub fn update_ref(repo: &Path, reference: &str, object: &str) -> Result<()> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
+pub fn update_ref(repo: &GitRepository, reference: &str, object: &str) -> Result<()> {
+    let output = repo
+        .git()
         .args(["update-ref", reference, object])
         .output()?;
     if !output.status.success() {
@@ -476,12 +450,8 @@ pub fn update_ref(repo: &Path, reference: &str, object: &str) -> Result<()> {
     Ok(())
 }
 
-fn git_text(repo: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()?;
+fn git_text(repo: &GitRepository, args: &[&str]) -> Result<String> {
+    let output = repo.git().args(args).output()?;
     if !output.status.success() {
         bail!(
             "git {} failed: {}",
@@ -495,6 +465,7 @@ fn git_text(repo: &Path, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::has_complete_object_graph;
+    use crate::gitcmd::GitRepository;
     use std::fs;
     use std::path::Path;
     use std::process::Command;
@@ -532,7 +503,9 @@ mod tests {
             git(&full, &["add", "file"]);
             git(&full, &["commit", "--quiet", "-m", contents]);
         }
-        assert!(has_complete_object_graph(&full));
+        assert!(has_complete_object_graph(
+            &GitRepository::open(&full).unwrap()
+        ));
 
         let shallow = temporary.path().join("shallow");
         let source_url = format!("file://{}", full.display());
@@ -547,12 +520,18 @@ mod tests {
             "git clone: {}",
             String::from_utf8_lossy(&clone.stderr)
         );
-        assert!(!has_complete_object_graph(&shallow));
+        assert!(!has_complete_object_graph(
+            &GitRepository::open(&shallow).unwrap()
+        ));
 
         git(&full, &["config", "remote.origin.promisor", "true"]);
-        assert!(!has_complete_object_graph(&full));
+        assert!(!has_complete_object_graph(
+            &GitRepository::open(&full).unwrap()
+        ));
         git(&full, &["config", "--unset", "remote.origin.promisor"]);
         git(&full, &["config", "extensions.partialClone", "origin"]);
-        assert!(!has_complete_object_graph(&full));
+        assert!(!has_complete_object_graph(
+            &GitRepository::open(&full).unwrap()
+        ));
     }
 }
