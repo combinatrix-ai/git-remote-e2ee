@@ -613,13 +613,26 @@ fn native_git_fetch_reimports_packs_after_local_objects_are_pruned() {
         helper_git(&source, &["push", "-q", "private", branch]);
     }
 
+    // Git may run detached auto-maintenance after a fetch, which can repack
+    // or prune concurrently with the explicit prune below and make the test
+    // nondeterministic on fast CI runners. Disable it and prune explicitly.
+    for setting in [
+        "maintenance.auto=false",
+        "gc.auto=0",
+        "gc.autoDetach=false",
+        "fetch.writeCommitGraph=false",
+    ] {
+        let (key, value) = setting.split_once('=').unwrap();
+        git(&destination, &["config", key, value], false);
+    }
     helper_git(&destination, &["fetch", "-q", "private"]);
     git(
         &destination,
         &["update-ref", "-d", "refs/remotes/private/feature"],
         false,
     );
-    git(&destination, &["gc", "-q", "--prune=now"], false);
+    git(&destination, &["repack", "-a", "-d", "-q"], false);
+    git(&destination, &["prune", "--expire=now"], false);
     assert!(
         !git_output(&destination, &["cat-file", "-e", &heads[1]], false)
             .status
