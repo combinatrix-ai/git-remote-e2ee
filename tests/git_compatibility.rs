@@ -2,6 +2,8 @@
 //! Git upstream's `t/t5801-remote-helpers.sh`. This is an independent Rust
 //! implementation, not a copy of Git's GPL test code.
 
+mod support;
+
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -15,7 +17,9 @@ fn add_helper_to_path(command: &mut Command) {
     let helper = Path::new(env!("CARGO_BIN_EXE_git-remote-e2ee"));
     let mut paths = vec![helper.parent().unwrap().to_path_buf()];
     paths.extend(env::split_paths(&env::var_os("PATH").unwrap_or_default()));
-    command.env("PATH", env::join_paths(paths).unwrap());
+    command
+        .env("PATH", env::join_paths(paths).unwrap())
+        .env("XDG_STATE_HOME", support::state_home());
 }
 
 fn git_output(repo: &Path, args: &[&str], with_helper: bool) -> Output {
@@ -62,9 +66,13 @@ fn setup_remote(root: &Path) -> (std::path::PathBuf, std::path::PathBuf, KeyFile
     let key_path = root.join("repository.key.json");
     let key = KeyFile::generate();
     key.write_new(&key_path).unwrap();
-    EncryptedRepository::new(FilesystemStorage::new(&storage), key.clone())
-        .initialize("owner")
-        .unwrap();
+    EncryptedRepository::new(
+        FilesystemStorage::new(&storage),
+        key.clone(),
+        support::state_dir(),
+    )
+    .initialize("owner")
+    .unwrap();
     (storage, key_path, key)
 }
 
@@ -166,7 +174,11 @@ fn upstream_style_push_refspecs_and_force_work() {
     git(&source, &["push", "private", "named:renamed"], true);
     git(&source, &["push", "private", "HEAD:from-head"], true);
 
-    let repository = EncryptedRepository::new(FilesystemStorage::new(&storage), key.clone());
+    let repository = EncryptedRepository::new(
+        FilesystemStorage::new(&storage),
+        key.clone(),
+        support::state_dir(),
+    );
     let manifest = repository.verify().unwrap();
     for reference in ["named", "renamed", "from-head"] {
         assert_eq!(manifest.refs[&format!("refs/heads/{reference}")], named);
@@ -256,7 +268,8 @@ fn lightweight_annotated_and_followed_tags_round_trip_through_helper() {
     );
     git(&source, &["push", "--follow-tags", "private", "main"], true);
 
-    let repository = EncryptedRepository::new(FilesystemStorage::new(&storage), key);
+    let repository =
+        EncryptedRepository::new(FilesystemStorage::new(&storage), key, support::state_dir());
     let manifest = repository.verify().unwrap();
     assert_eq!(manifest.refs["refs/tags/v1.0"], first);
     assert_eq!(
@@ -303,7 +316,8 @@ fn moving_an_existing_tag_requires_force() {
     let second = commit_file(&source, "second", "second");
     git(&source, &["push", "private", "main"], true);
     git(&source, &["tag", "-f", "v1.0", &second], false);
-    let repository = EncryptedRepository::new(FilesystemStorage::new(&storage), key);
+    let repository =
+        EncryptedRepository::new(FilesystemStorage::new(&storage), key, support::state_dir());
     let before = repository.verify().unwrap();
     let rejected = git_output(&source, &["push", "private", "v1.0"], true);
     assert!(!rejected.status.success());
@@ -337,7 +351,8 @@ fn deletions_publish_without_packs_and_prune_on_returning_and_fresh_clones() {
     git(&source, &["push", "private", "v-delete"], true);
     clone_remote(&returning, &storage, &key_path);
 
-    let repository = EncryptedRepository::new(FilesystemStorage::new(&storage), key);
+    let repository =
+        EncryptedRepository::new(FilesystemStorage::new(&storage), key, support::state_dir());
     let before = repository.verify().unwrap();
     let default_delete = git_output(&source, &["push", "--delete", "private", "main"], true);
     assert!(!default_delete.status.success());
@@ -423,7 +438,8 @@ fn unsupported_upstream_operations_fail_without_publication() {
     let head = commit_file(&source, "main", "main");
     git(&source, &["push", "private", "main"], true);
 
-    let repository = EncryptedRepository::new(FilesystemStorage::new(&storage), key);
+    let repository =
+        EncryptedRepository::new(FilesystemStorage::new(&storage), key, support::state_dir());
     let generation = repository.verify().unwrap().generation;
 
     let delete = git_output(&source, &["push", "private", ":main"], true);
@@ -525,7 +541,8 @@ fn stale_push_is_reported_as_an_ordinary_git_rejection() {
     );
     assert!(!stderr.contains("remote rejected"), "{stderr}");
     assert!(stderr.contains("git pull"), "{stderr}");
-    let repository = EncryptedRepository::new(FilesystemStorage::new(&storage), key);
+    let repository =
+        EncryptedRepository::new(FilesystemStorage::new(&storage), key, support::state_dir());
     assert_eq!(
         repository.verify().unwrap().refs["refs/heads/main"],
         published

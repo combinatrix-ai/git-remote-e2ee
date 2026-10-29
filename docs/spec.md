@@ -432,23 +432,26 @@ refs, pinning the new head, or publishing a successor. A signed ref advance
 whose required pack delta is absent is invalid even when every cryptographic
 check succeeds.
 
-Authenticating a manifest alone MUST NOT advance the continuity floor. A
-helper client's head, generation, repository root, and policy-generation floor
-advances only when the complete-ref connectivity check succeeds for that
-manifest's refs, either after pack import or, during listing, because every
-advertised ref is already connected locally; or after that client successfully
-publishes its own successor with compare-and-swap. A client MUST NOT rely on
-receiving a fetch command to pin a state, because Git omits it when no objects
-need to be transferred. A failed or incomplete
-import leaves the previous floor intact, so an authenticated but unusable
-publication cannot make a later valid successor look like rollback.
+Each machine (per OS user) keeps one continuity floor per repository root:
+repository root, manifest ID and generation, and policy generation. Every
+client operation that reads or publishes storage state (listing, fetch, push
+and its dry run, initialization, membership listing and changes,
+verification, and recovery) MUST hold that floor's exclusive lock, require the
+authenticated storage chain to pass through the floor, and, after it succeeds,
+advance the floor to the head it accepted or published. The floor never moves
+backward; a different head at the floor's generation is a fork. Because every
+operation shares the floor, a rollback that hides a state seen by any
+operation on the machine, including a revocation published by
+`device-revoke`, is rejected by every later operation, whichever checkout runs
+it. Holding the lock across validation and publication serializes processes
+on one machine.
 
-Client-state updates for one repository and remote MUST serialize their
-read-modify-write operation across helper processes. The merge MUST preserve
-the greatest recorded manifest and policy generations and MUST reject a
-same-generation head-ID conflict. The durable state-file replacement remains
-atomic; the lock is held while an import or publication checks and advances
-the floor.
+The floor records what storage has shown, not what a checkout has imported.
+Import progress (imported generation, imported pack IDs, and the verified
+frontier below) is kept per checkout and never substitutes for the floor. A
+signed head whose packs are missing still advances the floor once it
+authenticates and descends from it; import progress stays where it was until
+a fetch succeeds.
 
 A client MAY satisfy that requirement incrementally. After a successful full
 or incremental connectivity check, it records the exact checked ref tips as a
@@ -464,10 +467,10 @@ Imported pack IDs do not prove that their objects remain in the local object
 database; deleting a remote-tracking ref and pruning removes them. When the
 incremental check fails, the client MUST re-import every pack of the
 authenticated chain and run a full connectivity walk before failing. The
-re-import does not move the floor; only a successful full check advances it.
+recorded import progress moves only after a successful check.
 
-A missing frontier in a v5 client state requires a full connectivity walk. A
-client state from another wire version is not accepted. The incremental rule assumes the trusted
+A missing frontier requires a full connectivity walk. Local state in an
+unknown format is not accepted. The incremental rule assumes the trusted
 client's existing object database has not been corrupted outside this
 protocol; explicit full verification remains available to check local storage.
 
@@ -561,14 +564,13 @@ Unreachable losing objects require later GC.
 
 ## 11. Continuity and invitations
 
-Returning clients pin repository root, manifest ID and generation, and policy
-generation. The policy ID is not stored separately: the pinned manifest ID
-binds it through the manifest's sealed header. Helper continuity pins advance
-only after the complete-ref connectivity check succeeds (after import, or
-during listing when the advertised refs are already connected locally) or
-after a successful own publication, never from authentication alone. They reject rollback, a non-descendant manifest, policy
-rollback/sideways movement, root substitution, and generation gaps. Local
-client-state updates are serialized and monotonic across concurrent helpers.
+Each machine pins, per repository root, the root, manifest ID and generation,
+and policy generation (section 9). The policy ID is not stored separately:
+the pinned manifest ID binds it through the manifest's sealed header. The
+floor advances after any successful validation or publication on the machine.
+It rejects rollback, a non-descendant manifest, policy rollback/sideways
+movement, root substitution, and generation gaps. Floor updates are serialized
+and monotonic across concurrent processes.
 
 A fresh device should receive an administrator-authorized invitation checkpoint
 through an authenticated channel containing:

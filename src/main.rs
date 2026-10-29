@@ -1,14 +1,13 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command as Process;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 
+use git_remote_e2ee::continuity::default_state_dir;
 use git_remote_e2ee::crypto::{KeyFile, PublicDevice};
 use git_remote_e2ee::policy::{DeviceRoles, validate_device_label};
-use git_remote_e2ee::repository::{
-    EncryptedRepository, RecoveryOptions, RecoveryReport, admin_state_path,
-};
+use git_remote_e2ee::repository::{EncryptedRepository, RecoveryOptions, RecoveryReport};
 use git_remote_e2ee::storage::{FilesystemStorage, GitStorage};
 use git_remote_e2ee::url::StorageUrl;
 
@@ -116,32 +115,6 @@ enum Command {
         #[arg(long, requires = "publish")]
         accept_stale_floor: bool,
     },
-    /// Push without the remote helper; kept for benchmarks
-    #[command(hide = true)]
-    Push {
-        #[arg(long)]
-        storage: PathBuf,
-        #[arg(long)]
-        key: PathBuf,
-        #[arg(long, default_value = ".")]
-        repo: PathBuf,
-        #[arg(long = "ref")]
-        reference: String,
-        #[arg(long)]
-        force: bool,
-    },
-    /// Fetch without the remote helper; kept for benchmarks
-    #[command(hide = true)]
-    Fetch {
-        #[arg(long)]
-        storage: PathBuf,
-        #[arg(long)]
-        key: PathBuf,
-        #[arg(long, default_value = ".")]
-        repo: PathBuf,
-        #[arg(long, default_value = "origin")]
-        remote_name: String,
-    },
 }
 
 struct Target {
@@ -185,13 +158,16 @@ macro_rules! with_repository {
     ($target:expr, |$repository:ident| $body:expr) => {{
         let target: &Target = $target;
         let key = KeyFile::read(&target.key)?;
+        let state_dir = default_state_dir()?;
         match &target.storage {
             StorageUrl::Directory(path) => {
-                let $repository = EncryptedRepository::new(FilesystemStorage::new(path), key);
+                let $repository =
+                    EncryptedRepository::new(FilesystemStorage::new(path), key, state_dir);
                 $body
             }
             StorageUrl::Git(remote) => {
-                let $repository = EncryptedRepository::new(GitStorage::open(remote)?, key);
+                let $repository =
+                    EncryptedRepository::new(GitStorage::open(remote)?, key, state_dir);
                 $body
             }
         }
@@ -265,10 +241,8 @@ fn main() -> Result<()> {
                     storage,
                     key: std::path::absolute(key)?,
                 };
-                let pin = admin_pin_path(&target.key)?;
                 with_repository!(&target, |repository| {
                     repository.initialize(&label)?;
-                    repository.pin_admin_state(&pin)?;
                 });
                 Ok(target)
             })();
@@ -310,12 +284,11 @@ fn main() -> Result<()> {
             key,
         } => {
             let target = Target::resolve(&target, key)?;
-            let pin = admin_pin_path(&target.key)?;
             let public = PublicDevice::read(&device)?;
             let device_id = public.device_id.clone();
             let roles = DeviceRoles::from(role);
             let (manifest, policy) = with_repository!(&target, |repository| {
-                repository.add_device(public, &label, roles, &pin)?
+                repository.add_device(public, &label, roles)?
             });
             println!("added {device_id} ({label}); manifest {manifest}; policy {policy}");
         }
@@ -325,17 +298,14 @@ fn main() -> Result<()> {
             key,
         } => {
             let target = Target::resolve(&target, key)?;
-            let pin = admin_pin_path(&target.key)?;
-            let (manifest, policy) = with_repository!(&target, |repository| {
-                repository.revoke_device(&device_id, &pin)?
-            });
+            let (manifest, policy) = with_repository!(&target, |repository| repository
+                .revoke_device(&device_id)?);
             println!("revoked {device_id}; manifest {manifest}; policy {policy}");
         }
         Command::DeviceList { target, key } => {
             let target = Target::resolve(&target, key)?;
-            let pin = admin_pin_path(&target.key)?;
             let own_id = KeyFile::read(&target.key)?.device_id()?;
-            let devices = with_repository!(&target, |repository| repository.list_devices(&pin)?);
+            let devices = with_repository!(&target, |repository| repository.list_devices()?);
             for device in devices {
                 println!(
                     "{}{}  {}  role={}  status={}",
@@ -371,28 +341,6 @@ fn main() -> Result<()> {
                 with_repository!(&target, |repository| repository.recover(&repo, options)?);
             print_recovery_report(&report);
         }
-        Command::Push {
-            storage,
-            key,
-            repo,
-            reference,
-            force,
-        } => {
-            let repository =
-                EncryptedRepository::new(FilesystemStorage::new(storage), KeyFile::read(&key)?);
-            println!("{}", repository.push_ref(&repo, &reference, force)?);
-        }
-        Command::Fetch {
-            storage,
-            key,
-            repo,
-            remote_name,
-        } => {
-            let repository =
-                EncryptedRepository::new(FilesystemStorage::new(storage), KeyFile::read(&key)?);
-            let manifest = repository.fetch_into(&repo, &remote_name)?;
-            println!("fetched generation {}", manifest.generation);
-        }
     }
     Ok(())
 }
@@ -420,10 +368,6 @@ fn default_owner_label() -> String {
         .map(|hostname| hostname.trim().to_owned())
         .filter(|hostname| validate_device_label(hostname).is_ok())
         .unwrap_or_else(|| "owner".to_owned())
-}
-
-fn admin_pin_path(key: &Path) -> Result<PathBuf> {
-    admin_state_path(&KeyFile::read(key)?.repository_root)
 }
 
 fn inside_git_repository() -> Result<bool> {

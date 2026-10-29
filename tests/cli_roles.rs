@@ -143,14 +143,14 @@ fn init_accepts_relative_storage_and_key_paths() {
             .path()
             .join("state/git-e2ee")
             .join(&owner.repository_root)
-            .join("admin-state.json")
+            .join("continuity.json")
             .is_file(),
-        "init must pin the administrator state under XDG_STATE_HOME"
+        "init must pin the continuity floor under XDG_STATE_HOME"
     );
 }
 
 #[test]
-fn admin_pin_survives_moving_the_key() {
+fn continuity_floor_survives_moving_the_key() {
     let temporary = tempfile::tempdir().unwrap();
     let storage = temporary.path().join("storage");
     let snapshot = temporary.path().join("storage-snapshot");

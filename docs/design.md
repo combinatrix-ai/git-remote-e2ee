@@ -130,18 +130,22 @@ administrative CAS is never automatically rebased.
 - Packs are decrypted segment by segment directly into `git index-pack`
   oldest-first.
 - After import, every advertised ref must resolve to a complete local Git
-  object graph before the continuity floor or remote-tracking refs move.
-- Authentication alone never advances the continuity floor. The floor advances
-  after a successful import and connectivity check, after the client's own
-  publication wins compare-and-swap, or during listing when every advertised
-  ref already resolves to a complete local object graph. The last case matters
-  because Git skips the helper's fetch command when nothing needs to be
-  transferred, as after a membership change, a deletion, or a tag pointing at
-  an existing object; without it, such a state would never be pinned and a
-  later replay of the previous state would be accepted.
-- Per-repository/remote client-state updates hold an advisory file lock across
-  validation and read-modify-write. The state replacement remains durable and
-  atomic, and its manifest and policy generations never move backward.
+  object graph before the checkout's import progress or remote-tracking refs
+  move.
+- One continuity floor per repository root per machine,
+  `$XDG_STATE_HOME/git-e2ee/<root>/continuity.json`, is the only continuity
+  authority. Listing, fetch, push and dry-run push, `init`, `device-*`,
+  `verify`, and `recover` take its exclusive lock, require the authenticated
+  chain to pass through it, and advance it after success, so concurrent
+  processes on one machine serialize. Listing advances it on authentication
+  and continuity alone; Git omits the fetch command when nothing needs to be
+  transferred (after a membership change, a deletion, or a tag pointing at an
+  existing object), so a floor that waited for fetch would never pin such a
+  state.
+- Each checkout's import progress (`.git/git-remote-e2ee/<root>/progress.json`)
+  records the imported generation, imported pack IDs, and verified ref
+  frontier. It is a cache under its own lock, taken after the floor's, and is
+  never consulted for continuity.
 - The helper advertises `refs/heads/*` and `refs/tags/*`; every other ref
   namespace is rejected before publication.
 - Branch updates require fast-forward ancestry unless force is explicit. Tags
@@ -256,25 +260,22 @@ motivates future garbage collection.
 
 ## Continuity and limits
 
-Returning clients pin repository root, manifest ID/generation, and policy
-generation. They reject rollback, non-descendant state, policy rollback, and
-root substitution. A signed manifest seen by list is not yet a pin: helper
-state advances after all required packs are imported and every advertised ref
-passes the complete-object-graph check, or after the client's own publication
-successfully wins compare-and-swap. A missing or unusable pack therefore cannot
-raise the continuity floor.
+The machine floor pins repository root, manifest ID/generation, and policy
+generation. It rejects rollback, non-descendant state, policy rollback, and
+root substitution. The library takes the state directory as an argument
+(`EncryptedRepository::new(storage, key, state_dir)`); only the binaries read
+`XDG_STATE_HOME`. There is no code path that publishes or fetches without the
+floor.
 
-Each local repository/remote pair has one stable lock file beside its client
-state. Helpers hold the exclusive lock while checking the current floor and
-performing an import or publication update. State writes merge monotonically
-and use the existing flushed temporary-file, rename, and parent-directory
-sync path. Administrator pins use the same serialized, monotonic state update
-rules after initialization or a successful policy transition.
+A single machine-wide floor closes a gap that per-checkout pins left open: a
+revocation seen only by `device-revoke` used to protect administrative
+commands but not a checkout that had not fetched it, so a replayed
+pre-revocation state could receive a new push readable by the revoked device.
 
-State files written by earlier builds are not lowered automatically. Their
-head pin may have come from listing, but it is indistinguishable from a valid
-pin made after the client's own publication; lowering it could weaken rollback
-detection.
+The floor file is replaced with the flushed temporary-file, rename, and
+parent-directory sync path. Its stable `continuity.json.lock` sibling is held
+from validation through advancement. Floor writes are monotonic: a lower
+generation is ignored and a different head at the same generation is a fork.
 
 Storage alone still cannot prevent:
 
@@ -389,8 +390,8 @@ require the current tip to be a single-parent child of it.
 
 `git-e2ee recover` takes a target (a Git remote name or a storage URL),
 plus `--key` and `--repo`. The repository defaults to `.`; the continuity floor
-is read from `.git/git-remote-e2ee/<repository-root>/state.json`, where the root
-comes from the key file. Without `--publish`, the command
+is this machine's `$XDG_STATE_HOME/git-e2ee/<repository-root>/continuity.json`,
+where the root comes from the key file. Without `--publish`, the command
 only reports. Publishing an older offer requires `--discard-newer`. Directory
 publication requires `--accept-stale-floor` and prints the warning above.
 

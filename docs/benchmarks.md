@@ -540,8 +540,11 @@ quadratic in aggregate metadata: each immutable policy generation repeats a
 larger device list and each manifest repeats a larger envelope list. This does
 not multiply content packs.
 
-Push timing also depends on the client path. The direct diagnostic
-`git-e2ee push` has no clone-local continuity pin, so it deliberately validates
+Push timing also depends on the client path. (The direct diagnostic
+`git-e2ee push`/`fetch` mode measured here no longer exists: every push and
+fetch now goes through the continuity floor, and the benchmark scripts use the
+native helper only. The numbers below are kept as recorded.) The direct
+`git-e2ee push` had no clone-local continuity pin, so it deliberately validated
 the complete 100-generation chain on every push. It took 3.12--3.54 seconds in
 this run. Normal Git usage goes through `git-remote-e2ee`; set
 `BENCH_E2EE_PUSH_MODE=native` to benchmark that path. Its first push after 99

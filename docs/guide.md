@@ -44,20 +44,22 @@ repository is its administrator. The key path is stored only in local Git
 configuration. The key file is never written to the encrypted remote and must
 never be committed.
 
-The CLI keeps an administrative continuity pin per repository root at
-`$XDG_STATE_HOME/git-e2ee/<repository-root>/admin-state.json` (by default under
-`~/.local/state`). `device-add`, `device-revoke`, and `device-list` all check
-the storage head against this pin and then advance it, so storage cannot show
-an older membership list, for example one that hides a revocation, once you
-have seen a newer one. Moving or renaming the key file keeps the pin. Back up
-that file together with the key.
+Each machine keeps one continuity floor per repository root at
+`$XDG_STATE_HOME/git-e2ee/<repository-root>/continuity.json` (by default under
+`~/.local/state`). `git fetch`, `git push`, `init`, `device-add`,
+`device-revoke`, `device-list`, `verify`, and `recover` all check the storage
+head against this floor and then advance it, so once anything on this machine
+has seen a state, storage cannot show an older one. For example, after
+`device-revoke` no checkout on this machine will push onto a replayed
+pre-revocation state, even one that never fetched the revocation. Moving or
+renaming the key file, renaming a Git remote, or adding a second remote or
+clone for the same repository keeps the floor. Every remote for one
+repository root shares it, so a mirror that lags behind the newest state you
+have seen is reported as rolled back. Back up that file together with the key.
 
-Inside a Git repository, the continuity pin is likewise kept per repository
-root at `.git/git-remote-e2ee/<repository-root>/state.json`, not per Git remote
-name. Renaming a remote or adding a second remote for the same encrypted
-repository keeps rollback protection. Every remote for one repository root
-shares one floor, so a mirror that lags behind the newest state you have seen
-is reported as rolled back.
+Each clone also records its own import progress under
+`.git/git-remote-e2ee/<repository-root>/`. That is a cache of work already
+done; deleting it only causes a full re-import.
 
 ## Git host as storage (carrier-Git backend)
 
@@ -237,11 +239,11 @@ cd /work/my-clone
 git-e2ee recover origin
 ```
 
-The local floor is read from
-`<repo>/.git/git-remote-e2ee/<repository-root>/state.json`; use a repository
-that previously fetched or pushed. The remote name does not matter. A fresh clone has no floor,
-so recovery reports that freshness and fork identity are unverified and will
-not publish.
+The local floor is this machine's
+`$XDG_STATE_HOME/git-e2ee/<repository-root>/continuity.json`, so run recovery
+on a machine that previously used the repository. A machine that never did has
+no floor, so recovery reports that freshness and fork identity are unverified
+and will not publish.
 
 Review the offered manifest IDs, generations, verified signers, replays, and
 any fork report. Recovery is allowed only when the current head is demonstrably

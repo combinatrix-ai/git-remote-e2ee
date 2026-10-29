@@ -6,7 +6,7 @@ Windows and virtual-power-cut results below were verified on 2026-09-23.
 
 ## Publication sequence
 
-Client continuity state (`state.json`), filesystem `HEAD`, and immutable
+The continuity floor (`continuity.json`), filesystem `HEAD`, and immutable
 objects use the same flush rules:
 
 1. Create any missing directory that will hold the published name, then flush
@@ -19,7 +19,7 @@ objects use the same flush rules:
 2. Write a temporary file and `File::sync_all` it. Return the error if that
    fails.
 3. Publish the name.
-   - `state.json` and `HEAD` use `rename` in the destination directory and
+   - `continuity.json` and `HEAD` use `rename` in the destination directory and
      replace an existing file.
    - Immutable objects use `hard_link` from `.staging/<temp>` to
      `packs/<prefix>/<id>`. Those are different directories on the same
@@ -33,9 +33,9 @@ objects use the same flush rules:
 `FilesystemStorage::initialize` creates `packs` and `manifests`
 with the same directory helper, so the storage root (the preexisting ancestor)
 is flushed when those directories are new. A later object shard flushes the new
-`<prefix>` directory and `packs`, not the storage root again. Client state
-creates `.git/git-remote-e2ee/<remote>` the same way and stops at `.git` when
-that directory already exists.
+`<prefix>` directory and `packs`, not the storage root again. The floor
+creates `$XDG_STATE_HOME/git-e2ee/<repository-root>` the same way and stops at
+the deepest directory that already exists.
 
 The carrier-Git backend does not use this helper. Its compare-and-swap is the
 fast-forward push of the carrier branch (`refs/heads/main` by default).
@@ -199,7 +199,7 @@ above, and panics otherwise.
 
 Ops are isolated inside the fixture:
 
-- `client_state` → `<fixture>\client\state.json` via `persist_client_state`
+- `client_state` → `<fixture>\client\durability-fixture\continuity.json` via the continuity-floor writer
 - `head` → `<fixture>\head\HEAD` via `FilesystemStorage::compare_and_swap_head`
 - `object` → `<fixture>\object-store\objects\<prefix>\<id>` via `put_object_if_absent`
 
