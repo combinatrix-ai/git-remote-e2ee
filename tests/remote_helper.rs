@@ -1,3 +1,4 @@
+use git_remote_e2ee::gitcmd::GitRepository;
 mod support;
 
 use std::env;
@@ -170,7 +171,9 @@ fn concurrent_helper_processes_preserve_the_client_state_floor() {
     encrypted.initialize("owner").unwrap();
     configure_remote(&source, &remote_path, &key_path);
     configure_remote(&destination, &remote_path, &key_path);
-    encrypted.fetch_into(&destination, "private").unwrap();
+    encrypted
+        .fetch_into(&GitRepository::open(&destination).unwrap(), "private")
+        .unwrap();
 
     fs::write(source.join("note.md"), "first\n").unwrap();
     git(&source, &["add", "note.md"], false);
@@ -437,7 +440,7 @@ fn native_git_fetch_rejects_same_generation_manifest_fork() {
     fork.initialize("owner").unwrap();
     let fork_head = fork
         .push(
-            &source,
+            &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
                 source: "refs/heads/main",
@@ -610,13 +613,26 @@ fn native_git_fetch_reimports_packs_after_local_objects_are_pruned() {
         helper_git(&source, &["push", "-q", "private", branch]);
     }
 
+    // Git may run detached auto-maintenance after a fetch, which can repack
+    // or prune concurrently with the explicit prune below and make the test
+    // nondeterministic on fast CI runners. Disable it and prune explicitly.
+    for setting in [
+        "maintenance.auto=false",
+        "gc.auto=0",
+        "gc.autoDetach=false",
+        "fetch.writeCommitGraph=false",
+    ] {
+        let (key, value) = setting.split_once('=').unwrap();
+        git(&destination, &["config", key, value], false);
+    }
     helper_git(&destination, &["fetch", "-q", "private"]);
     git(
         &destination,
         &["update-ref", "-d", "refs/remotes/private/feature"],
         false,
     );
-    git(&destination, &["gc", "-q", "--prune=now"], false);
+    git(&destination, &["repack", "-a", "-d", "-q"], false);
+    git(&destination, &["prune", "--expire=now"], false);
     assert!(
         !git_output(&destination, &["cat-file", "-e", &heads[1]], false)
             .status

@@ -1,3 +1,4 @@
+use git_remote_e2ee::gitcmd::GitRepository;
 mod support;
 
 use std::env;
@@ -272,7 +273,9 @@ fn read_only_device_cannot_publish_recovery() {
             DeviceRoles::reader(),
         )
         .unwrap();
-    owner_repository.fetch_into(&reader_repo, "origin").unwrap();
+    owner_repository
+        .fetch_into(&GitRepository::open(&reader_repo).unwrap(), "origin")
+        .unwrap();
     let (floor_id, _) = owner_repository.current_manifest().unwrap();
     let invalid_bytes = b"malformed but content-addressed manifest";
     let invalid_id = git_remote_e2ee::crypto::object_id(invalid_bytes);
@@ -286,7 +289,7 @@ fn read_only_device_cannot_publish_recovery() {
     let read_only = EncryptedRepository::new(storage.clone(), reader, support::state_dir());
     let report = read_only
         .recover(
-            &reader_repo,
+            &GitRepository::open(&reader_repo).unwrap(),
             RecoveryOptions {
                 publish: true,
                 base: None,

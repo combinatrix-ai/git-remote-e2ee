@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -17,6 +17,7 @@ use crate::error::{
     ObjectUnavailable, Unsupported,
 };
 use crate::git;
+use crate::gitcmd::{self, GitRepository};
 use crate::manifest::{
     Manifest, ManifestAuthorization, ManifestHeader, OpenedManifest, PackDescriptor, open_manifest,
     pack_aad, peek_manifest_header, seal_manifest, unwrap_generation_key, unwrap_predecessor_key,
@@ -265,9 +266,9 @@ impl<S: Storage> EncryptedRepository<S> {
     /// Continuity progress is keyed by repository root rather than by Git
     /// remote name, so `git remote rename` or a second remote for the same
     /// encrypted repository shares it.
-    fn open_checkout(&self, repo: &Path) -> Result<Checkout> {
-        git::ensure_repository(repo)?;
-        let directory = git_state_directory(repo)?
+    fn open_checkout(&self, repo: &GitRepository) -> Result<Checkout> {
+        let directory = repo
+            .git_dir()
             .join("git-remote-e2ee")
             .join(&self.key.repository_root);
         crate::persist::create_dir_all_durable(&directory)
@@ -460,7 +461,7 @@ impl<S: Storage> EncryptedRepository<S> {
     /// manifest ID that holds it.
     pub fn push(
         &self,
-        repo: &Path,
+        repo: &GitRepository,
         destination_ref: &str,
         change: RefChange<'_>,
     ) -> Result<String> {
@@ -575,7 +576,7 @@ impl<S: Storage> EncryptedRepository<S> {
     /// Runs every check `push` would, without publishing (`git push --dry-run`).
     pub fn check_push(
         &self,
-        repo: &Path,
+        repo: &GitRepository,
         destination_ref: &str,
         change: RefChange<'_>,
     ) -> Result<()> {
@@ -586,12 +587,11 @@ impl<S: Storage> EncryptedRepository<S> {
 
     fn preflight_ref_change(
         &self,
-        repo: &Path,
+        repo: &GitRepository,
         floor: &FloorGuard,
         destination_ref: &str,
         change: RefChange<'_>,
     ) -> Result<(OpenedState, Option<String>, bool)> {
-        git::ensure_repository(repo)?;
         let ref_kind = git::validate_inner_ref(repo, destination_ref)?;
         let chain = self.pinned_chain(floor)?;
         let current = chain.first().context("manifest chain is empty")?.clone();
@@ -646,7 +646,7 @@ impl<S: Storage> EncryptedRepository<S> {
 
     /// Imports the current generation and points `refs/remotes/<remote_name>/*`
     /// and tags at its refs, as `git fetch` through the helper would.
-    pub fn fetch_into(&self, repo: &Path, remote_name: &str) -> Result<Manifest> {
+    pub fn fetch_into(&self, repo: &GitRepository, remote_name: &str) -> Result<Manifest> {
         let manifest = self.import_packs(repo)?;
         for (reference, object) in &manifest.refs {
             match git::validate_inner_ref(repo, reference)? {
@@ -660,7 +660,7 @@ impl<S: Storage> EncryptedRepository<S> {
         Ok(manifest)
     }
 
-    pub fn observe_manifest(&self, repo: &Path) -> Result<Manifest> {
+    pub fn observe_manifest(&self, repo: &GitRepository) -> Result<Manifest> {
         let floor = self.lock_floor()?;
         let checkout = self.open_checkout(repo)?;
         let chain = self.pinned_chain(&floor)?;
@@ -687,7 +687,7 @@ impl<S: Storage> EncryptedRepository<S> {
         Ok(current.manifest.clone())
     }
 
-    pub fn import_packs(&self, repo: &Path) -> Result<Manifest> {
+    pub fn import_packs(&self, repo: &GitRepository) -> Result<Manifest> {
         let floor = self.lock_floor()?;
         let checkout = self.open_checkout(repo)?;
         let chain = self.pinned_chain(&floor)?;
@@ -725,7 +725,7 @@ impl<S: Storage> EncryptedRepository<S> {
     /// `after_generation`, recording each pack ID in `imported`.
     fn import_chain_packs(
         &self,
-        repo: &Path,
+        repo: &GitRepository,
         chain: &[OpenedState],
         after_generation: Option<u64>,
         imported: &mut HashSet<String>,
@@ -810,7 +810,11 @@ impl<S: Storage> EncryptedRepository<S> {
         Ok(current.manifest.clone())
     }
 
-    pub fn recover(&self, repo: &Path, options: RecoveryOptions<'_>) -> Result<RecoveryReport> {
+    pub fn recover(
+        &self,
+        repo: &GitRepository,
+        options: RecoveryOptions<'_>,
+    ) -> Result<RecoveryReport> {
         let floor_guard = self.lock_floor()?;
         let checkout = self.open_checkout(repo)?;
         let local_floor = floor_guard.read()?;
@@ -1315,10 +1319,8 @@ impl<S: Storage> EncryptedRepository<S> {
 
     fn verify_base_graph(&self, chain: &[OpenedState]) -> Result<()> {
         let temporary = tempfile::tempdir()?;
-        let init = std::process::Command::new("git")
-            .arg("init")
-            .arg("--bare")
-            .arg("--quiet")
+        let init = gitcmd::without_repository()
+            .args(["init", "--bare", "--quiet"])
             .arg(temporary.path())
             .output()?;
         if !init.status.success() {
@@ -1327,6 +1329,7 @@ impl<S: Storage> EncryptedRepository<S> {
                 String::from_utf8_lossy(&init.stderr).trim()
             )
         }
+        let scratch = GitRepository::owned_git_dir(temporary.path());
         for entry in chain.iter().rev() {
             for descriptor in &entry.manifest.new_packs {
                 let encrypted = self.storage.open_object(ObjectKind::Pack, &descriptor.id)?;
@@ -1337,7 +1340,7 @@ impl<S: Storage> EncryptedRepository<S> {
                     SubkeyKind::Pack,
                     descriptor.ordinal,
                 )?;
-                let mut importer = git::start_pack_import(temporary.path())?;
+                let mut importer = git::start_pack_import(&scratch)?;
                 open_pack_stream(
                     &pack_key,
                     encrypted,
@@ -1354,7 +1357,7 @@ impl<S: Storage> EncryptedRepository<S> {
             }
         }
         git::ensure_refs_connected_since(
-            temporary.path(),
+            &scratch,
             &chain
                 .first()
                 .context("selected recovery chain is empty")?
@@ -1769,18 +1772,6 @@ fn record_rejected_head(
         log.entries.drain(..remove);
     }
     write_json(&path, &log)
-}
-
-fn git_state_directory(repo: &Path) -> Result<PathBuf> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["rev-parse", "--absolute-git-dir"])
-        .output()?;
-    if !output.status.success() {
-        bail!("could not locate Git directory")
-    }
-    Ok(String::from_utf8(output.stdout)?.trim().into())
 }
 
 #[cfg(test)]

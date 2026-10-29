@@ -1,10 +1,10 @@
 use std::io::{self, BufRead, Write};
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use git_remote_e2ee::continuity::default_state_dir;
 use git_remote_e2ee::crypto::KeyFile;
+use git_remote_e2ee::gitcmd::GitRepository;
 use git_remote_e2ee::repository::{EncryptedRepository, PushRejection, ReadOnlyDevice, RefChange};
 use git_remote_e2ee::storage::{CasConflict, FilesystemStorage, GitStorage, Storage};
 use git_remote_e2ee::url::StorageUrl;
@@ -24,25 +24,32 @@ fn run() -> Result<()> {
         bail!("unexpected extra argument")
     }
 
-    let key_path = configured_key_path(&remote_name)?;
+    let local = GitRepository::from_environment()?
+        .context("the e2ee remote helper must run inside a Git repository")?;
+    let key_path = configured_key_path(&local, &remote_name)?;
     let key = KeyFile::read(&key_path)?;
     let storage = StorageUrl::parse(&url)?;
-    persist_absolute_url(&remote_name, &url, &storage)?;
+    persist_absolute_url(&local, &remote_name, &url, &storage)?;
     let state_dir = default_state_dir()?;
     match storage {
         StorageUrl::Directory(path) => run_protocol(
             EncryptedRepository::new(FilesystemStorage::new(path), key, state_dir),
+            &local,
             remote_name,
         ),
         StorageUrl::Git(remote) => run_protocol(
             EncryptedRepository::new(GitStorage::open(&remote)?, key, state_dir),
+            &local,
             remote_name,
         ),
     }
 }
 
-fn run_protocol<S: Storage>(repository: EncryptedRepository<S>, remote_name: String) -> Result<()> {
-    let local_repository = Path::new(".");
+fn run_protocol<S: Storage>(
+    repository: EncryptedRepository<S>,
+    local_repository: &GitRepository,
+    remote_name: String,
+) -> Result<()> {
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();
     let stdout = io::stdout();
@@ -120,7 +127,7 @@ fn run_protocol<S: Storage>(repository: EncryptedRepository<S>, remote_name: Str
 
 fn process_push_batch<S: git_remote_e2ee::storage::Storage>(
     repository: &EncryptedRepository<S>,
-    local_repository: &Path,
+    local_repository: &GitRepository,
     remote_name: &str,
     first: &str,
     lines: &mut impl Iterator<Item = io::Result<String>>,
@@ -215,15 +222,16 @@ fn consume_batch(
     Ok(())
 }
 
-fn configured_key_path(remote_name: &str) -> Result<PathBuf> {
+fn configured_key_path(local: &GitRepository, remote_name: &str) -> Result<PathBuf> {
     let key = format!("remote.{remote_name}.e2ee-key");
-    if let Some(path) = configured_path(&key)? {
+    if let Some(path) = configured_path(local, &key)? {
         return Ok(path);
     }
-    if let Some(path) = configured_path("e2ee.key")? {
+    if let Some(path) = configured_path(local, "e2ee.key")? {
         let path = std::path::absolute(&path)
             .with_context(|| format!("resolve key path {}", path.display()))?;
-        set_local_config(&key, &path.to_string_lossy()).context("persist clone-time key config")?;
+        set_local_config(local, &key, &path.to_string_lossy())
+            .context("persist clone-time key config")?;
         return Ok(path);
     }
     bail!("missing Git config {key} (or clone-time e2ee.key)")
@@ -232,21 +240,27 @@ fn configured_key_path(remote_name: &str) -> Result<PathBuf> {
 /// A relative storage path in a clone URL is resolved against the directory
 /// `git clone` ran in, which later fetches from inside the clone do not share.
 /// Rewrite the remote's URL to the absolute path the first time it is seen.
-fn persist_absolute_url(remote_name: &str, url: &str, storage: &StorageUrl) -> Result<()> {
+fn persist_absolute_url(
+    local: &GitRepository,
+    remote_name: &str,
+    url: &str,
+    storage: &StorageUrl,
+) -> Result<()> {
     let absolute = storage.to_string();
     let key = format!("remote.{remote_name}.url");
-    let Some(configured) = configured_value(&key)? else {
+    let Some(configured) = configured_value(local, &key)? else {
         return Ok(());
     };
     let as_given = format!("e2ee::{}", url.strip_prefix("e2ee::").unwrap_or(url));
     if configured != as_given || configured == absolute {
         return Ok(());
     }
-    set_local_config(&key, &absolute).context("persist absolute remote URL")
+    set_local_config(local, &key, &absolute).context("persist absolute remote URL")
 }
 
-fn set_local_config(key: &str, value: &str) -> Result<()> {
-    let output = Command::new("git")
+fn set_local_config(local: &GitRepository, key: &str, value: &str) -> Result<()> {
+    let output = local
+        .git()
         .args(["config", "--local", key, value])
         .output()?;
     if !output.status.success() {
@@ -258,10 +272,8 @@ fn set_local_config(key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn configured_value(key: &str) -> Result<Option<String>> {
-    let output = Command::new("git")
-        .args(["config", "--get", key])
-        .output()?;
+fn configured_value(local: &GitRepository, key: &str) -> Result<Option<String>> {
+    let output = local.git().args(["config", "--get", key]).output()?;
     if output.status.success() {
         Ok(Some(String::from_utf8(output.stdout)?.trim().to_owned()))
     } else {
@@ -269,8 +281,9 @@ fn configured_value(key: &str) -> Result<Option<String>> {
     }
 }
 
-fn configured_path(key: &str) -> Result<Option<PathBuf>> {
-    let output = Command::new("git")
+fn configured_path(local: &GitRepository, key: &str) -> Result<Option<PathBuf>> {
+    let output = local
+        .git()
         .args(["config", "--path", "--get", key])
         .output()?;
     if output.status.success() {

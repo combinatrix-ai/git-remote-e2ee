@@ -1,3 +1,4 @@
+use git_remote_e2ee::gitcmd::GitRepository;
 mod support;
 
 use std::collections::BTreeMap;
@@ -422,7 +423,7 @@ fn carrier_git_allows_exactly_one_concurrent_writer() {
     let first = thread::spawn(move || {
         barrier_a.wait();
         repository_a.push(
-            &source_a,
+            &GitRepository::open(&source_a).unwrap(),
             "refs/heads/writer-a",
             RefChange::Update {
                 source: "refs/heads/main",
@@ -434,7 +435,7 @@ fn carrier_git_allows_exactly_one_concurrent_writer() {
     let second = thread::spawn(move || {
         barrier_b.wait();
         repository_b.push(
-            &source_b,
+            &GitRepository::open(&source_b).unwrap(),
             "refs/heads/writer-b",
             RefChange::Update {
                 source: "refs/heads/main",
@@ -510,14 +511,26 @@ fn stale_carrier_views_on_one_machine_refresh_instead_of_reporting_rollback() {
     let stale_fetch = open();
     let stale_push_main = open();
     let stale_push_new = open();
-    open().push(&source_a, "refs/heads/main", update).unwrap();
+    open()
+        .push(
+            &GitRepository::open(&source_a).unwrap(),
+            "refs/heads/main",
+            update,
+        )
+        .unwrap();
     assert_eq!(support::read_floor(&key.repository_root)["generation"], 1);
 
-    let manifest = stale_fetch.fetch_into(&fetched, "private").unwrap();
+    let manifest = stale_fetch
+        .fetch_into(&GitRepository::open(&fetched).unwrap(), "private")
+        .unwrap();
     assert_eq!(manifest.generation, 1);
 
     let error = stale_push_main
-        .push(&source_b, "refs/heads/main", update)
+        .push(
+            &GitRepository::open(&source_b).unwrap(),
+            "refs/heads/main",
+            update,
+        )
         .unwrap_err();
     let rejected_as_fetch_first = error
         .downcast_ref::<PushRejection>()
@@ -526,7 +539,11 @@ fn stale_carrier_views_on_one_machine_refresh_instead_of_reporting_rollback() {
     assert!(rejected_as_fetch_first, "{error:#}");
 
     stale_push_new
-        .push(&source_b, "refs/heads/writer-b", update)
+        .push(
+            &GitRepository::open(&source_b).unwrap(),
+            "refs/heads/writer-b",
+            update,
+        )
         .unwrap();
     let manifest = open().verify().unwrap();
     assert_eq!(manifest.generation, 2);
@@ -686,6 +703,16 @@ fn deleted_and_corrupt_carrier_caches_are_rebuilt() {
     assert_eq!(
         reachable_object_count(&cache_repo(&cache_root)),
         reachable_object_count(&carrier)
+    );
+    let generations: Vec<_> = fs::read_dir(cache.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().starts_with("objects-"))
+        .collect();
+    assert_eq!(
+        generations.len(),
+        1,
+        "the rebuild left replaced generations: {generations:?}"
     );
 }
 
@@ -890,7 +917,7 @@ fn carrier_git_detects_tampered_ciphertext_chunk() {
         support::state_dir(),
     )
     .push(
-        &source,
+        &GitRepository::open(&source).unwrap(),
         "refs/heads/main",
         RefChange::Update {
             source: "refs/heads/main",
@@ -989,7 +1016,7 @@ fn carrier_recovery_chooses_legitimate_descendant_and_restores_deleted_ciphertex
     let pushed_object = git(&source, &["rev-parse", "HEAD"], false);
     repository
         .push(
-            &source,
+            &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
                 source: "refs/heads/main",
@@ -1006,7 +1033,7 @@ fn carrier_recovery_chooses_legitimate_descendant_and_restores_deleted_ciphertex
         owner.clone(),
         &returning_machine,
     )
-    .fetch_into(&returning, "private")
+    .fetch_into(&GitRepository::open(&returning).unwrap(), "private")
     .unwrap();
     let floor_generation: u64 = serde_json::from_slice::<serde_json::Value>(
         &fs::read(
@@ -1065,7 +1092,7 @@ fn carrier_recovery_chooses_legitimate_descendant_and_restores_deleted_ciphertex
     let recoverer = EncryptedRepository::new(recovery_storage, owner.clone(), &returning_machine);
     let report = recoverer
         .recover(
-            &returning,
+            &GitRepository::open(&returning).unwrap(),
             RecoveryOptions {
                 publish: false,
                 base: None,
@@ -1086,7 +1113,7 @@ fn carrier_recovery_chooses_legitimate_descendant_and_restores_deleted_ciphertex
 
     let older_base = recoverer
         .recover(
-            &returning,
+            &GitRepository::open(&returning).unwrap(),
             RecoveryOptions {
                 publish: true,
                 base: Some(&floor_id),
@@ -1105,7 +1132,7 @@ fn carrier_recovery_chooses_legitimate_descendant_and_restores_deleted_ciphertex
 
     let recovered = recoverer
         .recover(
-            &returning,
+            &GitRepository::open(&returning).unwrap(),
             RecoveryOptions {
                 publish: true,
                 base: None,
@@ -1133,8 +1160,12 @@ fn carrier_recovery_chooses_legitimate_descendant_and_restores_deleted_ciphertex
     let recovered_header = peek_manifest_header(&recovered_bytes).unwrap();
     assert!(unwrap_generation_key(&recovered_header, &reader).is_err());
 
-    recoverer.fetch_into(&returning, "private").unwrap();
-    recoverer.fetch_into(&fresh, "private").unwrap();
+    recoverer
+        .fetch_into(&GitRepository::open(&returning).unwrap(), "private")
+        .unwrap();
+    recoverer
+        .fetch_into(&GitRepository::open(&fresh).unwrap(), "private")
+        .unwrap();
     assert_eq!(
         git(
             &fresh,
@@ -1210,13 +1241,13 @@ fn carrier_recovery_offers_hidden_legitimate_content_descendant() {
         owner.clone(),
         &returning_machine,
     )
-    .fetch_into(&returning, "private")
+    .fetch_into(&GitRepository::open(&returning).unwrap(), "private")
     .unwrap();
 
     let pushed_object = git(&source, &["rev-parse", "HEAD"], false);
     repository
         .push(
-            &source,
+            &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
                 source: "refs/heads/main",
@@ -1264,7 +1295,7 @@ fn carrier_recovery_offers_hidden_legitimate_content_descendant() {
     );
     let report = recoverer
         .recover(
-            &returning,
+            &GitRepository::open(&returning).unwrap(),
             RecoveryOptions {
                 publish: false,
                 base: None,
@@ -1282,7 +1313,7 @@ fn carrier_recovery_offers_hidden_legitimate_content_descendant() {
 
     let stale_choice = recoverer
         .recover(
-            &returning,
+            &GitRepository::open(&returning).unwrap(),
             RecoveryOptions {
                 publish: true,
                 base: Some(&floor_id),
@@ -1301,7 +1332,7 @@ fn carrier_recovery_offers_hidden_legitimate_content_descendant() {
 
     let recovered = recoverer
         .recover(
-            &returning,
+            &GitRepository::open(&returning).unwrap(),
             RecoveryOptions {
                 publish: true,
                 base: None,
@@ -1315,8 +1346,12 @@ fn carrier_recovery_offers_hidden_legitimate_content_descendant() {
     assert_eq!(head, recovered_id);
     assert_eq!(manifest.previous.as_deref(), Some(legitimate_id.as_str()));
     assert_eq!(manifest.refs["refs/heads/main"], pushed_object);
-    recoverer.fetch_into(&returning, "private").unwrap();
-    recoverer.fetch_into(&fresh, "private").unwrap();
+    recoverer
+        .fetch_into(&GitRepository::open(&returning).unwrap(), "private")
+        .unwrap();
+    recoverer
+        .fetch_into(&GitRepository::open(&fresh).unwrap(), "private")
+        .unwrap();
     assert_eq!(
         git(
             &fresh,
@@ -1372,10 +1407,12 @@ fn carrier_recovery_refuses_history_with_a_merge_hiding_a_legitimate_state() {
             .unwrap(),
     )
     .unwrap();
-    repository.fetch_into(&returning, "private").unwrap();
+    repository
+        .fetch_into(&GitRepository::open(&returning).unwrap(), "private")
+        .unwrap();
     repository
         .push(
-            &source,
+            &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
                 source: "refs/heads/main",
@@ -1435,7 +1472,7 @@ fn carrier_recovery_refuses_history_with_a_merge_hiding_a_legitimate_state() {
     );
     let error = recoverer
         .recover(
-            &returning,
+            &GitRepository::open(&returning).unwrap(),
             RecoveryOptions {
                 publish: true,
                 base: None,
@@ -1480,7 +1517,9 @@ fn carrier_recovery_refuses_conflicting_authenticated_descendants() {
             DeviceRoles::reader(),
         )
         .unwrap();
-    repository.fetch_into(&returning, "private").unwrap();
+    repository
+        .fetch_into(&GitRepository::open(&returning).unwrap(), "private")
+        .unwrap();
 
     let policy_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
     let policy_encrypted = policy_storage
@@ -1529,7 +1568,7 @@ fn carrier_recovery_refuses_conflicting_authenticated_descendants() {
     let recovery_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
     let report = EncryptedRepository::new(recovery_storage, owner, support::state_dir())
         .recover(
-            &returning,
+            &GitRepository::open(&returning).unwrap(),
             RecoveryOptions {
                 publish: true,
                 base: None,
@@ -1594,7 +1633,9 @@ fn carrier_recovery_loses_cas_without_retrying_when_another_writer_publishes() {
             DeviceRoles::reader(),
         )
         .unwrap();
-    repository.fetch_into(&returning, "private").unwrap();
+    repository
+        .fetch_into(&GitRepository::open(&returning).unwrap(), "private")
+        .unwrap();
     let policy_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
     let policy_encrypted = policy_storage
         .get_object(ObjectKind::Manifest, &floor_id)
@@ -1621,7 +1662,7 @@ fn carrier_recovery_loses_cas_without_retrying_when_another_writer_publishes() {
         EncryptedRepository::new(stale_storage, owner.clone(), support::state_dir());
     let offered = stale_recoverer
         .recover(
-            &returning,
+            &GitRepository::open(&returning).unwrap(),
             RecoveryOptions {
                 publish: false,
                 base: None,
@@ -1647,7 +1688,7 @@ fn carrier_recovery_loses_cas_without_retrying_when_another_writer_publishes() {
 
     let error = stale_recoverer
         .recover(
-            &returning,
+            &GitRepository::open(&returning).unwrap(),
             RecoveryOptions {
                 publish: true,
                 base: None,
@@ -2174,7 +2215,7 @@ fn carrier_recovery_classifies_missing_head_manifest_as_unavailable() {
     );
     repository
         .push(
-            &source,
+            &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
                 source: "refs/heads/main",
@@ -2182,7 +2223,9 @@ fn carrier_recovery_classifies_missing_head_manifest_as_unavailable() {
             },
         )
         .unwrap();
-    repository.fetch_into(&returning, "private").unwrap();
+    repository
+        .fetch_into(&GitRepository::open(&returning).unwrap(), "private")
+        .unwrap();
 
     fs::write(source.join("note.md"), "second content\n").unwrap();
     git(&source, &["commit", "-q", "-am", "second"], false);
@@ -2193,7 +2236,7 @@ fn carrier_recovery_classifies_missing_head_manifest_as_unavailable() {
     );
     repository
         .push(
-            &source,
+            &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
                 source: "refs/heads/main",
@@ -2219,7 +2262,7 @@ fn carrier_recovery_classifies_missing_head_manifest_as_unavailable() {
             support::state_dir(),
         )
         .recover(
-            &returning,
+            &GitRepository::open(&returning).unwrap(),
             RecoveryOptions {
                 publish,
                 base: None,
@@ -2264,7 +2307,7 @@ fn carrier_recovery_refuses_to_skip_a_historical_head_with_missing_objects() {
     );
     repository
         .push(
-            &source,
+            &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
                 source: "refs/heads/main",
@@ -2272,7 +2315,9 @@ fn carrier_recovery_refuses_to_skip_a_historical_head_with_missing_objects() {
             },
         )
         .unwrap();
-    repository.fetch_into(&returning, "private").unwrap();
+    repository
+        .fetch_into(&GitRepository::open(&returning).unwrap(), "private")
+        .unwrap();
     let (floor_id, floor) = repository.current_manifest().unwrap();
 
     let uncommitted = GitStorage::open(carrier.to_str().unwrap()).unwrap();
@@ -2311,7 +2356,7 @@ fn carrier_recovery_refuses_to_skip_a_historical_head_with_missing_objects() {
         support::state_dir(),
     )
     .recover(
-        &returning,
+        &GitRepository::open(&returning).unwrap(),
         RecoveryOptions {
             publish: true,
             base: None,
@@ -2350,7 +2395,7 @@ fn carrier_history_reads_skip_corrupt_copies_for_an_older_valid_one() {
     );
     repository
         .push(
-            &source,
+            &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
                 source: "refs/heads/main",
@@ -2427,7 +2472,7 @@ fn carrier_historical_restore_charges_rejected_copies_against_its_byte_budget() 
     );
     repository
         .push(
-            &source,
+            &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
                 source: "refs/heads/main",
@@ -2507,7 +2552,7 @@ fn recover_junk_head_after_later_writer_push(recover_as_owner: bool) {
         .unwrap();
     open(&writer)
         .push(
-            &writer_checkout,
+            &GitRepository::open(&writer_checkout).unwrap(),
             "refs/heads/main",
             RefChange::Update {
                 source: "refs/heads/main",
@@ -2515,7 +2560,9 @@ fn recover_junk_head_after_later_writer_push(recover_as_owner: bool) {
             },
         )
         .unwrap();
-    open(&owner).fetch_into(&owner_checkout, "origin").unwrap();
+    open(&owner)
+        .fetch_into(&GitRepository::open(&owner_checkout).unwrap(), "origin")
+        .unwrap();
     let (floor_id, _) = open(&owner).current_manifest().unwrap();
 
     edit_carrier(
@@ -2534,7 +2581,7 @@ fn recover_junk_head_after_later_writer_push(recover_as_owner: bool) {
     let recover = |publish| {
         open(key)
             .recover(
-                checkout,
+                &GitRepository::open(checkout).unwrap(),
                 RecoveryOptions {
                     publish,
                     base: None,

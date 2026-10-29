@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
@@ -14,6 +14,7 @@ use thiserror::Error;
 
 use crate::bounded::{self, Bounded, Opened};
 use crate::error::{BudgetExhausted, ObjectUnavailable};
+use crate::gitcmd::{self, GitRepository};
 use crate::trace;
 
 #[derive(Debug, Error)]
@@ -631,6 +632,8 @@ const CARRIER_ROOT_ENTRIES: [&str; 6] = [
     "packs",
 ];
 const MAX_RECOVERY_OUTER_COMMITS: usize = 2048;
+const CARRIER_COMMIT_MESSAGE: &str = "git-remote-e2ee storage update";
+const CARRIER_IDENTITY: (&str, &str) = ("git-remote-e2ee", "git-remote-e2ee@invalid");
 
 pub struct GitStorage {
     checkout: tempfile::TempDir,
@@ -699,9 +702,8 @@ enum BatchHeader {
 
 impl CatFile {
     fn spawn(repo: &Path) -> Result<Self> {
-        let mut child = carrier_git_command()
-            .arg("-C")
-            .arg(repo)
+        let mut child = GitRepository::owned_work_tree(repo)
+            .git()
             .args(["cat-file", "--batch"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1158,9 +1160,8 @@ impl GitStorage {
 
     fn commit_history(&self, limit: usize) -> Result<Vec<String>> {
         let maximum = limit.saturating_add(1).to_string();
-        let output = carrier_git_command()
-            .arg("-C")
-            .arg(self.root())
+        let output = GitRepository::owned_work_tree(self.root())
+            .git()
             .args([
                 "rev-list",
                 "--parents",
@@ -1187,12 +1188,7 @@ impl GitStorage {
         Ok(commits)
     }
 
-    fn chunk_entries_at(
-        &self,
-        commit: &str,
-        kind: ObjectKind,
-        id: &str,
-    ) -> Result<Option<Vec<(String, String)>>> {
+    fn chunk_entries_at(&self, commit: &str, kind: ObjectKind, id: &str) -> Result<CarrierListing> {
         carrier_chunk_entries(self.root(), commit, kind, id)
     }
 
@@ -1204,9 +1200,8 @@ impl GitStorage {
             return Ok(Vec::new());
         };
         let directory = format!("{}/{}/{id}", kind.directory(), &id[..2]);
-        let output = carrier_git_command()
-            .arg("-C")
-            .arg(self.root())
+        let output = GitRepository::owned_work_tree(self.root())
+            .git()
             .args([
                 "rev-list",
                 &format!("--max-count={}", window.len()),
@@ -1236,11 +1231,8 @@ impl GitStorage {
         id: &str,
         mut sink: impl FnMut(usize, &[u8]) -> Result<()>,
     ) -> Result<bool> {
-        let chunks = match self.chunk_entries_at(commit, kind, id) {
-            Ok(Some(chunks)) => chunks,
-            Ok(None) => return Ok(false),
-            Err(error) if error.is::<std::io::Error>() => return Err(error),
-            Err(_) => return Ok(false),
+        let CarrierListing::Chunks(chunks) = self.chunk_entries_at(commit, kind, id)? else {
+            return Ok(false);
         };
         let mut reader = GitChunkReader::new(self.root(), chunks)?;
         let mut hasher = Sha256::new();
@@ -1292,19 +1284,27 @@ impl GitStorage {
         stage_carrier_checkout(self.root(), &cache.path.join("objects"))?;
         drop(add_timer);
         let commit_timer = trace::Span::new("carrier_git_commit");
-        git_command_with_object_directory(
+        let objects = cache.path.join("objects");
+        let tree = git_text_with_object_directory(self.root(), &objects, &["write-tree"])?;
+        let mut commit_tree = vec!["commit-tree", "--no-gpg-sign", "-m", CARRIER_COMMIT_MESSAGE];
+        if let Some(parent) = base_commit {
+            commit_tree.extend(["-p", parent]);
+        }
+        commit_tree.push(&tree);
+        let new_commit = git_text_with_object_directory(self.root(), &objects, &commit_tree)?;
+        git_command(
             self.root(),
-            &cache.path.join("objects"),
-            &["commit", "--quiet", "-m", "git-remote-e2ee storage update"],
+            &[
+                "update-ref",
+                &format!("refs/heads/{}", self.branch),
+                &new_commit,
+            ],
         )?;
-        let new_commit =
-            git_rev_parse(self.root(), "HEAD")?.context("carrier commit was not created")?;
         drop(commit_timer);
         let push_timer = trace::Span::new("carrier_git_push");
-        let push = carrier_git_command()
-            .arg("-C")
-            .arg(self.root())
-            .args(["push", "--quiet", "origin"])
+        let push = GitRepository::owned_work_tree(self.root())
+            .transport()
+            .args(["push", "--quiet", "--no-verify", "origin"])
             .arg(format!("HEAD:refs/heads/{}", self.branch))
             .output()?;
         drop(push_timer);
@@ -1356,9 +1356,8 @@ impl GitStorage {
             Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
             _ => {}
         }
-        let untracked = carrier_git_command()
-            .arg("-C")
-            .arg(root)
+        let untracked = GitRepository::owned_work_tree(root)
+            .git()
             .args([
                 "ls-files",
                 "--others",
@@ -1421,9 +1420,11 @@ impl Storage for GitStorage {
         let Some(commit) = git_rev_parse(self.root(), "HEAD")? else {
             bail!(unavailable())
         };
-        let chunks = self
-            .chunk_entries_at(&commit, kind, id)?
-            .ok_or_else(unavailable)?;
+        let chunks = match self.chunk_entries_at(&commit, kind, id)? {
+            CarrierListing::Chunks(chunks) => chunks,
+            CarrierListing::Absent => bail!(unavailable()),
+            CarrierListing::Malformed(reason) => bail!("carrier object {id}: {reason}"),
+        };
         Ok(Box::new(GitChunkReader::new(self.root(), chunks)?))
     }
 
@@ -1672,9 +1673,8 @@ fn remove_unretained_index_objects(
     keep: &HashSet<&str>,
 ) -> Result<()> {
     let tree = kind.directory();
-    let output = carrier_git_command()
-        .arg("-C")
-        .arg(repo)
+    let output = GitRepository::owned_work_tree(repo)
+        .git()
         .args(["ls-files", "-z", "--", tree])
         .output()?;
     ensure_git_success(&output, "git ls-files carrier recovery objects")?;
@@ -1741,20 +1741,29 @@ fn retain_carrier_objects(root: &Path, keep: &HashSet<&str>) -> Result<()> {
     Ok(())
 }
 
+/// What one carrier commit holds for an object.
+enum CarrierListing {
+    Absent,
+    /// Storage-controlled entries that do not form a valid chunk sequence.
+    Malformed(&'static str),
+    Chunks(Vec<(String, String)>),
+}
+
+/// Lists the chunks of `id` at `commit`. Malformed storage content is a
+/// `CarrierListing`; only Git or I/O failure is an error.
 fn carrier_chunk_entries(
     repo: &Path,
     commit: &str,
     kind: ObjectKind,
     id: &str,
-) -> Result<Option<Vec<(String, String)>>> {
+) -> Result<CarrierListing> {
     validate_id(id)?;
     let directory = format!("{}/{}/{id}", kind.directory(), &id[..2]);
-    let mut child = carrier_git_command()
-        .arg("-C")
-        .arg(repo)
+    let mut child = GitRepository::owned_work_tree(repo)
+        .git()
         .args(["ls-tree", "-r", "-z", commit, "--", &directory])
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()?;
     let mut listing = Vec::new();
     child
@@ -1766,15 +1775,25 @@ fn carrier_chunk_entries(
     if listing.len() as u64 > MAX_CARRIER_LISTING_BYTES {
         let _ = child.kill();
         let _ = child.wait();
-        bail!("carrier object listing exceeds its size budget")
+        return Ok(CarrierListing::Malformed(
+            "carrier object listing exceeds its size budget",
+        ));
     }
-    let status = child.wait()?;
-    if !status.success() {
-        bail!("git ls-tree carrier object failed: {status}")
-    }
+    let output = child.wait_with_output()?;
+    ensure_git_success(&output, "git ls-tree carrier object")?;
     if listing.is_empty() {
-        return Ok(None);
+        return Ok(CarrierListing::Absent);
     }
+    Ok(match parse_chunk_listing(&listing, &directory) {
+        Ok(chunks) => CarrierListing::Chunks(chunks),
+        Err(reason) => CarrierListing::Malformed(reason),
+    })
+}
+
+fn parse_chunk_listing(
+    listing: &[u8],
+    directory: &str,
+) -> std::result::Result<Vec<(String, String)>, &'static str> {
     let mut chunks = Vec::new();
     for entry in listing
         .split(|byte| *byte == 0)
@@ -1783,31 +1802,33 @@ fn carrier_chunk_entries(
         let tab = entry
             .iter()
             .position(|byte| *byte == b'\t')
-            .context("parse carrier tree entry")?;
+            .ok_or("carrier tree entry has no path")?;
         let (metadata, path) = (&entry[..tab], &entry[tab + 1..]);
-        let metadata = std::str::from_utf8(metadata)?;
-        let path = std::str::from_utf8(path)?.to_owned();
+        let metadata =
+            std::str::from_utf8(metadata).map_err(|_| "carrier tree entry is not UTF-8")?;
+        let path = std::str::from_utf8(path)
+            .map_err(|_| "carrier object path is not UTF-8")?
+            .to_owned();
         let mut fields = metadata.split_ascii_whitespace();
         if fields.next() != Some("100644") || fields.next() != Some("blob") {
-            bail!("carrier object contains a non-regular blob")
+            return Err("carrier object contains a non-regular blob");
         }
-        let blob_id = fields.next().context("carrier blob has no id")?;
+        let blob_id = fields.next().ok_or("carrier blob has no id")?;
         if fields.next().is_some() || !path.starts_with(&format!("{directory}/")) {
-            bail!("unexpected carrier object path")
+            return Err("unexpected carrier object path");
         }
         chunks.push((path, blob_id.to_owned()));
     }
     chunks.sort_by(|left, right| left.0.cmp(&right.0));
     if chunks.is_empty() || chunks.len() as u64 > MAX_CHUNKS_PER_OBJECT {
-        bail!("carrier object has an invalid chunk count")
+        return Err("carrier object has an invalid chunk count");
     }
     for (index, (path, _)) in chunks.iter().enumerate() {
-        let expected = format!("{directory}/{index:08}");
-        if path != &expected {
-            bail!("carrier object chunks are not a dense canonical sequence")
+        if *path != format!("{directory}/{index:08}") {
+            return Err("carrier object chunks are not a dense canonical sequence");
         }
     }
-    Ok(Some(chunks))
+    Ok(chunks)
 }
 
 struct CarrierCache {
@@ -1855,9 +1876,11 @@ impl CarrierCache {
                 drop(fetch_timer);
                 Ok(tip)
             }
-            Err(fetch_error) if self.is_corrupt()? => {
+            Err(FetchError::Local(fetch_error)) if self.is_corrupt()? => {
                 self.rebuild()?;
-                let result = fetch_carrier_branch(&self.path, remote, branch).with_context(|| {
+                let result = fetch_carrier_branch(&self.path, remote, branch)
+                    .map_err(FetchError::into_inner)
+                    .with_context(|| {
                     format!(
                         "fetch carrier branch after rebuilding corrupt cache (initial fetch failed: {fetch_error:#})"
                     )
@@ -1865,9 +1888,9 @@ impl CarrierCache {
                 drop(fetch_timer);
                 result
             }
-            Err(fetch_error) => {
+            Err(FetchError::Local(error) | FetchError::Remote(error)) => {
                 drop(fetch_timer);
-                Err(fetch_error)
+                Err(error)
             }
         }
     }
@@ -1910,7 +1933,7 @@ impl CarrierCache {
         OsRng.fill_bytes(&mut random);
         let generation = format!("objects-{}-{}", std::process::id(), hex::encode(random));
         self.path = self.remote_dir.join(generation);
-        let output = carrier_git_command()
+        let output = gitcmd::without_repository()
             .args(["init", "--bare", "--quiet"])
             .arg(&self.path)
             .output()?;
@@ -1928,10 +1951,25 @@ impl CarrierCache {
         Ok(!output.status.success())
     }
 
+    /// Publishes a fresh generation and removes the ones it replaces. A
+    /// process that opened its checkout before the rebuild and still borrows
+    /// a removed generation fails its later object reads instead of reading
+    /// from a corrupt store.
     fn rebuild(&mut self) -> Result<()> {
-        // Existing temporary checkouts may still borrow the previous object
-        // directory. Keep that generation intact and publish a fresh one.
-        self.initialize_generation()
+        self.initialize_generation()?;
+        let current = self.path.file_name().map(ToOwned::to_owned);
+        for entry in fs::read_dir(&self.remote_dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let replaced = name.to_str().is_some_and(valid_cache_generation)
+                && Some(&name) != current.as_ref();
+            if replaced {
+                fs::remove_dir_all(entry.path()).with_context(|| {
+                    format!("remove replaced carrier cache {}", entry.path().display())
+                })?;
+            }
+        }
+        Ok(())
     }
 
     fn publish_current(&self) -> Result<()> {
@@ -1992,7 +2030,7 @@ fn parse_carrier_location(location: &str) -> Result<(String, String)> {
     if branch.is_empty() {
         bail!("empty carrier branch in {location:?}")
     }
-    let check = carrier_git_command()
+    let check = gitcmd::without_repository()
         .args(["check-ref-format", &format!("refs/heads/{branch}")])
         .output()?;
     if !check.status.success() || branch.starts_with('-') {
@@ -2070,23 +2108,58 @@ fn configure_git_pack_settings(mut configure: impl FnMut(&str, &str) -> Result<(
     Ok(())
 }
 
-fn fetch_carrier_branch(cache: &Path, remote: &str, branch: &str) -> Result<Option<String>> {
+/// Why a carrier fetch failed. Only a failure while the remote is reachable
+/// can come from the local cache, so only that one justifies a corruption
+/// check.
+enum FetchError {
+    Remote(anyhow::Error),
+    Local(anyhow::Error),
+}
+
+impl FetchError {
+    fn into_inner(self) -> anyhow::Error {
+        match self {
+            Self::Remote(error) | Self::Local(error) => error,
+        }
+    }
+}
+
+fn fetch_carrier_branch(
+    cache: &Path,
+    remote: &str,
+    branch: &str,
+) -> std::result::Result<Option<String>, FetchError> {
     let remote_ref = format!("refs/heads/{branch}");
     let refspec = format!("+{remote_ref}:{CARRIER_CACHE_FETCH_REF}");
-    let fetch = cache_git_output(cache, &["fetch", "--quiet", "--no-tags", remote, &refspec])?;
+    let fetch = cache_transport_output(cache, &["fetch", "--quiet", "--no-tags", remote, &refspec])
+        .map_err(FetchError::Local)?;
     if fetch.status.success() {
-        return git_rev_parse(cache, CARRIER_CACHE_FETCH_REF);
+        return git_rev_parse(cache, CARRIER_CACHE_FETCH_REF).map_err(FetchError::Local);
     }
 
-    let ls_remote = cache_git_output(cache, &["ls-remote", "--heads", remote, &remote_ref])?;
-    ensure_git_success(&ls_remote, "git ls-remote carrier branch")?;
+    let ls_remote = cache_transport_output(cache, &["ls-remote", "--heads", remote, &remote_ref])
+        .and_then(|output| {
+            ensure_git_success(&output, "git ls-remote carrier branch")?;
+            Ok(output)
+        })
+        .map_err(|error| {
+            FetchError::Remote(error.context(format!(
+                "git fetch carrier branch failed: {}",
+                String::from_utf8_lossy(&fetch.stderr).trim()
+            )))
+        })?;
     if String::from_utf8_lossy(&ls_remote.stdout).trim().is_empty() {
-        let delete = cache_git_output(cache, &["update-ref", "-d", CARRIER_CACHE_FETCH_REF])?;
-        ensure_git_success(&delete, "git update-ref delete missing carrier branch")?;
+        cache_git_output(cache, &["update-ref", "-d", CARRIER_CACHE_FETCH_REF])
+            .and_then(|output| {
+                ensure_git_success(&output, "git update-ref delete missing carrier branch")
+            })
+            .map_err(FetchError::Local)?;
         return Ok(None);
     }
-    ensure_git_success(&fetch, "git fetch carrier branch")?;
-    unreachable!("failed git fetch must return an error")
+    Err(FetchError::Local(anyhow::anyhow!(
+        "git fetch carrier branch failed: {}",
+        String::from_utf8_lossy(&fetch.stderr).trim()
+    )))
 }
 
 fn create_carrier_checkout(
@@ -2097,9 +2170,8 @@ fn create_carrier_checkout(
     base_commit: &Option<String>,
 ) -> Result<()> {
     let _timer = trace::Span::new("carrier_checkout_git_setup");
-    let output = carrier_git_command()
-        .arg("-C")
-        .arg(checkout)
+    let output = GitRepository::owned_work_tree(checkout)
+        .git()
         .args(["init", "--quiet"])
         .output()?;
     ensure_git_success(&output, "git init carrier checkout")?;
@@ -2117,11 +2189,6 @@ fn create_carrier_checkout(
     git_command(checkout, &["config", "gc.auto", "0"])?;
     git_command(checkout, &["config", "maintenance.auto", "false"])?;
     configure_git_pack_settings(|key, value| git_command(checkout, &["config", key, value]))?;
-    git_command(checkout, &["config", "user.name", "git-remote-e2ee"])?;
-    git_command(
-        checkout,
-        &["config", "user.email", "git-remote-e2ee@invalid"],
-    )?;
     git_command(checkout, &["remote", "add", "origin", remote])?;
 
     let remote_ref = format!("refs/remotes/origin/{branch}");
@@ -2141,16 +2208,19 @@ fn create_carrier_checkout(
     Ok(())
 }
 
+/// `None` when `reference` names nothing; any other Git failure is an error.
 fn git_rev_parse(repo: &Path, reference: &str) -> Result<Option<String>> {
-    let output = carrier_git_command()
-        .arg("-C")
-        .arg(repo)
-        .args(["rev-parse", "--verify", reference])
+    let output = GitRepository::owned_work_tree(repo)
+        .git()
+        .args(["rev-parse", "--verify", "--quiet", reference])
         .output()?;
-    if output.status.success() {
-        Ok(Some(String::from_utf8(output.stdout)?.trim().to_owned()))
-    } else {
-        Ok(None)
+    match output.status.code() {
+        Some(0) => Ok(Some(String::from_utf8(output.stdout)?.trim().to_owned())),
+        Some(1) => Ok(None),
+        _ => {
+            ensure_git_success(&output, &format!("git rev-parse {reference}"))?;
+            unreachable!("a failed rev-parse is an error")
+        }
     }
 }
 
@@ -2160,9 +2230,15 @@ fn cache_git_command(cache: &Path, args: &[&str]) -> Result<()> {
 }
 
 fn cache_git_output(cache: &Path, args: &[&str]) -> Result<std::process::Output> {
-    Ok(carrier_git_command()
-        .arg("--git-dir")
-        .arg(cache)
+    Ok(GitRepository::owned_git_dir(cache)
+        .git()
+        .args(args)
+        .output()?)
+}
+
+fn cache_transport_output(cache: &Path, args: &[&str]) -> Result<std::process::Output> {
+    Ok(GitRepository::owned_git_dir(cache)
+        .transport()
         .args(args)
         .output()?)
 }
@@ -2178,9 +2254,8 @@ fn ensure_git_success(output: &std::process::Output, action: &str) -> Result<()>
 }
 
 fn git_command(repo: &Path, args: &[&str]) -> Result<()> {
-    let output = carrier_git_command()
-        .arg("-C")
-        .arg(repo)
+    let output = GitRepository::owned_work_tree(repo)
+        .git()
         .args(args)
         .output()?;
     if !output.status.success() {
@@ -2194,9 +2269,8 @@ fn git_command(repo: &Path, args: &[&str]) -> Result<()> {
 }
 
 fn git_command_with_input(repo: &Path, args: &[&str], input: &[u8]) -> Result<()> {
-    let mut child = carrier_git_command()
-        .arg("-C")
-        .arg(repo)
+    let mut child = GitRepository::owned_work_tree(repo)
+        .git()
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -2259,25 +2333,26 @@ fn stage_carrier_checkout(repo: &Path, object_directory: &Path) -> Result<()> {
     )
 }
 
-fn git_command_with_object_directory(
+/// Runs a plumbing command that writes objects into the carrier cache and
+/// returns its trimmed output. Carrier commits are written this way, with a
+/// fixed identity, so user hooks, signing, and identity never apply.
+fn git_text_with_object_directory(
     repo: &Path,
     object_directory: &Path,
     args: &[&str],
-) -> Result<()> {
-    let output = carrier_git_command()
-        .arg("-C")
-        .arg(repo)
+) -> Result<String> {
+    let (name, email) = CARRIER_IDENTITY;
+    let output = GitRepository::owned_work_tree(repo)
+        .git()
         .env("GIT_OBJECT_DIRECTORY", object_directory)
+        .env("GIT_AUTHOR_NAME", name)
+        .env("GIT_AUTHOR_EMAIL", email)
+        .env("GIT_COMMITTER_NAME", name)
+        .env("GIT_COMMITTER_EMAIL", email)
         .args(args)
         .output()?;
-    if !output.status.success() {
-        bail!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-    }
-    Ok(())
+    ensure_git_success(&output, &format!("git {}", args.join(" ")))?;
+    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 
 fn git_command_with_object_directory_input(
@@ -2286,9 +2361,8 @@ fn git_command_with_object_directory_input(
     args: &[&str],
     input: &[u8],
 ) -> Result<()> {
-    let mut child = carrier_git_command()
-        .arg("-C")
-        .arg(repo)
+    let mut child = GitRepository::owned_work_tree(repo)
+        .git()
         .env("GIT_OBJECT_DIRECTORY", object_directory)
         .args(args)
         .stdin(Stdio::piped())
@@ -2309,22 +2383,6 @@ fn git_command_with_object_directory_input(
         )
     }
     Ok(())
-}
-
-fn carrier_git_command() -> Command {
-    let mut command = Command::new("git");
-    for variable in [
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_COMMON_DIR",
-        "GIT_INDEX_FILE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_QUARANTINE_PATH",
-    ] {
-        command.env_remove(variable);
-    }
-    command
 }
 
 #[cfg(test)]
@@ -2507,7 +2565,10 @@ mod tests {
     #[cfg(unix)]
     fn make_fifo(path: &Path) {
         let _ = fs::remove_file(path);
-        let status = Command::new("mkfifo").arg(path).status().unwrap();
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .unwrap();
         assert!(status.success());
     }
 
@@ -2673,5 +2734,58 @@ mod tests {
     fn object_ids_must_be_lowercase_hex() {
         validate_id(&"ab".repeat(32)).unwrap();
         assert!(validate_id(&"AB".repeat(32)).is_err());
+    }
+
+    fn checkout_git(root: &Path, args: &[&str]) -> String {
+        let output = GitRepository::owned_work_tree(root)
+            .git()
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[test]
+    fn a_failed_carrier_listing_is_an_error_not_a_missing_copy() {
+        let checkout = tempfile::tempdir().unwrap();
+        checkout_git(checkout.path(), &["init", "--quiet"]);
+        fs::write(checkout.path().join("FORMAT"), STORAGE_FORMAT).unwrap();
+        checkout_git(checkout.path(), &["add", "FORMAT"]);
+        let tree = checkout_git(checkout.path(), &["write-tree"]);
+        let commit = checkout_git(
+            checkout.path(),
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@invalid",
+                "commit-tree",
+                "-m",
+                "carrier",
+                &tree,
+            ],
+        );
+        let storage = GitStorage {
+            checkout,
+            location: "unused".to_owned(),
+            remote: "unused".to_owned(),
+            branch: "main".to_owned(),
+            state: Mutex::new(GitStorageState { base_commit: None }),
+        };
+        let id = "ab".repeat(32);
+        let read =
+            |commit: &str| storage.read_copy_at(commit, ObjectKind::Manifest, &id, |_, _| Ok(()));
+
+        assert!(!read(&commit).unwrap(), "an absent copy is not an error");
+        let unknown_commit = "1".repeat(40);
+        assert!(
+            read(&unknown_commit).is_err(),
+            "git ls-tree failing on an unreadable commit must not read as an absent copy"
+        );
     }
 }
