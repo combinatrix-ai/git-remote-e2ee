@@ -12,6 +12,7 @@ use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::bounded::{self, Bounded, Opened};
 use crate::error::{BudgetExhausted, ObjectUnavailable};
 use crate::trace;
 
@@ -28,8 +29,13 @@ pub struct CasConflict {
 #[error("{0}")]
 pub struct StorageOccupied(pub String);
 
-const MAX_BUFFERED_OBJECT_SIZE: u64 = 16 * 1024 * 1024;
-const MAX_STORAGE_HEAD_BYTES: u64 = 4096;
+// The size contract every writer enforces before publication and every
+// reader enforces before allocating, so nothing published is unreadable.
+pub const MAX_HEAD_BYTES: u64 = 4096;
+pub const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+pub const CARRIER_CHUNK_BYTES: u64 = 32 * 1024 * 1024;
+pub const MAX_CHUNKS_PER_OBJECT: u64 = 4096;
+pub const MAX_OBJECT_BYTES: u64 = CARRIER_CHUNK_BYTES * MAX_CHUNKS_PER_OBJECT;
 
 pub trait ObjectStage: Write + Send {
     fn finish(self: Box<Self>, id: &str) -> Result<()>;
@@ -42,21 +48,33 @@ trait ObjectStageSink: Write + Send + Sized {
 struct ValidatingObjectStage<S> {
     sink: S,
     hasher: Sha256,
+    kind: ObjectKind,
+    written: u64,
 }
 
 impl<S: ObjectStageSink + 'static> ValidatingObjectStage<S> {
-    fn wrap(sink: S) -> Box<dyn ObjectStage> {
+    fn wrap(sink: S, kind: ObjectKind) -> Box<dyn ObjectStage> {
         Box::new(Self {
             sink,
             hasher: Sha256::new(),
+            kind,
+            written: 0,
         })
     }
 }
 
 impl<S: ObjectStageSink> Write for ValidatingObjectStage<S> {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let limit = self.kind.max_bytes();
+        if self.written.saturating_add(data.len() as u64) > limit {
+            return Err(std::io::Error::other(format!(
+                "{} object exceeds the {limit}-byte maximum that readers accept; splitting larger objects is not supported",
+                self.kind.name()
+            )));
+        }
         let written = self.sink.write(data)?;
         self.hasher.update(&data[..written]);
+        self.written += written as u64;
         Ok(written)
     }
 
@@ -68,7 +86,7 @@ impl<S: ObjectStageSink> Write for ValidatingObjectStage<S> {
 impl<S: ObjectStageSink> ObjectStage for ValidatingObjectStage<S> {
     fn finish(self: Box<Self>, id: &str) -> Result<()> {
         validate_id(id)?;
-        let Self { sink, hasher } = *self;
+        let Self { sink, hasher, .. } = *self;
         if hex::encode(hasher.finalize()) != id {
             bail!("staged object hash does not match id")
         }
@@ -86,13 +104,13 @@ pub trait Storage {
         stage.finish(id)
     }
 
+    /// Buffers a whole object; the bound is the manifest limit, since
+    /// manifests are the objects read this way.
     fn get_object(&self, kind: ObjectKind, id: &str) -> Result<Vec<u8>> {
-        let mut reader = self
-            .open_object(kind, id)?
-            .take(MAX_BUFFERED_OBJECT_SIZE + 1);
+        let mut reader = self.open_object(kind, id)?.take(MAX_MANIFEST_BYTES + 1);
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > MAX_BUFFERED_OBJECT_SIZE {
+        if bytes.len() as u64 > MAX_MANIFEST_BYTES {
             bail!("buffered object exceeds size limit")
         }
         Ok(bytes)
@@ -114,7 +132,7 @@ pub trait Storage {
         Ok(HeadObservation {
             head_id,
             token: bytes.clone(),
-            head_bytes: Some(bytes),
+            head: Some(StoredHead::Bytes(bytes)),
         })
     }
 
@@ -130,7 +148,14 @@ pub trait Storage {
         Ok(None)
     }
 
-    fn restore_historical_object(&self, _kind: ObjectKind, _id: &str) -> Result<bool> {
+    /// Restores a stored copy of `id` from storage history, reading at most
+    /// `max_bytes` across every copy it tries.
+    fn restore_historical_object(
+        &self,
+        _kind: ObjectKind,
+        _id: &str,
+        _max_bytes: u64,
+    ) -> Result<bool> {
         Ok(false)
     }
 
@@ -143,7 +168,60 @@ pub trait Storage {
 pub struct HeadObservation {
     pub head_id: Option<String>,
     pub token: Vec<u8>,
-    pub head_bytes: Option<Vec<u8>>,
+    /// What storage holds where HEAD belongs; `None` when nothing is there.
+    pub head: Option<StoredHead>,
+}
+
+/// The contents of storage HEAD. Only `Bytes` can name a manifest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StoredHead {
+    Bytes(Vec<u8>),
+    /// A symbolic link, FIFO, directory, or other non-regular entry.
+    NotRegular,
+    /// Longer than `MAX_HEAD_BYTES`; never read.
+    Oversized,
+}
+
+impl StoredHead {
+    fn from_bounded(bounded: Bounded) -> Option<Self> {
+        match bounded {
+            Bounded::Absent => None,
+            Bounded::Within(bytes) => Some(Self::Bytes(bytes)),
+            Bounded::Oversized => Some(Self::Oversized),
+            Bounded::NotRegular => Some(Self::NotRegular),
+        }
+    }
+
+    pub fn head_id(&self) -> Option<String> {
+        let Self::Bytes(bytes) = self else {
+            return None;
+        };
+        let value = std::str::from_utf8(bytes).ok()?.trim();
+        validate_id(value).ok()?;
+        Some(value.to_owned())
+    }
+
+    /// The manifest ID, or why this HEAD names none.
+    pub fn parse(&self) -> Result<String> {
+        match self {
+            Self::Bytes(_) => self
+                .head_id()
+                .context("storage HEAD is not a valid head: it does not name a manifest object ID"),
+            Self::NotRegular => bail!("storage HEAD is not a valid head: it is not a regular file"),
+            Self::Oversized => {
+                bail!("storage HEAD is not a valid head: it exceeds {MAX_HEAD_BYTES} bytes")
+            }
+        }
+    }
+
+    /// Bytes that identify this observation in rejected-head evidence.
+    pub fn evidence(&self) -> &[u8] {
+        match self {
+            Self::Bytes(bytes) => bytes,
+            Self::NotRegular => b"storage HEAD is not a regular file",
+            Self::Oversized => b"storage HEAD is oversized",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -207,13 +285,16 @@ fn check_storage_format(location: &str, format: Option<&[u8]>, head_present: boo
     bail!("storage at {location} uses format {found}; this git-remote-e2ee reads format 6")
 }
 
-fn read_bounded_format(mut reader: impl Read) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    reader
-        .by_ref()
-        .take(MAX_STORAGE_FORMAT_BYTES)
-        .read_to_end(&mut bytes)?;
-    Ok(bytes)
+/// Reads a small root file through the bounded opener.
+fn read_root_file(path: &Path, max_bytes: u64) -> Result<Option<Vec<u8>>> {
+    match bounded::read_regular_bounded(path, max_bytes)
+        .with_context(|| format!("read {}", path.display()))?
+    {
+        Bounded::Absent => Ok(None),
+        Bounded::Within(bytes) => Ok(Some(bytes)),
+        Bounded::Oversized => bail!("{} exceeds {max_bytes} bytes", path.display()),
+        Bounded::NotRegular => bail!("{} is not a regular file", path.display()),
+    }
 }
 
 impl ObjectKind {
@@ -221,6 +302,20 @@ impl ObjectKind {
         match self {
             Self::Pack => "packs",
             Self::Manifest => "manifests",
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Pack => "pack",
+            Self::Manifest => "manifest",
+        }
+    }
+
+    pub fn max_bytes(self) -> u64 {
+        match self {
+            Self::Pack => MAX_OBJECT_BYTES,
+            Self::Manifest => MAX_MANIFEST_BYTES,
         }
     }
 }
@@ -253,12 +348,8 @@ impl FilesystemStorage {
     }
 
     fn check_format(&self) -> Result<()> {
-        let format = match File::open(self.root.join("FORMAT")) {
-            Ok(file) => Some(read_bounded_format(file)?),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error.into()),
-        };
-        let head_present = self.root.join("HEAD").exists();
+        let format = read_root_file(&self.root.join("FORMAT"), MAX_STORAGE_FORMAT_BYTES)?;
+        let head_present = fs::symlink_metadata(self.root.join("HEAD")).is_ok();
         check_storage_format(
             &self.root.display().to_string(),
             format.as_deref(),
@@ -367,37 +458,48 @@ impl Storage for FilesystemStorage {
             .write(true)
             .create_new(true)
             .open(&temporary)?;
-        Ok(ValidatingObjectStage::wrap(FilesystemObjectStage {
-            file,
-            temporary,
-            root: self.root.clone(),
+        Ok(ValidatingObjectStage::wrap(
+            FilesystemObjectStage {
+                file,
+                temporary,
+                root: self.root.clone(),
+                kind,
+            },
             kind,
-        }))
+        ))
     }
 
     fn open_object(&self, kind: ObjectKind, id: &str) -> Result<Box<dyn Read + Send>> {
         let path = self.object_path(kind, id)?;
-        let file = File::open(&path)
-            .map_err(|source| ObjectUnavailable {
-                storage: "directory",
-                id: id.to_owned(),
-                source: Some(source),
-            })
-            .with_context(|| format!("read {}", path.display()))?;
-        Ok(Box::new(file))
+        let refused = |kind, reason: &str| Some(std::io::Error::new(kind, reason.to_owned()));
+        let source = match bounded::open_regular(&path) {
+            Ok(Opened::Regular(file, length)) if length <= kind.max_bytes() => {
+                return Ok(Box::new(file.take(kind.max_bytes())));
+            }
+            Ok(Opened::Regular(..)) => refused(
+                std::io::ErrorKind::InvalidData,
+                "object exceeds the maximum object size",
+            ),
+            Ok(Opened::NotRegular) => refused(
+                std::io::ErrorKind::InvalidData,
+                "object is not a regular file",
+            ),
+            Ok(Opened::Absent) => Some(std::io::ErrorKind::NotFound.into()),
+            Err(error) => Some(error),
+        };
+        Err(ObjectUnavailable {
+            storage: "directory",
+            id: id.to_owned(),
+            source,
+        })
+        .with_context(|| format!("read {}", path.display()))
     }
 
     fn read_head(&self) -> Result<Option<String>> {
         self.check_format()?;
-        let Some(bytes) = read_bounded_head_file(&self.root.join("HEAD"))? else {
-            return Ok(None);
-        };
-        let value = std::str::from_utf8(&bytes)
-            .context("invalid opaque object id")?
-            .trim()
-            .to_owned();
-        validate_id(&value)?;
-        Ok(Some(value))
+        read_stored_head(&self.root.join("HEAD"))?
+            .map(|head| head.parse())
+            .transpose()
     }
 
     fn compare_and_swap_head(&self, expected: Option<&str>, next: &str) -> Result<()> {
@@ -427,18 +529,14 @@ impl Storage for FilesystemStorage {
 
     fn observe_head(&self) -> Result<HeadObservation> {
         self.check_format()?;
-        let head_bytes = read_bounded_head_file(&self.root.join("HEAD"))?;
-        let head_id = head_bytes.as_deref().and_then(|bytes| {
-            std::str::from_utf8(bytes)
-                .ok()
-                .map(str::trim)
-                .filter(|value| validate_id(value).is_ok())
-                .map(ToOwned::to_owned)
-        });
+        let head = read_stored_head(&self.root.join("HEAD"))?;
         Ok(HeadObservation {
-            head_id,
-            token: head_bytes.clone().unwrap_or_default(),
-            head_bytes,
+            head_id: head.as_ref().and_then(StoredHead::head_id),
+            token: head
+                .as_ref()
+                .map(|head| head.evidence().to_vec())
+                .unwrap_or_default(),
+            head,
         })
     }
 
@@ -446,21 +544,15 @@ impl Storage for FilesystemStorage {
         validate_id(next)?;
         let lock = self.lock_file()?;
         lock.lock_exclusive()?;
-        let actual = match read_bounded_head_file(&self.root.join("HEAD")) {
+        let actual = match read_stored_head(&self.root.join("HEAD")) {
             Ok(actual) => actual,
             Err(error) => {
                 fs2::FileExt::unlock(&lock)?;
                 return Err(error);
             }
         };
-        if actual != observed.head_bytes {
-            let actual_id = actual.as_deref().and_then(|bytes| {
-                std::str::from_utf8(bytes)
-                    .ok()
-                    .map(str::trim)
-                    .filter(|value| validate_id(value).is_ok())
-                    .map(ToOwned::to_owned)
-            });
+        if actual != observed.head {
+            let actual_id = actual.as_ref().and_then(StoredHead::head_id);
             fs2::FileExt::unlock(&lock)?;
             return Err(CasConflict {
                 expected: observed.head_id.clone(),
@@ -481,32 +573,10 @@ impl Storage for FilesystemStorage {
     }
 }
 
-/// Opening a FIFO for reading blocks until a writer appears, so the type is
-/// checked on the path before opening and again on the opened handle.
-fn read_bounded_head_file(path: &Path) -> Result<Option<Vec<u8>>> {
-    match fs::metadata(path) {
-        Ok(metadata) if !metadata.is_file() => bail!("storage HEAD is not a regular file"),
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    }
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    if !file.metadata()?.is_file() {
-        bail!("storage HEAD is not a regular file")
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_STORAGE_HEAD_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_STORAGE_HEAD_BYTES {
-        bail!(BudgetExhausted(
-            "recovery outer-head byte budget exhausted".to_owned()
-        ))
-    }
-    Ok(Some(bytes))
+fn read_stored_head(path: &Path) -> Result<Option<StoredHead>> {
+    let bounded =
+        bounded::read_regular_bounded(path, MAX_HEAD_BYTES).context("read storage HEAD")?;
+    Ok(StoredHead::from_bounded(bounded))
 }
 
 fn validate_id(id: &str) -> Result<()> {
@@ -534,14 +604,19 @@ fn reader_id(mut reader: impl Read) -> Result<String> {
 }
 
 fn verify_file_id(path: &Path, id: &str) -> Result<()> {
-    if reader_id(File::open(path)?)? != id {
+    let Opened::Regular(file, _) = bounded::open_regular(path)? else {
+        bail!("stored object {id} is not a regular file")
+    };
+    if reader_id(file)? != id {
         bail!("object id collision for {id}")
     }
     Ok(())
 }
 
 const CARRIER_DEFAULT_BRANCH: &str = "main";
-const CARRIER_CHUNK_SIZE: usize = 32 * 1024 * 1024;
+const CARRIER_CHUNK_SIZE: usize = CARRIER_CHUNK_BYTES as usize;
+/// Bounds one object's `ls-tree` listing: a few hundred bytes per chunk entry.
+const MAX_CARRIER_LISTING_BYTES: u64 = 8 * 1024 * 1024;
 const CARRIER_ATTRIBUTES: &[u8] = b"* -delta\n";
 const CARRIER_CACHE_ENV: &str = "GIT_REMOTE_E2EE_CACHE_DIR";
 /// Each cache serves one (remote, branch) pair, so one fixed ref suffices.
@@ -596,25 +671,34 @@ impl Read for ChunkReader {
                     .record(0, started.map_or(0, |started| started.elapsed().as_nanos()));
                 return Ok(0);
             }
-            self.current = Some(File::open(&self.paths[self.next])?);
+            let Opened::Regular(file, _) = bounded::open_regular(&self.paths[self.next])? else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "carrier object chunk is not a regular file",
+                ));
+            };
+            self.current = Some(file);
             self.next += 1;
         }
     }
 }
 
-struct GitChunkReader {
+/// One `git cat-file --batch` process. Each header is checked before its
+/// body is read, so a blob's type and size are known before any allocation.
+struct CatFile {
     child: Child,
     input: Option<ChildStdin>,
     output: BufReader<std::process::ChildStdout>,
-    chunks: Vec<(String, String)>,
-    next: usize,
-    remaining: u64,
     finished: bool,
-    trace: trace::Io,
 }
 
-impl GitChunkReader {
-    fn new(repo: &Path, chunks: Vec<(String, String)>) -> Result<Self> {
+enum BatchHeader {
+    Missing,
+    Object { id: String, kind: String, size: u64 },
+}
+
+impl CatFile {
+    fn spawn(repo: &Path) -> Result<Self> {
         let mut child = carrier_git_command()
             .arg("-C")
             .arg(repo)
@@ -629,54 +713,52 @@ impl GitChunkReader {
             child,
             input: Some(input),
             output: BufReader::new(output),
-            chunks,
-            next: 0,
-            remaining: 0,
             finished: false,
-            trace: trace::Io::new("carrier_object_read"),
         })
     }
 
-    fn start_next_chunk(&mut self) -> std::io::Result<bool> {
-        if self.next == self.chunks.len() {
-            return Ok(false);
-        }
-        let expected = &self.chunks[self.next].1;
+    fn request(&mut self, object: &str) -> std::io::Result<BatchHeader> {
         let input = self
             .input
             .as_mut()
-            .expect("git cat-file input is open until all chunks are read");
-        writeln!(input, "{expected}")?;
+            .expect("git cat-file input is open until finished");
+        writeln!(input, "{object}")?;
         input.flush()?;
         let mut header = String::new();
         if self.output.read_line(&mut header)? == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
-                "git cat-file ended before returning a carrier chunk",
+                "git cat-file ended before answering",
             ));
         }
         let fields: Vec<_> = header.split_ascii_whitespace().collect();
-        if fields.len() != 3 || fields[0] != expected || fields[1] != "blob" {
+        match fields[..] {
+            [_, "missing"] | [_, "ambiguous"] => Ok(BatchHeader::Missing),
+            [id, kind, size] => Ok(BatchHeader::Object {
+                id: id.to_owned(),
+                kind: kind.to_owned(),
+                size: size
+                    .parse()
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?,
+            }),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "git cat-file returned an invalid header",
+            )),
+        }
+    }
+
+    /// Consumes the newline git writes after each object body.
+    fn end_body(&mut self) -> std::io::Result<()> {
+        let mut trailer = [0_u8; 1];
+        self.output.read_exact(&mut trailer)?;
+        if trailer[0] != b'\n' {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "git cat-file returned an invalid carrier chunk header",
+                "git cat-file returned a malformed object trailer",
             ));
         }
-        let size = fields[2]
-            .parse::<u64>()
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        let last = self.next + 1 == self.chunks.len();
-        if (!last && size != CARRIER_CHUNK_SIZE as u64)
-            || (last && (size == 0 || size > CARRIER_CHUNK_SIZE as u64))
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "carrier object chunk has invalid size",
-            ));
-        }
-        self.next += 1;
-        self.remaining = size;
-        Ok(true)
+        Ok(())
     }
 
     fn finish(&mut self) -> std::io::Result<()> {
@@ -690,6 +772,81 @@ impl GitChunkReader {
     }
 }
 
+impl Drop for CatFile {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.input.take();
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// Reads one blob of at most `max_bytes` from a carrier commit.
+fn carrier_blob(repo: &Path, object: &str, max_bytes: u64) -> Result<Bounded> {
+    let mut cat = CatFile::spawn(repo)?;
+    let size = match cat.request(object)? {
+        BatchHeader::Missing => return Ok(Bounded::Absent),
+        BatchHeader::Object { kind, .. } if kind != "blob" => return Ok(Bounded::NotRegular),
+        BatchHeader::Object { size, .. } if size > max_bytes => return Ok(Bounded::Oversized),
+        BatchHeader::Object { size, .. } => size,
+    };
+    let mut bytes = vec![0_u8; size as usize];
+    cat.output.read_exact(&mut bytes)?;
+    cat.end_body()?;
+    cat.finish()?;
+    Ok(Bounded::Within(bytes))
+}
+
+/// Streams a carrier object's chunk blobs. A chunk whose header shows the
+/// wrong type or size fails with `InvalidData` before its body is read.
+struct GitChunkReader {
+    cat: CatFile,
+    chunks: Vec<(String, String)>,
+    next: usize,
+    remaining: u64,
+    trace: trace::Io,
+}
+
+impl GitChunkReader {
+    fn new(repo: &Path, chunks: Vec<(String, String)>) -> Result<Self> {
+        Ok(Self {
+            cat: CatFile::spawn(repo)?,
+            chunks,
+            next: 0,
+            remaining: 0,
+            trace: trace::Io::new("carrier_object_read"),
+        })
+    }
+
+    /// The index of the chunk the last read came from.
+    fn chunk_index(&self) -> usize {
+        self.next.saturating_sub(1)
+    }
+
+    fn start_next_chunk(&mut self) -> std::io::Result<()> {
+        let expected = &self.chunks[self.next].1;
+        let invalid = |message| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
+        let size = match self.cat.request(expected)? {
+            BatchHeader::Object { id, kind, size } if id == *expected && kind == "blob" => size,
+            _ => {
+                return Err(invalid(
+                    "git cat-file returned an invalid carrier chunk header",
+                ));
+            }
+        };
+        let last = self.next + 1 == self.chunks.len();
+        if (!last && size != CARRIER_CHUNK_BYTES)
+            || (last && (size == 0 || size > CARRIER_CHUNK_BYTES))
+        {
+            return Err(invalid("carrier object chunk has invalid size"));
+        }
+        self.next += 1;
+        self.remaining = size;
+        Ok(())
+    }
+}
+
 impl Read for GitChunkReader {
     fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
         if output.is_empty() {
@@ -698,17 +855,17 @@ impl Read for GitChunkReader {
         let started = self.trace.is_active().then(std::time::Instant::now);
         if self.remaining == 0 {
             if self.next == self.chunks.len() {
-                self.finish()?;
+                if !self.cat.finished {
+                    self.cat.finish()?;
+                }
                 self.trace
                     .record(0, started.map_or(0, |started| started.elapsed().as_nanos()));
                 return Ok(0);
             }
-            if !self.start_next_chunk()? {
-                return Ok(0);
-            }
+            self.start_next_chunk()?;
         }
         let amount = output.len().min(self.remaining as usize);
-        let read = self.output.read(&mut output[..amount])?;
+        let read = self.cat.output.read(&mut output[..amount])?;
         if read == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -717,30 +874,13 @@ impl Read for GitChunkReader {
         }
         self.remaining -= read as u64;
         if self.remaining == 0 {
-            let mut trailer = [0_u8; 1];
-            self.output.read_exact(&mut trailer)?;
-            if trailer[0] != b'\n' {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "git cat-file returned a malformed chunk trailer",
-                ));
-            }
+            self.cat.end_body()?;
         }
         self.trace.record(
             read,
             started.map_or(0, |started| started.elapsed().as_nanos()),
         );
         Ok(read)
-    }
-}
-
-impl Drop for GitChunkReader {
-    fn drop(&mut self) {
-        if !self.finished {
-            self.input.take();
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
     }
 }
 
@@ -934,32 +1074,33 @@ impl GitStorage {
 
     /// Reads a root file from the checkout, falling back to the opened
     /// commit because the checkout only populates the index.
-    fn local_root_file(&self, name: &str, max_bytes: u64) -> Result<Option<Vec<u8>>> {
+    fn local_root_file(&self, name: &str, max_bytes: u64) -> Result<Bounded> {
         let path = self.root().join(name);
-        match File::open(&path) {
-            Ok(file) => {
-                if file.metadata()?.len() > max_bytes {
-                    bail!("carrier {name} exceeds its size budget")
-                }
-                let mut bytes = Vec::new();
-                file.take(max_bytes).read_to_end(&mut bytes)?;
-                Ok(Some(bytes))
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        match bounded::read_regular_bounded(&path, max_bytes)
+            .with_context(|| format!("read carrier {name}"))?
+        {
+            Bounded::Absent => {
                 let Some(commit) = git_rev_parse(self.root(), "HEAD")? else {
-                    return Ok(None);
+                    return Ok(Bounded::Absent);
                 };
-                self.file_at_commit(&commit, name, max_bytes)
+                carrier_blob(self.root(), &format!("{commit}:{name}"), max_bytes)
             }
-            Err(error) => Err(error.into()),
+            found => Ok(found),
         }
     }
 
     fn check_format(&self) -> Result<()> {
-        let format = self.local_root_file("FORMAT", MAX_STORAGE_FORMAT_BYTES)?;
-        let head_present = self
-            .local_root_file("HEAD", MAX_STORAGE_HEAD_BYTES)?
-            .is_some();
+        let format = match self.local_root_file("FORMAT", MAX_STORAGE_FORMAT_BYTES)? {
+            Bounded::Absent => None,
+            Bounded::Within(bytes) => Some(bytes),
+            Bounded::Oversized | Bounded::NotRegular => {
+                bail!("carrier FORMAT is not a small regular file")
+            }
+        };
+        let head_present = !matches!(
+            self.local_root_file("HEAD", MAX_HEAD_BYTES)?,
+            Bounded::Absent
+        );
         check_storage_format(&self.location, format.as_deref(), head_present)
     }
 
@@ -989,86 +1130,30 @@ impl GitStorage {
     }
 
     fn local_head(&self) -> Result<Option<String>> {
-        self.check_format()?;
-        let path = self.root().join("HEAD");
-        match fs::read_to_string(path) {
-            Ok(value) => {
-                let value = value.trim().to_owned();
-                validate_id(&value)?;
-                Ok(Some(value))
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let Some(commit) = git_rev_parse(self.root(), "HEAD")? else {
-                    return Ok(None);
-                };
-                let Some(bytes) = self.head_bytes_at_commit(&commit)? else {
-                    return Ok(None);
-                };
-                let value = String::from_utf8(bytes)?.trim().to_owned();
-                validate_id(&value)?;
-                Ok(Some(value))
-            }
-            Err(error) => Err(error.into()),
-        }
+        self.local_stored_head()?
+            .map(|head| head.parse())
+            .transpose()
     }
 
-    fn local_head_bytes(&self) -> Result<Option<Vec<u8>>> {
+    fn local_stored_head(&self) -> Result<Option<StoredHead>> {
         self.check_format()?;
-        let path = self.root().join("HEAD");
-        match read_bounded_head_file(&path) {
-            Ok(Some(bytes)) => Ok(Some(bytes)),
-            Ok(None) => {
-                let Some(commit) = git_rev_parse(self.root(), "HEAD")? else {
-                    return Ok(None);
-                };
-                self.head_bytes_at_commit(&commit)
-            }
-            Err(error) => Err(error),
-        }
+        Ok(StoredHead::from_bounded(
+            self.local_root_file("HEAD", MAX_HEAD_BYTES)?,
+        ))
     }
 
     /// The manifest ID a conflicting remote tip names, for diagnostics only:
     /// a tip whose HEAD is missing or malformed still wins the conflict.
     fn conflicting_head(&self, commit: Option<&str>) -> Option<String> {
-        let bytes = self.head_bytes_at_commit(commit?).ok()??;
-        let value = String::from_utf8(bytes).ok()?.trim().to_owned();
-        validate_id(&value).ok()?;
-        Some(value)
+        self.stored_head_at_commit(commit?).ok()??.head_id()
     }
 
-    fn head_bytes_at_commit(&self, commit: &str) -> Result<Option<Vec<u8>>> {
-        self.file_at_commit(commit, "HEAD", MAX_STORAGE_HEAD_BYTES)
-    }
-
-    fn file_at_commit(&self, commit: &str, name: &str, max_bytes: u64) -> Result<Option<Vec<u8>>> {
-        let object = format!("{commit}:{name}");
-        let size = carrier_git_command()
-            .arg("-C")
-            .arg(self.root())
-            .args(["cat-file", "-s", &object])
-            .output()?;
-        if !size.status.success() {
-            return Ok(None);
-        }
-        let size = String::from_utf8(size.stdout)?.trim().parse::<u64>()?;
-        if size > max_bytes {
-            if name == "HEAD" {
-                bail!(BudgetExhausted(
-                    "recovery outer-head byte budget exhausted".to_owned()
-                ))
-            }
-            bail!("carrier {name} exceeds its size budget")
-        }
-        let output = carrier_git_command()
-            .arg("-C")
-            .arg(self.root())
-            .args(["show", &object])
-            .output()?;
-        if output.status.success() {
-            Ok(Some(output.stdout))
-        } else {
-            Ok(None)
-        }
+    fn stored_head_at_commit(&self, commit: &str) -> Result<Option<StoredHead>> {
+        Ok(StoredHead::from_bounded(carrier_blob(
+            self.root(),
+            &format!("{commit}:HEAD"),
+            MAX_HEAD_BYTES,
+        )?))
     }
 
     fn commit_history(&self, limit: usize) -> Result<Vec<String>> {
@@ -1139,9 +1224,11 @@ impl GitStorage {
             .collect())
     }
 
-    /// Streams the copy of `id` stored at `commit` into `sink` chunk by chunk.
-    /// Returns false when the commit holds no copy or the copy is malformed or
-    /// does not hash to `id`; `sink` errors and process failures propagate.
+    /// Streams the copy of `id` stored at `commit` into `sink` as
+    /// `(chunk index, bytes)` pieces. Returns false when the commit holds no
+    /// copy or the copy is malformed or does not hash to `id`; `sink` sees
+    /// every byte read, including those of a copy later rejected. `sink`
+    /// errors and process failures propagate.
     fn read_copy_at(
         &self,
         commit: &str,
@@ -1155,22 +1242,18 @@ impl GitStorage {
             Err(error) if error.is::<std::io::Error>() => return Err(error),
             Err(_) => return Ok(false),
         };
+        let mut reader = GitChunkReader::new(self.root(), chunks)?;
         let mut hasher = Sha256::new();
-        for (index, (path, _)) in chunks.iter().enumerate() {
-            let output = carrier_git_command()
-                .arg("-C")
-                .arg(self.root())
-                .args(["show", &format!("{commit}:{path}")])
-                .output()?;
-            let length = output.stdout.len();
-            if !output.status.success()
-                || (index + 1 < chunks.len() && length != CARRIER_CHUNK_SIZE)
-                || (index + 1 == chunks.len() && (length == 0 || length > CARRIER_CHUNK_SIZE))
-            {
-                return Ok(false);
-            }
-            hasher.update(&output.stdout);
-            sink(index, &output.stdout)?;
+        let mut buffer = vec![0_u8; 64 * 1024];
+        loop {
+            let read = match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => return Ok(false),
+                Err(error) => return Err(error.into()),
+            };
+            sink(reader.chunk_index(), &buffer[..read])?;
+            hasher.update(&buffer[..read]);
         }
         Ok(hex::encode(hasher.finalize()) == id)
     }
@@ -1305,15 +1388,18 @@ impl Storage for GitStorage {
         OsRng.fill_bytes(&mut random);
         let staging = self.root().join(format!(".stage-{}", hex::encode(random)));
         fs::create_dir(&staging)?;
-        Ok(ValidatingObjectStage::wrap(CarrierObjectStage {
-            staging,
-            root: self.root().to_path_buf(),
+        Ok(ValidatingObjectStage::wrap(
+            CarrierObjectStage {
+                staging,
+                root: self.root().to_path_buf(),
+                kind,
+                current: None,
+                chunk_index: 0,
+                chunk_len: 0,
+                trace: trace::Io::new("carrier_stage_write"),
+            },
             kind,
-            current: None,
-            chunk_index: 0,
-            chunk_len: 0,
-            trace: trace::Io::new("carrier_stage_write"),
-        }))
+        ))
     }
 
     fn open_object(&self, kind: ObjectKind, id: &str) -> Result<Box<dyn Read + Send>> {
@@ -1405,23 +1491,16 @@ impl Storage for GitStorage {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("carrier state lock poisoned"))?;
-        let head_bytes = self.local_head_bytes()?;
-        let head_id = head_bytes.as_deref().and_then(|bytes| {
-            std::str::from_utf8(bytes)
-                .ok()
-                .map(str::trim)
-                .filter(|value| validate_id(value).is_ok())
-                .map(ToOwned::to_owned)
-        });
+        let head = self.local_stored_head()?;
         Ok(HeadObservation {
-            head_id,
+            head_id: head.as_ref().and_then(StoredHead::head_id),
             token: state
                 .base_commit
                 .as_deref()
                 .unwrap_or_default()
                 .as_bytes()
                 .to_vec(),
-            head_bytes,
+            head,
         })
     }
 
@@ -1444,21 +1523,15 @@ impl Storage for GitStorage {
             }
             .into());
         }
-        let actual_bytes = self.local_head_bytes()?;
-        if actual_bytes != observed.head_bytes {
+        let actual = self.local_stored_head()?;
+        if actual != observed.head {
             return Err(CasConflict {
                 expected: observed.head_id.clone(),
-                actual: actual_bytes.as_deref().and_then(|bytes| {
-                    std::str::from_utf8(bytes)
-                        .ok()
-                        .map(str::trim)
-                        .filter(|value| validate_id(value).is_ok())
-                        .map(ToOwned::to_owned)
-                }),
+                actual: actual.as_ref().and_then(StoredHead::head_id),
             }
             .into());
         }
-        if actual_bytes.is_none() {
+        if actual.is_none() {
             self.refuse_foreign_branch(&expected_tip)?;
         }
         let new_commit =
@@ -1483,15 +1556,8 @@ impl Storage for GitStorage {
         let mut total_bytes = 0_u64;
         for commit_id in &commits {
             let head_id = self
-                .head_bytes_at_commit(commit_id)?
-                .as_deref()
-                .and_then(|bytes| {
-                    std::str::from_utf8(bytes)
-                        .ok()
-                        .map(str::trim)
-                        .filter(|value| validate_id(value).is_ok())
-                        .map(ToOwned::to_owned)
-                });
+                .stored_head_at_commit(commit_id)?
+                .and_then(|head| head.head_id());
             if let Some(id) = &head_id
                 && !history.manifests.contains_key(id)
             {
@@ -1524,25 +1590,50 @@ impl Storage for GitStorage {
         Ok(Some(history))
     }
 
-    fn restore_historical_object(&self, kind: ObjectKind, id: &str) -> Result<bool> {
+    fn restore_historical_object(
+        &self,
+        kind: ObjectKind,
+        id: &str,
+        max_bytes: u64,
+    ) -> Result<bool> {
         let commits = self.commit_history(MAX_RECOVERY_OUTER_COMMITS)?;
         if commits.len() > MAX_RECOVERY_OUTER_COMMITS {
             bail!(BudgetExhausted(
                 "carrier recovery outer-commit budget exhausted".to_owned()
             ))
         }
+        // Every byte read counts, including corrupt copies that are skipped.
+        let mut total_bytes = 0_u64;
         for copy in self.copy_commits(&commits, kind, id)? {
             let staging = tempfile::Builder::new()
                 .prefix("git-remote-e2ee-restore-")
                 .tempdir_in(self.root())?;
             let object_dir = staging.path().join("object");
             fs::create_dir(&object_dir)?;
-            let valid = self.read_copy_at(&copy, kind, id, |index, chunk| {
-                let mut file = File::create(object_dir.join(format!("{index:08}")))?;
-                file.write_all(chunk)?;
-                file.sync_all()?;
+            let mut current: Option<(usize, File)> = None;
+            let valid = self.read_copy_at(&copy, kind, id, |index, piece| {
+                total_bytes = total_bytes
+                    .checked_add(piece.len() as u64)
+                    .context("carrier restore byte count overflow")?;
+                if total_bytes > max_bytes {
+                    bail!(BudgetExhausted(
+                        "carrier recovery restore byte budget exhausted".to_owned()
+                    ))
+                }
+                if current.as_ref().map(|(open, _)| *open) != Some(index) {
+                    if let Some((_, file)) = current.take() {
+                        file.sync_all()?;
+                    }
+                    let file = File::create(object_dir.join(format!("{index:08}")))?;
+                    current = Some((index, file));
+                }
+                let (_, file) = current.as_mut().expect("chunk file opened above");
+                file.write_all(piece)?;
                 Ok(())
             })?;
+            if let Some((_, file)) = current.take() {
+                file.sync_all()?;
+            }
             if !valid {
                 continue;
             }
@@ -1658,21 +1749,34 @@ fn carrier_chunk_entries(
 ) -> Result<Option<Vec<(String, String)>>> {
     validate_id(id)?;
     let directory = format!("{}/{}/{id}", kind.directory(), &id[..2]);
-    let output = carrier_git_command()
+    let mut child = carrier_git_command()
         .arg("-C")
         .arg(repo)
         .args(["ls-tree", "-r", "-z", commit, "--", &directory])
-        .output()?;
-    ensure_git_success(&output, "git ls-tree carrier object")?;
-    if output.stdout.is_empty() {
-        return Ok(None);
-    }
-    if output.stdout.len() > 8 * 1024 * 1024 {
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut listing = Vec::new();
+    child
+        .stdout
+        .take()
+        .context("open git ls-tree stdout")?
+        .take(MAX_CARRIER_LISTING_BYTES + 1)
+        .read_to_end(&mut listing)?;
+    if listing.len() as u64 > MAX_CARRIER_LISTING_BYTES {
+        let _ = child.kill();
+        let _ = child.wait();
         bail!("carrier object listing exceeds its size budget")
     }
+    let status = child.wait()?;
+    if !status.success() {
+        bail!("git ls-tree carrier object failed: {status}")
+    }
+    if listing.is_empty() {
+        return Ok(None);
+    }
     let mut chunks = Vec::new();
-    for entry in output
-        .stdout
+    for entry in listing
         .split(|byte| *byte == 0)
         .filter(|entry| !entry.is_empty())
     {
@@ -1694,7 +1798,7 @@ fn carrier_chunk_entries(
         chunks.push((path, blob_id.to_owned()));
     }
     chunks.sort_by(|left, right| left.0.cmp(&right.0));
-    if chunks.is_empty() || chunks.len() > 4096 {
+    if chunks.is_empty() || chunks.len() as u64 > MAX_CHUNKS_PER_OBJECT {
         bail!("carrier object has an invalid chunk count")
     }
     for (index, (path, _)) in chunks.iter().enumerate() {
@@ -2257,17 +2361,23 @@ mod tests {
     fn object_stage_validates_all_written_bytes_before_publishing() {
         let data = b"partial writes must all contribute to the staged object hash";
         let published = Arc::new(AtomicBool::new(false));
-        let mut stage = ValidatingObjectStage::wrap(PartialWriteSink {
-            published: Arc::clone(&published),
-        });
+        let mut stage = ValidatingObjectStage::wrap(
+            PartialWriteSink {
+                published: Arc::clone(&published),
+            },
+            ObjectKind::Pack,
+        );
         stage.write_all(data).unwrap();
         stage.finish(&object_id(data)).unwrap();
         assert!(published.load(Ordering::Relaxed));
 
         let published = Arc::new(AtomicBool::new(false));
-        let mut stage = ValidatingObjectStage::wrap(PartialWriteSink {
-            published: Arc::clone(&published),
-        });
+        let mut stage = ValidatingObjectStage::wrap(
+            PartialWriteSink {
+                published: Arc::clone(&published),
+            },
+            ObjectKind::Pack,
+        );
         stage.write_all(data).unwrap();
         assert!(stage.finish(&object_id(b"different bytes")).is_err());
         assert!(!published.load(Ordering::Relaxed));
@@ -2341,7 +2451,7 @@ mod tests {
     fn buffered_object_reads_have_a_hard_limit() {
         let directory = tempfile::tempdir().unwrap();
         let storage = FilesystemStorage::new(directory.path());
-        let data = vec![1_u8; MAX_BUFFERED_OBJECT_SIZE as usize + 1];
+        let data = vec![1_u8; MAX_MANIFEST_BYTES as usize + 1];
         let id = object_id(&data);
         storage
             .put_object_if_absent(ObjectKind::Pack, &id, &data)
@@ -2395,52 +2505,168 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn filesystem_head_reads_refuse_a_fifo() {
-        let (directory, storage) = initialized_storage();
-        let observed = storage.observe_head().unwrap();
-        let head = directory.path().join("HEAD");
-        fs::remove_file(&head).unwrap();
-        let status = Command::new("mkfifo").arg(&head).status().unwrap();
+    fn make_fifo(path: &Path) {
+        let _ = fs::remove_file(path);
+        let status = Command::new("mkfifo").arg(path).status().unwrap();
         assert!(status.success());
+    }
+
+    fn assert_invalid_head(storage: &FilesystemStorage, expected: StoredHead) {
+        let error = storage.read_head().unwrap_err();
+        assert!(
+            format!("{error:#}").contains("storage HEAD is not a valid head"),
+            "{error:#}"
+        );
+        let observed = storage.observe_head().unwrap();
+        assert_eq!(observed.head_id, None);
+        assert_eq!(observed.head, Some(expected));
+    }
+
+    /// Replaces HEAD with an entry no reader may accept, then checks that
+    /// reads report an invalid head, a stale observation loses the CAS, and a
+    /// fresh observation of the invalid head can replace it.
+    fn assert_head_entry_is_an_invalid_observation(
+        replace: impl FnOnce(&Path),
+        expected: StoredHead,
+    ) {
+        let (directory, storage) = initialized_storage();
+        let stale = storage.observe_head().unwrap();
+        replace(&directory.path().join("HEAD"));
         let storage = Arc::new(storage);
 
         let reader = Arc::clone(&storage);
-        let result = finishes_within(move || reader.read_head().is_err());
-        assert_eq!(result, Some(true), "read_head must refuse a FIFO HEAD");
-
-        let reader = Arc::clone(&storage);
-        let result = finishes_within(move || reader.observe_head().is_err());
-        assert_eq!(result, Some(true), "observe_head must refuse a FIFO HEAD");
+        let shown = expected.clone();
+        let observed = finishes_within(move || {
+            assert_invalid_head(&reader, shown);
+            reader.observe_head().unwrap()
+        })
+        .expect("reading an invalid HEAD must not block");
 
         let writer = Arc::clone(&storage);
-        let result = finishes_within(move || {
+        let stale_error = finishes_within(move || {
             writer
-                .compare_and_swap_observed_head(&observed, &object_id(b"second"))
+                .compare_and_swap_observed_head(&stale, &object_id(b"second"))
+                .unwrap_err()
+        })
+        .expect("CAS over an invalid HEAD must not block");
+        assert!(stale_error.downcast_ref::<CasConflict>().is_some());
+
+        let next = object_id(b"recovered");
+        storage
+            .compare_and_swap_observed_head(&observed, &next)
+            .unwrap();
+        assert_eq!(storage.read_head().unwrap(), Some(next));
+        drop(directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_head_is_an_invalid_observation_not_a_hang() {
+        assert_head_entry_is_an_invalid_observation(make_fifo, StoredHead::NotRegular);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_head_symlink_to_a_fifo_is_an_invalid_observation_not_a_hang() {
+        assert_head_entry_is_an_invalid_observation(
+            |head| {
+                let fifo = head.with_file_name("elsewhere");
+                make_fifo(&fifo);
+                fs::remove_file(head).unwrap();
+                std::os::unix::fs::symlink(&fifo, head).unwrap();
+            },
+            StoredHead::NotRegular,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_head_symlink_to_a_regular_file_is_not_followed() {
+        assert_head_entry_is_an_invalid_observation(
+            |head| {
+                let target = head.with_file_name("elsewhere");
+                fs::write(&target, format!("{}\n", object_id(b"first"))).unwrap();
+                fs::remove_file(head).unwrap();
+                std::os::unix::fs::symlink(&target, head).unwrap();
+            },
+            StoredHead::NotRegular,
+        );
+    }
+
+    #[test]
+    fn an_oversized_head_is_an_invalid_observation() {
+        assert_head_entry_is_an_invalid_observation(
+            |head| fs::write(head, vec![b'a'; MAX_HEAD_BYTES as usize + 1]).unwrap(),
+            StoredHead::Oversized,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_format_fails_instead_of_hanging() {
+        let (directory, storage) = initialized_storage();
+        make_fifo(&directory.path().join("FORMAT"));
+        let result = finishes_within(move || format!("{:#}", storage.read_head().unwrap_err()));
+        assert!(
+            result
+                .expect("reading a FIFO FORMAT must not block")
+                .contains("not a regular file")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_pack_fails_instead_of_hanging() {
+        let (directory, storage) = initialized_storage();
+        let data = b"pack bytes";
+        let id = object_id(data);
+        let path = storage.object_path(ObjectKind::Pack, &id).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        make_fifo(&path);
+        let storage = Arc::new(storage);
+
+        let reader = Arc::clone(&storage);
+        let opened = finishes_within(move || {
+            reader
+                .open_object(ObjectKind::Pack, &id)
+                .err()
+                .map(|error| error.downcast_ref::<ObjectUnavailable>().is_some())
+        });
+        assert_eq!(opened, Some(Some(true)), "opening a FIFO pack must fail");
+
+        let writer = Arc::clone(&storage);
+        let written = finishes_within(move || {
+            writer
+                .put_object_if_absent(ObjectKind::Pack, &object_id(data), data)
                 .is_err()
         });
-        assert_eq!(result, Some(true), "observed CAS must refuse a FIFO HEAD");
+        assert_eq!(written, Some(true), "verifying a FIFO pack must fail");
         drop(directory);
     }
 
     #[test]
-    fn filesystem_head_reads_reject_oversized_heads() {
+    fn writers_refuse_a_manifest_readers_would_reject_before_publication() {
         let (directory, storage) = initialized_storage();
-        let observed = storage.observe_head().unwrap();
-        let oversized = vec![b'a'; MAX_STORAGE_HEAD_BYTES as usize + 1];
-        fs::write(directory.path().join("HEAD"), &oversized).unwrap();
-        for error in [
-            storage.read_head().unwrap_err(),
-            storage.observe_head().unwrap_err(),
-            storage
-                .compare_and_swap_observed_head(&observed, &object_id(b"second"))
-                .unwrap_err(),
-        ] {
-            assert!(
-                error.downcast_ref::<BudgetExhausted>().is_some(),
-                "{error:#}"
-            );
-        }
+        let head = storage.read_head().unwrap();
+        let data = vec![7_u8; MAX_MANIFEST_BYTES as usize + 1];
+        let id = object_id(&data);
+        let error = storage
+            .put_object_if_absent(ObjectKind::Manifest, &id, &data)
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("manifest object exceeds"),
+            "{error:#}"
+        );
+        assert!(
+            !storage
+                .object_path(ObjectKind::Manifest, &id)
+                .unwrap()
+                .exists()
+        );
+        assert_eq!(storage.read_head().unwrap(), head);
+        let manifests = directory.path().join("manifests");
+        assert_eq!(fs::read_dir(manifests).unwrap().count(), 0);
+        drop(directory);
     }
 
     #[test]

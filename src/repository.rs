@@ -23,7 +23,7 @@ use crate::manifest::{
     verify_manifest, wrap_predecessor_key,
 };
 use crate::policy::{DeviceRecord, DeviceRoles, PolicyState};
-use crate::storage::{HeadObservation, ObjectKind, Storage, StorageOccupied};
+use crate::storage::{HeadObservation, ObjectKind, Storage, StorageOccupied, StoredHead};
 use crate::trace;
 
 const MAX_RECOVERY_OUTER_COMMITS: usize = 2048;
@@ -854,10 +854,14 @@ impl<S: Storage> EncryptedRepository<S> {
                 &mut |id| self.read_manifest_material(id),
                 Some(&mut budget),
             ),
-            None if observation.head_bytes.is_some() => Err(proven_invalid(anyhow::anyhow!(
-                "storage HEAD is not a valid manifest object ID"
-            ))),
-            None => Err(MissingStorageHead.into()),
+            None => match &observation.head {
+                Some(head) => {
+                    Err(proven_invalid(head.parse().err().unwrap_or_else(|| {
+                        anyhow::anyhow!("storage HEAD is not a valid head")
+                    })))
+                }
+                None => Err(MissingStorageHead.into()),
+            },
         };
         match current_chain {
             Ok(chain) => {
@@ -920,7 +924,11 @@ impl<S: Storage> EncryptedRepository<S> {
         if report.classification == RecoveryClass::Invalid {
             let evidence_id = observation.head_id.clone().unwrap_or_else(|| {
                 hex::encode(Sha256::digest(
-                    observation.head_bytes.as_deref().unwrap_or_default(),
+                    observation
+                        .head
+                        .as_ref()
+                        .map(StoredHead::evidence)
+                        .unwrap_or_default(),
                 ))
             });
             record_rejected_head(
@@ -1360,7 +1368,11 @@ impl<S: Storage> EncryptedRepository<S> {
         if self.storage_object_matches(kind, id)? {
             return Ok(());
         }
-        if self.storage.restore_historical_object(kind, id)?
+        // Room for one corrupt maximal copy before the valid one.
+        let restore_budget = kind.max_bytes().saturating_mul(2);
+        if self
+            .storage
+            .restore_historical_object(kind, id, restore_budget)?
             && self.storage_object_matches(kind, id)?
         {
             return Ok(());

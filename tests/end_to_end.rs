@@ -1627,6 +1627,39 @@ fn recovery_discovery_budget_exhaustion_fails_closed() {
 }
 
 #[test]
+fn an_oversized_storage_head_is_invalid_and_recoverable_from_the_floor() {
+    let temporary = tempfile::tempdir().unwrap();
+    let repo = temporary.path().join("repo");
+    let storage_path = temporary.path().join("storage");
+    initialize_git(&repo);
+    let key = KeyFile::generate();
+    let storage = FilesystemStorage::new(&storage_path);
+    let repository = EncryptedRepository::new(storage.clone(), key, support::state_dir());
+    repository.initialize("owner").unwrap();
+    repository.fetch_into(&repo, "encrypted").unwrap();
+    let floor = storage.read_head().unwrap().unwrap();
+    fs::write(
+        storage_path.join("HEAD"),
+        vec![b'a'; git_remote_e2ee::storage::MAX_HEAD_BYTES as usize + 1],
+    )
+    .unwrap();
+
+    let error = repository.fetch_into(&repo, "encrypted").unwrap_err();
+    assert!(
+        format!("{error:#}").contains("storage HEAD is not a valid head"),
+        "{error:#}"
+    );
+
+    let recovered = publish_recovery(&repository, &repo).unwrap();
+    assert_eq!(recovered.classification, RecoveryClass::Invalid);
+    let published = recovered.published_manifest.unwrap();
+    let (current_id, current) = repository.current_manifest().unwrap();
+    assert_eq!(current_id, published);
+    assert_eq!(current.previous.as_deref(), Some(floor.as_str()));
+    assert_eq!(machine_floor(&repo)["head_id"], current_id);
+}
+
+#[test]
 fn writer_can_add_branch_without_having_other_remote_branch_objects() {
     let temporary = tempfile::tempdir().unwrap();
     let first_writer = temporary.path().join("first-writer");
