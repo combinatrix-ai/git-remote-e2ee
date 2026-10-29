@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Stdio};
+use std::process::Stdio;
 use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
@@ -13,8 +13,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::bounded::{self, Bounded, Opened};
+use crate::catfile::{BatchHeader, CatFile, GitObjectType};
 use crate::error::{BudgetExhausted, ObjectUnavailable};
 use crate::gitcmd::{self, GitRepository};
+use crate::refname;
 use crate::trace;
 
 #[derive(Debug, Error)]
@@ -686,115 +688,19 @@ impl Read for ChunkReader {
     }
 }
 
-/// One `git cat-file --batch` process. Each header is checked before its
-/// body is read, so a blob's type and size are known before any allocation.
-struct CatFile {
-    child: Child,
-    input: Option<ChildStdin>,
-    output: BufReader<std::process::ChildStdout>,
-    finished: bool,
-}
-
-enum BatchHeader {
-    Missing,
-    Object { id: String, kind: String, size: u64 },
-}
-
-impl CatFile {
-    fn spawn(repo: &Path) -> Result<Self> {
-        let mut child = GitRepository::owned_work_tree(repo)
-            .git()
-            .args(["cat-file", "--batch"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
-        let input = child.stdin.take().context("open git cat-file stdin")?;
-        let output = child.stdout.take().context("open git cat-file stdout")?;
-        Ok(Self {
-            child,
-            input: Some(input),
-            output: BufReader::new(output),
-            finished: false,
-        })
-    }
-
-    fn request(&mut self, object: &str) -> std::io::Result<BatchHeader> {
-        let input = self
-            .input
-            .as_mut()
-            .expect("git cat-file input is open until finished");
-        writeln!(input, "{object}")?;
-        input.flush()?;
-        let mut header = String::new();
-        if self.output.read_line(&mut header)? == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "git cat-file ended before answering",
-            ));
-        }
-        let fields: Vec<_> = header.split_ascii_whitespace().collect();
-        match fields[..] {
-            [_, "missing"] | [_, "ambiguous"] => Ok(BatchHeader::Missing),
-            [id, kind, size] => Ok(BatchHeader::Object {
-                id: id.to_owned(),
-                kind: kind.to_owned(),
-                size: size
-                    .parse()
-                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?,
-            }),
-            _ => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "git cat-file returned an invalid header",
-            )),
-        }
-    }
-
-    /// Consumes the newline git writes after each object body.
-    fn end_body(&mut self) -> std::io::Result<()> {
-        let mut trailer = [0_u8; 1];
-        self.output.read_exact(&mut trailer)?;
-        if trailer[0] != b'\n' {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "git cat-file returned a malformed object trailer",
-            ));
-        }
-        Ok(())
-    }
-
-    fn finish(&mut self) -> std::io::Result<()> {
-        self.input.take();
-        let status = self.child.wait()?;
-        self.finished = true;
-        if !status.success() {
-            return Err(std::io::Error::other("git cat-file failed"));
-        }
-        Ok(())
-    }
-}
-
-impl Drop for CatFile {
-    fn drop(&mut self) {
-        if !self.finished {
-            self.input.take();
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-    }
-}
-
 /// Reads one blob of at most `max_bytes` from a carrier commit.
 fn carrier_blob(repo: &Path, object: &str, max_bytes: u64) -> Result<Bounded> {
-    let mut cat = CatFile::spawn(repo)?;
+    let mut cat = CatFile::batch(&GitRepository::owned_work_tree(repo))?;
     let size = match cat.request(object)? {
         BatchHeader::Missing => return Ok(Bounded::Absent),
-        BatchHeader::Object { kind, .. } if kind != "blob" => return Ok(Bounded::NotRegular),
+        BatchHeader::Object { kind, .. } if kind != GitObjectType::Blob => {
+            return Ok(Bounded::NotRegular);
+        }
         BatchHeader::Object { size, .. } if size > max_bytes => return Ok(Bounded::Oversized),
         BatchHeader::Object { size, .. } => size,
     };
     let mut bytes = vec![0_u8; size as usize];
-    cat.output.read_exact(&mut bytes)?;
+    cat.body().read_exact(&mut bytes)?;
     cat.end_body()?;
     cat.finish()?;
     Ok(Bounded::Within(bytes))
@@ -813,7 +719,7 @@ struct GitChunkReader {
 impl GitChunkReader {
     fn new(repo: &Path, chunks: Vec<(String, String)>) -> Result<Self> {
         Ok(Self {
-            cat: CatFile::spawn(repo)?,
+            cat: CatFile::batch(&GitRepository::owned_work_tree(repo))?,
             chunks,
             next: 0,
             remaining: 0,
@@ -830,7 +736,11 @@ impl GitChunkReader {
         let expected = &self.chunks[self.next].1;
         let invalid = |message| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
         let size = match self.cat.request(expected)? {
-            BatchHeader::Object { id, kind, size } if id == *expected && kind == "blob" => size,
+            BatchHeader::Object { id, kind, size }
+                if id == *expected && kind == GitObjectType::Blob =>
+            {
+                size
+            }
             _ => {
                 return Err(invalid(
                     "git cat-file returned an invalid carrier chunk header",
@@ -857,9 +767,7 @@ impl Read for GitChunkReader {
         let started = self.trace.is_active().then(std::time::Instant::now);
         if self.remaining == 0 {
             if self.next == self.chunks.len() {
-                if !self.cat.finished {
-                    self.cat.finish()?;
-                }
+                self.cat.finish()?;
                 self.trace
                     .record(0, started.map_or(0, |started| started.elapsed().as_nanos()));
                 return Ok(0);
@@ -867,7 +775,7 @@ impl Read for GitChunkReader {
             self.start_next_chunk()?;
         }
         let amount = output.len().min(self.remaining as usize);
-        let read = self.cat.output.read(&mut output[..amount])?;
+        let read = self.cat.body().read(&mut output[..amount])?;
         if read == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -2030,10 +1938,7 @@ fn parse_carrier_location(location: &str) -> Result<(String, String)> {
     if branch.is_empty() {
         bail!("empty carrier branch in {location:?}")
     }
-    let check = gitcmd::without_repository()
-        .args(["check-ref-format", &format!("refs/heads/{branch}")])
-        .output()?;
-    if !check.status.success() || branch.starts_with('-') {
+    if !refname::is_valid(&format!("refs/heads/{branch}")) || branch.starts_with('-') {
         bail!("invalid carrier branch name {branch:?} in {location:?}")
     }
     Ok((remote.to_owned(), branch.to_owned()))

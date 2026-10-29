@@ -1,4 +1,5 @@
 mod bounded;
+mod catfile;
 pub mod continuity;
 pub mod crypto;
 pub mod error;
@@ -7,6 +8,7 @@ pub mod gitcmd;
 pub mod manifest;
 mod persist;
 pub mod policy;
+mod refname;
 pub mod repository;
 pub mod storage;
 mod trace;

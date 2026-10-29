@@ -5,8 +5,9 @@ use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 
 use anyhow::{Context, Result, bail};
 
+use crate::catfile::{BatchHeader, CatFile, GitObjectType};
 use crate::gitcmd::GitRepository;
-use crate::trace;
+use crate::{refname, trace};
 
 pub fn has_complete_object_graph(repo: &GitRepository) -> bool {
     let shallow = match repo
@@ -48,26 +49,44 @@ pub enum InnerRefKind {
     Tag,
 }
 
-pub fn validate_inner_ref(repo: &GitRepository, reference: &str) -> Result<InnerRefKind> {
-    let kind = if reference.starts_with("refs/heads/") {
-        InnerRefKind::Branch
-    } else if reference.starts_with("refs/tags/") {
-        InnerRefKind::Tag
-    } else {
-        bail!(
-            "unsupported ref namespace for {reference}; only refs/heads/* and refs/tags/* are supported"
-        )
-    };
-    let output = repo.git().args(["check-ref-format", reference]).output()?;
-    if !output.status.success() {
+impl InnerRefKind {
+    /// The namespace of a ref whose name was already validated.
+    pub fn of(reference: &str) -> Result<Self> {
+        if reference.starts_with("refs/heads/") {
+            Ok(Self::Branch)
+        } else if reference.starts_with("refs/tags/") {
+            Ok(Self::Tag)
+        } else {
+            bail!(
+                "unsupported ref namespace for {reference}; only refs/heads/* and refs/tags/* are supported"
+            )
+        }
+    }
+}
+
+pub fn validate_inner_ref(reference: &str) -> Result<InnerRefKind> {
+    let kind = InnerRefKind::of(reference)?;
+    if !refname::is_valid(reference) {
         bail!("invalid Git ref name {reference}")
     }
     Ok(kind)
 }
 
-pub fn ensure_branch_target(repo: &GitRepository, reference: &str, object: &str) -> Result<()> {
-    let target = resolve_tag_chain(repo, reference, object, "pushed")?;
-    if target.kind != "commit" {
+/// Checks every ref name of a manifest once, when an operation accepts it.
+pub fn validate_inner_refs(refs: &BTreeMap<String, String>) -> Result<()> {
+    for reference in refs.keys() {
+        validate_inner_ref(reference)?;
+    }
+    Ok(())
+}
+
+pub fn ensure_branch_target(
+    objects: &mut Objects<'_>,
+    reference: &str,
+    object: &str,
+) -> Result<()> {
+    let target = resolve_tag_chain(objects, reference, object, "pushed")?;
+    if target.kind != GitObjectType::Commit {
         bail!("branch ref {reference} must resolve to a commit")
     }
     Ok(())
@@ -85,12 +104,118 @@ pub fn is_ancestor(repo: &GitRepository, ancestor: &str, descendant: &str) -> Re
     }
 }
 
-pub fn object_exists(repo: &GitRepository, object: &str) -> Result<bool> {
-    let status = repo.git().args(["cat-file", "-e", object]).status()?;
-    match status.code() {
-        Some(0) => Ok(true),
-        Some(1) => Ok(false),
-        _ => bail!("git cat-file failed"),
+/// Object queries for one operation, answered by at most one
+/// `git cat-file --batch-check` and one `git cat-file --batch` process,
+/// each started on first use.
+pub struct Objects<'a> {
+    repo: &'a GitRepository,
+    check: Option<CatFile>,
+    contents: Option<CatFile>,
+}
+
+/// Annotated tag headers larger than this are rejected; the message after
+/// them is skipped unread.
+const MAX_TAG_HEADER_BYTES: u64 = 64 * 1024;
+
+impl<'a> Objects<'a> {
+    pub fn new(repo: &'a GitRepository) -> Self {
+        Self {
+            repo,
+            check: None,
+            contents: None,
+        }
+    }
+
+    /// The object's type, or `None` when it is absent. A failure of git is
+    /// an error, never absence.
+    fn kind(&mut self, object: &str) -> Result<Option<GitObjectType>> {
+        let check = match &mut self.check {
+            Some(check) => check,
+            None => self.check.insert(CatFile::batch_check(self.repo)?),
+        };
+        match check
+            .request(object)
+            .context("git cat-file --batch-check failed")?
+        {
+            BatchHeader::Missing => Ok(None),
+            BatchHeader::Object { kind, .. } => Ok(Some(kind)),
+        }
+    }
+
+    pub fn exists(&mut self, object: &str) -> Result<bool> {
+        Ok(self.kind(object)?.is_some())
+    }
+
+    /// The `object` and `type` headers of an annotated tag. Only the header
+    /// block is read into memory; the message is discarded undecoded.
+    fn tag_target(&mut self, reference: &str, tag: &str) -> Result<(String, GitObjectType)> {
+        let header = self.tag_header(reference, tag)?;
+        let mut target = None;
+        let mut target_kind = None;
+        for line in header.split(|byte| *byte == b'\n') {
+            if let Some(value) = line.strip_prefix(b"object ") {
+                if target.replace(value).is_some() {
+                    bail!("annotated tag {reference} has duplicate target objects")
+                }
+            } else if let Some(value) = line.strip_prefix(b"type ")
+                && target_kind.replace(value).is_some()
+            {
+                bail!("annotated tag {reference} has duplicate target types")
+            }
+        }
+        let target = target.context("annotated tag is missing its target object")?;
+        if !matches!(target.len(), 40 | 64) || !target.iter().all(u8::is_ascii_hexdigit) {
+            bail!("annotated tag {reference} has a malformed target object")
+        }
+        let target_kind = target_kind.context("annotated tag is missing its target type")?;
+        let target_kind = GitObjectType::parse(target_kind)
+            .with_context(|| format!("annotated tag {reference} has an unknown target type"))?;
+        Ok((
+            String::from_utf8(target.to_vec()).expect("hex is ASCII"),
+            target_kind,
+        ))
+    }
+
+    fn tag_header(&mut self, reference: &str, tag: &str) -> Result<Vec<u8>> {
+        let contents = match &mut self.contents {
+            Some(contents) => contents,
+            None => self.contents.insert(CatFile::batch(self.repo)?),
+        };
+        let size = match contents
+            .request(tag)
+            .context("git cat-file --batch failed")?
+        {
+            BatchHeader::Object {
+                kind: GitObjectType::Tag,
+                size,
+                ..
+            } => size,
+            BatchHeader::Missing => bail!("annotated tag of {reference} disappeared while reading"),
+            BatchHeader::Object { .. } => {
+                // Its body is pending; this process cannot answer further.
+                self.contents = None;
+                bail!("annotated tag of {reference} changed type while reading")
+            }
+        };
+        let mut prefix = Vec::new();
+        let body = contents.body();
+        body.take(size.min(MAX_TAG_HEADER_BYTES))
+            .read_to_end(&mut prefix)?;
+        let rest = size - prefix.len() as u64;
+        if std::io::copy(&mut body.take(rest), &mut std::io::sink())? != rest {
+            bail!("git cat-file truncated annotated tag of {reference}")
+        }
+        contents.end_body()?;
+        match prefix.windows(2).position(|pair| pair == b"\n\n") {
+            Some(end) => {
+                prefix.truncate(end);
+                Ok(prefix)
+            }
+            None if rest == 0 => Ok(prefix),
+            None => bail!(
+                "annotated tag of {reference} has a header larger than {MAX_TAG_HEADER_BYTES} bytes"
+            ),
+        }
     }
 }
 
@@ -272,17 +397,18 @@ pub fn ensure_refs_connected_since(
     if refs.is_empty() {
         return Ok(());
     }
+    let mut objects = Objects::new(repo);
     let mut commit_roots = Vec::new();
     let mut verified_commit_roots = Vec::new();
     for (reference, object) in refs {
-        let ref_kind = validate_inner_ref(repo, reference)?;
-        let target = resolve_tag_chain(repo, reference, object, "fetched")?;
-        match target.kind.as_str() {
-            "commit" => commit_roots.push(target.oid),
-            "tree" if ref_kind == InnerRefKind::Tag => {
-                ensure_tree_connected(repo, reference, &target.oid)?
+        let ref_kind = InnerRefKind::of(reference)?;
+        let target = resolve_tag_chain(&mut objects, reference, object, "fetched")?;
+        match target.kind {
+            GitObjectType::Commit => commit_roots.push(target.oid),
+            GitObjectType::Tree if ref_kind == InnerRefKind::Tag => {
+                ensure_tree_connected(repo, &mut objects, reference, &target.oid)?
             }
-            "blob" if ref_kind == InnerRefKind::Tag => {}
+            GitObjectType::Blob if ref_kind == InnerRefKind::Tag => {}
             _ => bail!("fetched ref {reference} does not resolve to a supported Git object"),
         }
     }
@@ -293,14 +419,14 @@ pub fn ensure_refs_connected_since(
     // reachable beyond that frontier. Still require the frontier tips to be
     // present locally so corruption or an unexpected local prune fails closed.
     for (reference, object) in verified_refs {
-        let ref_kind = validate_inner_ref(repo, reference)?;
-        let target = resolve_tag_chain(repo, reference, object, "verified")?;
-        match target.kind.as_str() {
-            "commit" => verified_commit_roots.push(target.oid),
-            "tree" if ref_kind == InnerRefKind::Tag => {
-                ensure_tree_connected(repo, reference, &target.oid)?
+        let ref_kind = InnerRefKind::of(reference)?;
+        let target = resolve_tag_chain(&mut objects, reference, object, "verified")?;
+        match target.kind {
+            GitObjectType::Commit => verified_commit_roots.push(target.oid),
+            GitObjectType::Tree if ref_kind == InnerRefKind::Tag => {
+                ensure_tree_connected(repo, &mut objects, reference, &target.oid)?
             }
-            "blob" if ref_kind == InnerRefKind::Tag => {}
+            GitObjectType::Blob if ref_kind == InnerRefKind::Tag => {}
             _ => bail!("verified ref {reference} does not resolve to a supported Git object"),
         }
     }
@@ -340,63 +466,48 @@ pub fn ensure_refs_connected_since(
 
 struct RefTarget {
     oid: String,
-    kind: String,
+    kind: GitObjectType,
 }
 
 fn resolve_tag_chain(
-    repo: &GitRepository,
+    objects: &mut Objects<'_>,
     reference: &str,
     object: &str,
     label: &str,
 ) -> Result<RefTarget> {
+    let missing = || -> anyhow::Error {
+        if label == "verified" {
+            anyhow::anyhow!("verified ref {reference} is missing locally")
+        } else {
+            anyhow::anyhow!(
+                "fetched ref {reference} does not resolve to a complete Git object graph"
+            )
+        }
+    };
     let mut current = object.to_owned();
     let mut seen = HashSet::new();
     loop {
         if !seen.insert(current.clone()) {
             bail!("{label} ref {reference} contains a cyclic tag chain")
         }
-        let kind = match cat_file_type(repo, &current) {
-            Ok(kind) => kind,
-            Err(_) if label == "verified" => {
-                bail!("verified ref {reference} is missing locally")
-            }
-            Err(_) => {
-                bail!("fetched ref {reference} does not resolve to a complete Git object graph")
-            }
-        };
-        if kind != "tag" {
+        let kind = objects.kind(&current)?.ok_or_else(missing)?;
+        if kind != GitObjectType::Tag {
             return Ok(RefTarget { oid: current, kind });
         }
-        let body = git_text(repo, &["cat-file", "-p", &current])?;
-        let mut target = None;
-        let mut target_kind = None;
-        for line in body.lines().take_while(|line| !line.is_empty()) {
-            if let Some(value) = line.strip_prefix("object ") {
-                if target.is_some() {
-                    bail!("annotated tag {reference} has duplicate target objects")
-                }
-                target = Some(value);
-            } else if let Some(value) = line.strip_prefix("type ") {
-                if target_kind.is_some() {
-                    bail!("annotated tag {reference} has duplicate target types")
-                }
-                target_kind = Some(value);
-            }
-        }
-        let target = target.context("annotated tag is missing its target object")?;
-        let expected_kind = target_kind.context("annotated tag is missing its target type")?;
-        if cat_file_type(repo, target)? != expected_kind {
+        let (target, expected_kind) = objects.tag_target(reference, &current)?;
+        if objects.kind(&target)?.ok_or_else(missing)? != expected_kind {
             bail!("annotated tag {reference} has a mismatched target type")
         }
-        current = target.to_owned();
+        current = target;
     }
 }
 
-fn cat_file_type(repo: &GitRepository, object: &str) -> Result<String> {
-    git_text(repo, &["cat-file", "-t", object])
-}
-
-fn ensure_tree_connected(repo: &GitRepository, reference: &str, tree: &str) -> Result<()> {
+fn ensure_tree_connected(
+    repo: &GitRepository,
+    objects: &mut Objects<'_>,
+    reference: &str,
+    tree: &str,
+) -> Result<()> {
     let output = repo
         .git()
         .args(["ls-tree", "-r", "-t", "-z", "--full-tree", tree])
@@ -429,7 +540,7 @@ fn ensure_tree_connected(repo: &GitRepository, reference: &str, tree: &str) -> R
             // object database and is not part of this tree's connectivity.
             continue;
         }
-        if cat_file_type(repo, object).is_err() {
+        if !objects.exists(object)? {
             bail!("fetched tag {reference} contains missing Git object {object}")
         }
     }
@@ -464,11 +575,13 @@ fn git_text(repo: &GitRepository, args: &[&str]) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::has_complete_object_graph;
+    use super::{ensure_refs_connected_since, has_complete_object_graph};
     use crate::gitcmd::GitRepository;
+    use std::collections::BTreeMap;
     use std::fs;
+    use std::io::Write;
     use std::path::Path;
-    use std::process::Command;
+    use std::process::{Command, Stdio};
 
     fn git(repo: &Path, args: &[&str]) {
         let output = Command::new("git")
@@ -533,5 +646,122 @@ mod tests {
         assert!(!has_complete_object_graph(
             &GitRepository::open(&full).unwrap()
         ));
+    }
+
+    fn repository_with_commit(path: &Path) -> String {
+        git(path, &["init", "--quiet", "--initial-branch=main"]);
+        git(path, &["config", "user.name", "Test"]);
+        git(path, &["config", "user.email", "test@example.invalid"]);
+        git(path, &["commit", "--quiet", "--allow-empty", "-m", "first"]);
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn write_tag(
+        repo: &Path,
+        target: &str,
+        target_kind: &str,
+        extra_header: &[u8],
+        message: &[u8],
+    ) -> String {
+        let mut bytes = format!(
+            "object {target}\ntype {target_kind}\ntag t\ntagger Test <test@example.invalid> 0 +0000\n"
+        )
+        .into_bytes();
+        bytes.extend_from_slice(extra_header);
+        bytes.push(b'\n');
+        bytes.extend_from_slice(message);
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["hash-object", "-t", "tag", "-w", "--literally", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(&bytes).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[test]
+    fn tags_with_non_utf8_or_large_messages_are_inspectable() {
+        let temporary = tempfile::tempdir().unwrap();
+        let commit = repository_with_commit(temporary.path());
+        let binary = write_tag(
+            temporary.path(),
+            &commit,
+            "commit",
+            b"",
+            b"\xff\xfe\x00 not UTF-8\n",
+        );
+        let large_message = vec![b'x'; 16 * 1024 * 1024];
+        let large = write_tag(temporary.path(), &commit, "commit", b"", &large_message);
+        let nested = write_tag(temporary.path(), &binary, "tag", b"", b"\xc3\x28\n");
+        let refs = BTreeMap::from([
+            ("refs/tags/binary".to_owned(), binary),
+            ("refs/tags/large".to_owned(), large),
+            ("refs/tags/nested".to_owned(), nested),
+        ]);
+        let repo = GitRepository::open(temporary.path()).unwrap();
+        ensure_refs_connected_since(&repo, &refs, &BTreeMap::new()).unwrap();
+        ensure_refs_connected_since(&repo, &refs, &refs).unwrap();
+    }
+
+    #[test]
+    fn tag_headers_beyond_the_bound_are_rejected() {
+        let temporary = tempfile::tempdir().unwrap();
+        let commit = repository_with_commit(temporary.path());
+        let mut header = b"x-padding ".to_vec();
+        header.extend(vec![b'a'; 128 * 1024]);
+        header.push(b'\n');
+        let tag = write_tag(temporary.path(), &commit, "commit", &header, b"message\n");
+        let refs = BTreeMap::from([("refs/tags/padded".to_owned(), tag)]);
+        let repo = GitRepository::open(temporary.path()).unwrap();
+        let error = ensure_refs_connected_since(&repo, &refs, &BTreeMap::new()).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("header larger than"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_failing_git_is_an_error_and_not_a_missing_object() {
+        let temporary = tempfile::tempdir().unwrap();
+        let commit = repository_with_commit(temporary.path());
+        let absent = "0".repeat(commit.len());
+        let repo = GitRepository::open(temporary.path()).unwrap();
+        let error = ensure_refs_connected_since(
+            &repo,
+            &BTreeMap::from([("refs/heads/main".to_owned(), commit.clone())]),
+            &BTreeMap::from([("refs/heads/gone".to_owned(), absent)]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "verified ref refs/heads/gone is missing locally"
+        );
+
+        let broken = GitRepository::owned_git_dir(&temporary.path().join("not-a-repository"));
+        let error = ensure_refs_connected_since(
+            &broken,
+            &BTreeMap::from([("refs/heads/main".to_owned(), commit)]),
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert!(
+            error.chain().any(|cause| cause.is::<std::io::Error>()),
+            "{error:#}"
+        );
+        assert!(
+            !format!("{error:#}").contains("does not resolve"),
+            "{error:#}"
+        );
     }
 }

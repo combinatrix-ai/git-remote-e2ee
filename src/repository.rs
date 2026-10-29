@@ -466,8 +466,9 @@ impl<S: Storage> EncryptedRepository<S> {
         change: RefChange<'_>,
     ) -> Result<String> {
         let floor = self.lock_floor()?;
+        let mut objects = git::Objects::new(repo);
         let (current, next_object, non_fast_forward) =
-            self.preflight_ref_change(repo, &floor, destination_ref, change)?;
+            self.preflight_ref_change(repo, &mut objects, &floor, destination_ref, change)?;
         if next_object
             .as_ref()
             .is_some_and(|next| current.manifest.refs.get(destination_ref) == Some(next))
@@ -495,7 +496,7 @@ impl<S: Storage> EncryptedRepository<S> {
             let mut exclusions = BTreeMap::new();
             if !non_fast_forward {
                 for (reference, object) in &current.manifest.refs {
-                    if git::object_exists(repo, object)? {
+                    if objects.exists(object)? {
                         exclusions.insert(reference.clone(), object.clone());
                     }
                 }
@@ -581,18 +582,25 @@ impl<S: Storage> EncryptedRepository<S> {
         change: RefChange<'_>,
     ) -> Result<()> {
         let floor = self.lock_floor()?;
-        let (current, _, _) = self.preflight_ref_change(repo, &floor, destination_ref, change)?;
+        let (current, _, _) = self.preflight_ref_change(
+            repo,
+            &mut git::Objects::new(repo),
+            &floor,
+            destination_ref,
+            change,
+        )?;
         floor.advance(ContinuityFloor::at(&current.id, &current.manifest))
     }
 
     fn preflight_ref_change(
         &self,
         repo: &GitRepository,
+        objects: &mut git::Objects<'_>,
         floor: &FloorGuard,
         destination_ref: &str,
         change: RefChange<'_>,
     ) -> Result<(OpenedState, Option<String>, bool)> {
-        let ref_kind = git::validate_inner_ref(repo, destination_ref)?;
+        let ref_kind = git::validate_inner_ref(destination_ref)?;
         let chain = self.pinned_chain(floor)?;
         let current = chain.first().context("manifest chain is empty")?.clone();
         let device_id = self.key.device_id()?;
@@ -602,9 +610,7 @@ impl<S: Storage> EncryptedRepository<S> {
             }
             bail!("device is not an active writer")
         }
-        for reference in current.manifest.refs.keys() {
-            git::validate_inner_ref(repo, reference)?;
-        }
+        git::validate_inner_refs(&current.manifest.refs)?;
         let old_object = current.manifest.refs.get(destination_ref);
         let RefChange::Update { source, force } = change else {
             if old_object.is_none() {
@@ -623,7 +629,7 @@ impl<S: Storage> EncryptedRepository<S> {
             return Ok((current, Some(next_object), false));
         }
         if ref_kind == git::InnerRefKind::Branch {
-            git::ensure_branch_target(repo, destination_ref, &next_object)?;
+            git::ensure_branch_target(objects, destination_ref, &next_object)?;
         }
         if ref_kind == git::InnerRefKind::Tag && old_object.is_some() && !force {
             return Err(PushRejection::AlreadyExists(destination_ref.to_owned()).into());
@@ -631,7 +637,7 @@ impl<S: Storage> EncryptedRepository<S> {
         let non_fast_forward = if ref_kind == git::InnerRefKind::Branch
             && let Some(old_object) = old_object
         {
-            if !git::object_exists(repo, old_object)? {
+            if !objects.exists(old_object)? {
                 return Err(PushRejection::FetchFirst(destination_ref.to_owned()).into());
             }
             !git::is_ancestor(repo, old_object, &next_object)?
@@ -649,7 +655,7 @@ impl<S: Storage> EncryptedRepository<S> {
     pub fn fetch_into(&self, repo: &GitRepository, remote_name: &str) -> Result<Manifest> {
         let manifest = self.import_packs(repo)?;
         for (reference, object) in &manifest.refs {
-            match git::validate_inner_ref(repo, reference)? {
+            match git::InnerRefKind::of(reference)? {
                 git::InnerRefKind::Branch => {
                     let short = reference.strip_prefix("refs/heads/").unwrap();
                     git::update_ref(repo, &format!("refs/remotes/{remote_name}/{short}"), object)?;
@@ -665,9 +671,7 @@ impl<S: Storage> EncryptedRepository<S> {
         let checkout = self.open_checkout(repo)?;
         let chain = self.pinned_chain(&floor)?;
         let current = chain.first().context("manifest chain is empty")?;
-        for reference in current.manifest.refs.keys() {
-            git::validate_inner_ref(repo, reference)?;
-        }
+        git::validate_inner_refs(&current.manifest.refs)?;
         floor.advance(ContinuityFloor::at(&current.id, &current.manifest))?;
         // Git skips the helper's fetch command when every advertised object is
         // already local, for example after a membership change, a deletion, or
@@ -692,9 +696,7 @@ impl<S: Storage> EncryptedRepository<S> {
         let checkout = self.open_checkout(repo)?;
         let chain = self.pinned_chain(&floor)?;
         let current = chain.first().context("manifest chain is empty")?;
-        for reference in current.manifest.refs.keys() {
-            git::validate_inner_ref(repo, reference)?;
-        }
+        git::validate_inner_refs(&current.manifest.refs)?;
         let progress = checkout.read()?;
         let mut imported: HashSet<String> = progress.packs.into_iter().collect();
         self.import_chain_packs(repo, &chain, progress.imported_generation, &mut imported)?;
@@ -1356,15 +1358,13 @@ impl<S: Storage> EncryptedRepository<S> {
                 importer.finish()?;
             }
         }
-        git::ensure_refs_connected_since(
-            &scratch,
-            &chain
-                .first()
-                .context("selected recovery chain is empty")?
-                .manifest
-                .refs,
-            &BTreeMap::new(),
-        )
+        let refs = &chain
+            .first()
+            .context("selected recovery chain is empty")?
+            .manifest
+            .refs;
+        git::validate_inner_refs(refs)?;
+        git::ensure_refs_connected_since(&scratch, refs, &BTreeMap::new())
     }
 
     fn ensure_object_available(&self, kind: ObjectKind, id: &str) -> Result<()> {
