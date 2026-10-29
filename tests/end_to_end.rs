@@ -445,7 +445,7 @@ fn returning_client_rejects_signed_ref_advance_without_its_pack() {
 }
 
 #[test]
-fn missing_verified_frontier_tip_fails_closed() {
+fn missing_verified_frontier_tip_forces_full_reverification() {
     let temporary = tempfile::tempdir().unwrap();
     let source = temporary.path().join("source");
     let destination = temporary.path().join("destination");
@@ -468,11 +468,12 @@ fn missing_verified_frontier_tip_fails_closed() {
     state["verified_refs"]["refs/heads/main"] = serde_json::Value::String("1".repeat(40));
     fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
 
-    let error = repository
-        .fetch_into(&destination, "e2ee")
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("verified ref refs/heads/main is missing locally"));
+    let manifest = repository.fetch_into(&destination, "e2ee").unwrap();
+    let state: serde_json::Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(
+        state["verified_refs"]["refs/heads/main"],
+        manifest.refs["refs/heads/main"].as_str()
+    );
 }
 
 #[test]

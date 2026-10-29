@@ -505,3 +505,88 @@ fn native_git_fetch_pins_branch_deletions_that_transfer_no_objects() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn native_git_fetch_reimports_packs_after_local_objects_are_pruned() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let destination = temporary.path().join("destination");
+    let remote_path = temporary.path().join("remote");
+    let key_path = temporary.path().join("repository.key.json");
+    initialize_git(&source);
+    initialize_git(&destination);
+    let key = KeyFile::generate();
+    key.write_new(&key_path).unwrap();
+    EncryptedRepository::new(FilesystemStorage::new(&remote_path), key)
+        .initialize("owner")
+        .unwrap();
+    configure_remote(&source, &remote_path, &key_path);
+    configure_remote(&destination, &remote_path, &key_path);
+
+    let helper_git = |repo: &Path, args: &[&str]| {
+        let helper = Path::new(env!("CARGO_BIN_EXE_git-remote-e2ee"));
+        let mut paths = vec![helper.parent().unwrap().to_path_buf()];
+        paths.extend(env::split_paths(&env::var_os("PATH").unwrap_or_default()));
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env("PATH", env::join_paths(paths).unwrap())
+            .env("GIT_REMOTE_E2EE_CACHE_DIR", temporary.path().join("cache"))
+            .env("XDG_STATE_HOME", temporary.path().join("state"))
+            .env("XDG_CONFIG_HOME", temporary.path().join("config"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    let mut heads = Vec::new();
+    for (branch, content) in [("main", "first"), ("feature", "second")] {
+        git(&source, &["checkout", "-q", "-B", branch], false);
+        fs::write(source.join("note.md"), format!("{content}\n")).unwrap();
+        git(&source, &["add", "note.md"], false);
+        git(&source, &["commit", "-q", "-m", content], false);
+        heads.push(git(&source, &["rev-parse", "HEAD"], false));
+        helper_git(&source, &["push", "-q", "private", branch]);
+    }
+
+    helper_git(&destination, &["fetch", "-q", "private"]);
+    git(
+        &destination,
+        &["update-ref", "-d", "refs/remotes/private/feature"],
+        false,
+    );
+    git(&destination, &["gc", "-q", "--prune=now"], false);
+    assert!(
+        !git_output(&destination, &["cat-file", "-e", &heads[1]], false)
+            .status
+            .success(),
+        "gc pruned the feature commit"
+    );
+
+    helper_git(&destination, &["fetch", "-q", "private"]);
+    assert_eq!(
+        git(
+            &destination,
+            &["rev-parse", "refs/remotes/private/feature"],
+            false
+        ),
+        heads[1]
+    );
+    git(
+        &destination,
+        &["fsck", "--connectivity-only", "--no-dangling"],
+        false,
+    );
+    assert_eq!(
+        git(
+            &destination,
+            &["show", "refs/remotes/private/feature:note.md"],
+            false
+        ),
+        "second"
+    );
+}
