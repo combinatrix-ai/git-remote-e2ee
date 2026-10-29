@@ -195,7 +195,7 @@ impl GitRepository {
     }
 }
 
-/// A `git` command that touches no repository (`init`, `check-ref-format`),
+/// A `git` command that touches no repository (`init`),
 /// under the policy for repositories this program owns.
 pub(crate) fn without_repository() -> Command {
     let mut command = Command::new("git");
