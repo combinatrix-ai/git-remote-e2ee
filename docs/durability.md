@@ -17,7 +17,10 @@ objects use the same flush rules:
    creation fails and the directories this call created are removed when
    possible. A failed create is unacknowledged.
 2. Write a temporary file and `File::sync_all` it. Return the error if that
-   fails.
+   fails. `continuity.json`, `HEAD`, `FORMAT`, `README.md`, and client JSON
+   state go through `persist::replace_file_durably`, which creates the
+   temporary exclusively in the destination directory and removes it on any
+   failure before the rename.
 3. Publish the name.
    - `continuity.json` and `HEAD` use `rename` in the destination directory and
      replace an existing file.

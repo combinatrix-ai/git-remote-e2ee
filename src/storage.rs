@@ -22,6 +22,12 @@ pub struct CasConflict {
     pub actual: Option<String>,
 }
 
+/// Storage holds content this tool did not write where a genesis head would
+/// go. Returned before anything is written.
+#[derive(Debug, Error)]
+#[error("{0}")]
+pub struct StorageOccupied(pub String);
+
 const MAX_BUFFERED_OBJECT_SIZE: u64 = 16 * 1024 * 1024;
 const MAX_STORAGE_HEAD_BYTES: u64 = 4096;
 
@@ -265,13 +271,14 @@ impl FilesystemStorage {
     fn write_genesis_files(&self) -> Result<()> {
         let readme = self.root.join("README.md");
         if !readme.exists() {
-            write_file_durable(
+            crate::persist::replace_file_durably(
                 &self.root,
                 "README.md",
                 storage_readme("This directory").as_bytes(),
             )?;
         }
-        write_file_durable(&self.root, "FORMAT", STORAGE_FORMAT)
+        crate::persist::replace_file_durably(&self.root, "FORMAT", STORAGE_FORMAT)?;
+        Ok(())
     }
 
     fn lock_file(&self) -> Result<File> {
@@ -413,7 +420,7 @@ impl Storage for FilesystemStorage {
             return Err(error);
         }
 
-        write_filesystem_head_locked(&self.root, next)?;
+        crate::persist::replace_file_durably(&self.root, "HEAD", format!("{next}\n").as_bytes())?;
         fs2::FileExt::unlock(&lock)?;
         Ok(())
     }
@@ -468,56 +475,10 @@ impl Storage for FilesystemStorage {
             return Err(error);
         }
 
-        write_filesystem_head_locked(&self.root, next)?;
+        crate::persist::replace_file_durably(&self.root, "HEAD", format!("{next}\n").as_bytes())?;
         fs2::FileExt::unlock(&lock)?;
         Ok(())
     }
-}
-
-fn write_filesystem_head_locked(root: &Path, next: &str) -> Result<()> {
-    let mut random = [0_u8; 8];
-    OsRng.fill_bytes(&mut random);
-    let temporary = root.join(format!(".HEAD-{}", hex::encode(random)));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)?;
-    let published = (|| -> std::io::Result<()> {
-        writeln!(file, "{next}")?;
-        file.sync_all()?;
-        crate::persist::durability_checkpoint(crate::persist::STAGE_AFTER_FILE_FLUSH);
-        fs::rename(&temporary, root.join("HEAD"))
-    })();
-    if let Err(error) = published {
-        let _ = fs::remove_file(&temporary);
-        return Err(error.into());
-    }
-    crate::persist::durability_checkpoint(crate::persist::STAGE_AFTER_NAME_PUBLISH);
-    crate::persist::sync_directory(root)
-        .with_context(|| format!("sync directory {}", root.display()))?;
-    Ok(())
-}
-
-fn write_file_durable(root: &Path, name: &str, bytes: &[u8]) -> Result<()> {
-    let mut random = [0_u8; 8];
-    OsRng.fill_bytes(&mut random);
-    let temporary = root.join(format!(".{name}-{}", hex::encode(random)));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)?;
-    let published = (|| -> std::io::Result<()> {
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        fs::rename(&temporary, root.join(name))
-    })();
-    if let Err(error) = published {
-        let _ = fs::remove_file(&temporary);
-        return Err(error.into());
-    }
-    crate::persist::sync_directory(root)
-        .with_context(|| format!("sync directory {}", root.display()))?;
-    Ok(())
 }
 
 /// Opening a FIFO for reading blocks until a writer appears, so the type is
@@ -1017,11 +978,12 @@ impl GitStorage {
     /// content (for example a hosting provider's initial README).
     fn refuse_foreign_branch(&self, base_commit: &Option<String>) -> Result<()> {
         if base_commit.is_some() {
-            bail!(
+            return Err(StorageOccupied(format!(
                 "branch {branch} of {remote} already exists; use an empty repository or choose another branch with e2ee::{remote}#<branch>",
                 branch = self.branch,
                 remote = self.remote,
-            )
+            ))
+            .into());
         }
         Ok(())
     }
@@ -1876,24 +1838,11 @@ impl CarrierCache {
         let generation = generation
             .to_str()
             .context("carrier cache generation name is not UTF-8")?;
-        let mut random = [0_u8; 8];
-        OsRng.fill_bytes(&mut random);
-        let temporary = self.remote_dir.join(format!(
-            ".current-{}-{}",
-            std::process::id(),
-            hex::encode(random)
-        ));
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)?;
-        writeln!(file, "{generation}")?;
-        file.sync_all()?;
-        let current = self.remote_dir.join("current");
-        if current.exists() {
-            fs::remove_file(&current)?;
-        }
-        fs::rename(&temporary, &current)?;
+        crate::persist::replace_file_durably(
+            &self.remote_dir,
+            "current",
+            format!("{generation}\n").as_bytes(),
+        )?;
         Ok(())
     }
 
@@ -2498,19 +2447,5 @@ mod tests {
     fn object_ids_must_be_lowercase_hex() {
         validate_id(&"ab".repeat(32)).unwrap();
         assert!(validate_id(&"AB".repeat(32)).is_err());
-    }
-
-    #[test]
-    fn failed_head_write_removes_its_temporary() {
-        let directory = tempfile::tempdir().unwrap();
-        fs::create_dir(directory.path().join("HEAD")).unwrap();
-        fs::write(directory.path().join("HEAD").join("occupant"), b"x").unwrap();
-        assert!(write_filesystem_head_locked(directory.path(), &object_id(b"next")).is_err());
-        let leftovers: Vec<_> = fs::read_dir(directory.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .filter(|name| name.to_string_lossy().starts_with(".HEAD-"))
-            .collect();
-        assert!(leftovers.is_empty(), "leftover temporaries: {leftovers:?}");
     }
 }

@@ -7,7 +7,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use git_remote_e2ee::continuity::default_state_dir;
 use git_remote_e2ee::crypto::{KeyFile, PublicDevice};
 use git_remote_e2ee::policy::{DeviceRoles, validate_device_label};
-use git_remote_e2ee::repository::{EncryptedRepository, RecoveryOptions, RecoveryReport};
+use git_remote_e2ee::repository::{
+    EncryptedRepository, InitializeError, RecoveryOptions, RecoveryReport,
+};
 use git_remote_e2ee::storage::{FilesystemStorage, GitStorage};
 use git_remote_e2ee::url::StorageUrl;
 
@@ -236,23 +238,28 @@ fn main() -> Result<()> {
                     path
                 }
             };
-            let initialized = (|| -> Result<Target> {
+            let attempt = (|| -> Result<(Target, Result<String, InitializeError>)> {
                 let target = Target {
                     storage,
                     key: std::path::absolute(key)?,
                 };
-                with_repository!(&target, |repository| {
-                    repository.initialize(&label)?;
-                });
-                Ok(target)
+                let outcome = with_repository!(&target, |repository| repository.initialize(&label));
+                Ok((target, outcome))
             })();
-            let target = match initialized {
-                Ok(target) => target,
-                Err(error) => {
+            let target = match attempt {
+                Ok((target, Ok(_))) => target,
+                Ok((_, Err(InitializeError::BeforePublication(error)))) | Err(error) => {
                     if let Some(path) = created_key {
                         let _ = std::fs::remove_file(path);
                     }
                     return Err(error);
+                }
+                Ok((target, Err(error))) => {
+                    return Err(anyhow::Error::new(error).context(format!(
+                        "kept key {}; it may be the only owner key for {}",
+                        target.key.display(),
+                        target.storage
+                    )));
                 }
             };
             println!("initialized {}", target.storage);

@@ -26,8 +26,12 @@
 //! prove that a particular disk honoured the flush, and it is not a substitute
 //! for a hard power cut. See `docs/durability.md`.
 
-use std::io;
-use std::path::Path;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+
+use rand::RngCore;
+use rand::rngs::OsRng;
 
 /// File contents have been flushed. The destination name has not been published.
 pub(crate) const STAGE_AFTER_FILE_FLUSH: &str = "after_file_flush";
@@ -37,6 +41,78 @@ pub(crate) const STAGE_AFTER_NAME_PUBLISH: &str = "after_name_publish";
 /// Emitted by the power-cut harness after that return, not by library paths.
 #[cfg(test)]
 pub(crate) const STAGE_AFTER_ACKNOWLEDGE: &str = "after_acknowledge";
+
+/// A failed [`replace_file_durably`]. The variant says whether the
+/// destination name may already hold the new bytes.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ReplaceError {
+    /// The destination is untouched and no temporary remains, unless removing
+    /// it failed too.
+    #[error("replace {}: not published", .destination.display())]
+    NotPublished {
+        destination: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    /// The rename returned, so the new bytes may be visible, but flushing the
+    /// directory failed. This is not success.
+    #[error("replace {}: published but the directory flush failed", .destination.display())]
+    Unacknowledged {
+        destination: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+}
+
+/// Replaces `directory/name` with `contents`: a uniquely named temporary in
+/// `directory` is created exclusively, written, flushed, renamed over the
+/// destination, and the directory is flushed. Any failure before the rename
+/// removes the temporary.
+pub(crate) fn replace_file_durably(
+    directory: &Path,
+    name: &str,
+    contents: &[u8],
+) -> Result<(), ReplaceError> {
+    let directory = if directory.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        directory
+    };
+    let destination = directory.join(name);
+    let not_published = |source| ReplaceError::NotPublished {
+        destination: destination.clone(),
+        source,
+    };
+    if name.is_empty() || Path::new(name).file_name() != Some(name.as_ref()) {
+        return Err(not_published(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "destination name must be one path component",
+        )));
+    }
+    let mut random = [0_u8; 8];
+    OsRng.fill_bytes(&mut random);
+    let temporary = directory.join(format!(".{name}.{}.tmp", hex::encode(random)));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(not_published)?;
+    let staged = (|| {
+        file.write_all(contents)?;
+        file.sync_all()?;
+        durability_checkpoint(STAGE_AFTER_FILE_FLUSH);
+        fs::rename(&temporary, &destination)
+    })();
+    if let Err(source) = staged {
+        let _ = fs::remove_file(&temporary);
+        return Err(not_published(source));
+    }
+    durability_checkpoint(STAGE_AFTER_NAME_PUBLISH);
+    sync_directory(directory).map_err(|source| ReplaceError::Unacknowledged {
+        destination: destination.clone(),
+        source,
+    })
+}
 
 pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
@@ -209,8 +285,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        STAGE_AFTER_ACKNOWLEDGE, STAGE_AFTER_FILE_FLUSH, STAGE_AFTER_NAME_PUBLISH,
-        create_dir_all_durable, set_durability_hook, sync_directory,
+        ReplaceError, STAGE_AFTER_ACKNOWLEDGE, STAGE_AFTER_FILE_FLUSH, STAGE_AFTER_NAME_PUBLISH,
+        create_dir_all_durable, replace_file_durably, set_durability_hook, sync_directory,
     };
     use crate::continuity::testing_write_floor;
     use crate::crypto::object_id;
@@ -536,6 +612,68 @@ mod tests {
             }
             other => panic!("unknown durability mode {other}"),
         }
+    }
+
+    fn entries(directory: &Path) -> Vec<String> {
+        let mut names: Vec<_> = fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn replace_publishes_new_bytes_and_leaves_no_temporary() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("state"), b"old").unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&seen);
+        let _guard = install_hook(move |stage| record.lock().unwrap().push(stage.to_owned()));
+        replace_file_durably(directory.path(), "state", b"new").unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![STAGE_AFTER_FILE_FLUSH, STAGE_AFTER_NAME_PUBLISH]
+        );
+        assert_eq!(fs::read(directory.path().join("state")).unwrap(), b"new");
+        assert_eq!(entries(directory.path()), vec!["state"]);
+    }
+
+    #[test]
+    fn failed_rename_removes_the_temporary_and_keeps_the_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let occupied = directory.path().join("HEAD");
+        fs::create_dir(&occupied).unwrap();
+        fs::write(occupied.join("occupant"), b"x").unwrap();
+        let error = replace_file_durably(directory.path(), "HEAD", b"next\n").unwrap_err();
+        assert!(
+            matches!(error, ReplaceError::NotPublished { .. }),
+            "{error:?}"
+        );
+        assert_eq!(entries(directory.path()), vec!["HEAD"]);
+        assert_eq!(entries(&occupied), vec!["occupant"]);
+    }
+
+    #[test]
+    fn replace_into_a_missing_directory_creates_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing");
+        let error = replace_file_durably(&missing, "state", b"new").unwrap_err();
+        assert!(
+            matches!(error, ReplaceError::NotPublished { .. }),
+            "{error:?}"
+        );
+        assert!(entries(directory.path()).is_empty());
+    }
+
+    #[test]
+    fn replace_rejects_a_name_with_a_separator() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("sub")).unwrap();
+        assert!(replace_file_durably(directory.path(), "sub/state", b"new").is_err());
+        assert!(replace_file_durably(directory.path(), "..", b"new").is_err());
+        assert_eq!(entries(directory.path()), vec!["sub"]);
+        assert!(entries(&directory.path().join("sub")).is_empty());
     }
 
     #[test]

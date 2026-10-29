@@ -2,13 +2,11 @@
 //! the atomic, locked JSON files that hold it and per-checkout progress.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
-use rand::RngCore;
-use rand::rngs::OsRng;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -141,25 +139,11 @@ pub(crate) fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
 }
 
 pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let mut random = [0_u8; 8];
-    OsRng.fill_bytes(&mut random);
-    let temporary = path.with_extension(format!("json.{}.tmp", hex::encode(random)));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)?;
-    file.write_all(&serde_json::to_vec_pretty(value)?)?;
-    file.sync_all()?;
-    crate::persist::durability_checkpoint(crate::persist::STAGE_AFTER_FILE_FLUSH);
-    fs::rename(&temporary, path)?;
-    crate::persist::durability_checkpoint(crate::persist::STAGE_AFTER_NAME_PUBLISH);
-    let parent = match path.parent() {
-        Some(parent) if parent.as_os_str().is_empty() => Path::new("."),
-        Some(parent) => parent,
-        None => bail!("state path has no parent"),
+    let (Some(directory), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
+    else {
+        bail!("state path {} has no parent or file name", path.display())
     };
-    crate::persist::sync_directory(parent)
-        .with_context(|| format!("sync directory {}", parent.display()))?;
+    crate::persist::replace_file_durably(directory, name, &serde_json::to_vec_pretty(value)?)?;
     Ok(())
 }
 
