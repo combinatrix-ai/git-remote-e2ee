@@ -1,3 +1,5 @@
+mod support;
+
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
@@ -13,7 +15,7 @@ use git_remote_e2ee::manifest::{
     unwrap_generation_key, wrap_predecessor_key,
 };
 use git_remote_e2ee::policy::{DeviceRoles, PolicyState};
-use git_remote_e2ee::repository::{EncryptedRepository, RecoveryClass, RecoveryOptions};
+use git_remote_e2ee::repository::{EncryptedRepository, RecoveryClass, RecoveryOptions, RefChange};
 use git_remote_e2ee::storage::{CasConflict, GitStorage, ObjectKind, Storage};
 
 static CACHE_ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -98,6 +100,7 @@ fn init_carrier(root: &Path, carrier: &Path, key: &KeyFile) {
     EncryptedRepository::new(
         GitStorage::open(carrier.to_str().unwrap()).unwrap(),
         key.clone(),
+        support::state_dir(),
     )
     .initialize("owner")
     .unwrap();
@@ -208,16 +211,9 @@ fn add_helper_to_path(command: &mut Command) {
     let helper = Path::new(env!("CARGO_BIN_EXE_git-remote-e2ee"));
     let mut paths = vec![helper.parent().unwrap().to_path_buf()];
     paths.extend(env::split_paths(&env::var_os("PATH").unwrap_or_default()));
-    command.env("PATH", env::join_paths(paths).unwrap());
-}
-
-fn state_dir(repo: &Path) -> std::path::PathBuf {
-    let entries: Vec<_> = fs::read_dir(repo.join(".git/git-remote-e2ee"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .collect();
-    assert_eq!(entries.len(), 1, "{entries:?}");
-    entries.into_iter().next().unwrap()
+    command
+        .env("PATH", env::join_paths(paths).unwrap())
+        .env("XDG_STATE_HOME", support::state_home());
 }
 
 #[test]
@@ -382,10 +378,13 @@ fn carrier_git_supports_tags_and_ref_deletion() {
         .status
         .success()
     );
-    let manifest =
-        EncryptedRepository::new(GitStorage::open(carrier.to_str().unwrap()).unwrap(), key)
-            .verify()
-            .unwrap();
+    let manifest = EncryptedRepository::new(
+        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        key,
+        support::state_dir(),
+    )
+    .verify()
+    .unwrap();
     assert!(!manifest.refs.contains_key("refs/heads/doomed"));
     assert!(!manifest.refs.contains_key("refs/tags/v-carrier"));
 }
@@ -404,25 +403,42 @@ fn carrier_git_allows_exactly_one_concurrent_writer() {
     init_carrier(temporary.path(), &carrier, &key);
 
     // Open both carrier checkouts before either push. They therefore race from
-    // the same outer commit and exercise receive-pack's ref lock/FF check.
+    // the same outer commit and exercise receive-pack's ref lock/FF check. Each
+    // writer is its own machine; one machine serializes on its floor lock.
     let repository_a = EncryptedRepository::new(
         GitStorage::open(carrier.to_str().unwrap()).unwrap(),
         key.clone(),
+        temporary.path().join("machine-a"),
     );
     let repository_b = EncryptedRepository::new(
         GitStorage::open(carrier.to_str().unwrap()).unwrap(),
         key.clone(),
+        temporary.path().join("machine-b"),
     );
     let barrier = Arc::new(Barrier::new(2));
     let barrier_a = barrier.clone();
     let first = thread::spawn(move || {
         barrier_a.wait();
-        repository_a.push_update(&source_a, "refs/heads/main", "refs/heads/writer-a", false)
+        repository_a.push(
+            &source_a,
+            "refs/heads/writer-a",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
     });
     let barrier_b = barrier.clone();
     let second = thread::spawn(move || {
         barrier_b.wait();
-        repository_b.push_update(&source_b, "refs/heads/main", "refs/heads/writer-b", false)
+        repository_b.push(
+            &source_b,
+            "refs/heads/writer-b",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
     });
 
     let results = [first.join().unwrap(), second.join().unwrap()];
@@ -436,7 +452,11 @@ fn carrier_git_allows_exactly_one_concurrent_writer() {
         "unexpected losing error: {loser:#}"
     );
 
-    let fresh = EncryptedRepository::new(GitStorage::open(carrier.to_str().unwrap()).unwrap(), key);
+    let fresh = EncryptedRepository::new(
+        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        key,
+        support::state_dir(),
+    );
     let manifest = fresh.verify().unwrap();
     assert_eq!(manifest.generation, 1);
     assert_eq!(manifest.refs.len(), 1);
@@ -809,8 +829,16 @@ fn carrier_git_detects_tampered_ciphertext_chunk() {
     EncryptedRepository::new(
         GitStorage::open(carrier.to_str().unwrap()).unwrap(),
         key.clone(),
+        support::state_dir(),
     )
-    .push_ref(&source, "refs/heads/main", false)
+    .push(
+        &source,
+        "refs/heads/main",
+        RefChange::Update {
+            source: "refs/heads/main",
+            force: false,
+        },
+    )
     .unwrap();
 
     git(
@@ -840,7 +868,11 @@ fn carrier_git_detects_tampered_ciphertext_chunk() {
     git(&attacker, &["commit", "-q", "-m", "tamper chunk"], false);
     git(&attacker, &["push", "-q", "origin", "main"], false);
 
-    let fresh = EncryptedRepository::new(GitStorage::open(carrier.to_str().unwrap()).unwrap(), key);
+    let fresh = EncryptedRepository::new(
+        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        key,
+        support::state_dir(),
+    );
     let error = fresh.verify().unwrap_err();
     assert!(
         error.to_string().contains("invalid pack stream magic"),
@@ -863,7 +895,6 @@ fn carrier_recovery_chooses_legitimate_descendant_and_restores_deleted_ciphertex
 
     let owner = KeyFile::generate();
     let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
-    let admin_pin = temporary.path().join("owner.admin-state.json");
     git(
         temporary.path(),
         &["init", "--bare", "-q", carrier.to_str().unwrap()],
@@ -872,15 +903,14 @@ fn carrier_recovery_chooses_legitimate_descendant_and_restores_deleted_ciphertex
     let repository = EncryptedRepository::new(
         GitStorage::open(carrier.to_str().unwrap()).unwrap(),
         owner.clone(),
+        support::state_dir(),
     );
     repository.initialize("owner").unwrap();
-    repository.pin_admin_state(&admin_pin).unwrap();
     let (reader_policy_manifest, _) = repository
         .add_device(
             reader.public_device().unwrap(),
             "device-1",
             DeviceRoles::reader(),
-            &admin_pin,
         )
         .unwrap();
     let policy_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
@@ -900,20 +930,40 @@ fn carrier_recovery_chooses_legitimate_descendant_and_restores_deleted_ciphertex
     .unwrap();
     let pushed_object = git(&source, &["rev-parse", "HEAD"], false);
     repository
-        .push_ref(&source, "refs/heads/main", false)
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap();
     let (floor_id, floor_manifest) = repository.current_manifest().unwrap();
     let pack_id = floor_manifest.new_packs[0].id.clone();
-    repository.fetch_into(&returning, "private").unwrap();
+    // The returning client is another machine; the writer's floor is not its floor.
+    let returning_machine = temporary.path().join("returning-machine");
+    EncryptedRepository::new(
+        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        owner.clone(),
+        &returning_machine,
+    )
+    .fetch_into(&returning, "private")
+    .unwrap();
     let floor_generation: u64 = serde_json::from_slice::<serde_json::Value>(
-        &fs::read(state_dir(&returning).join("state.json")).unwrap(),
+        &fs::read(
+            returning_machine
+                .join(&owner.repository_root)
+                .join("continuity.json"),
+        )
+        .unwrap(),
     )
     .unwrap()["generation"]
         .as_u64()
         .unwrap();
     assert_eq!(floor_manifest.generation, floor_generation);
     repository
-        .revoke_device(&reader.device_id().unwrap(), &admin_pin)
+        .revoke_device(&reader.device_id().unwrap())
         .unwrap();
     let (legitimate_id, legitimate) = repository.current_manifest().unwrap();
     assert_eq!(legitimate.refs["refs/heads/main"], pushed_object);
@@ -954,7 +1004,7 @@ fn carrier_recovery_chooses_legitimate_descendant_and_restores_deleted_ciphertex
         .unwrap();
 
     let recovery_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
-    let recoverer = EncryptedRepository::new(recovery_storage, owner.clone());
+    let recoverer = EncryptedRepository::new(recovery_storage, owner.clone(), &returning_machine);
     let report = recoverer
         .recover(
             &returning,
@@ -1067,19 +1117,17 @@ fn carrier_recovery_offers_hidden_legitimate_content_descendant() {
 
     let owner = KeyFile::generate();
     let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
-    let admin_pin = temporary.path().join("owner.admin-state.json");
     let repository = EncryptedRepository::new(
         GitStorage::open(carrier.to_str().unwrap()).unwrap(),
         owner.clone(),
+        support::state_dir(),
     );
     repository.initialize("owner").unwrap();
-    repository.pin_admin_state(&admin_pin).unwrap();
     let (floor_id, _) = repository
         .add_device(
             reader.public_device().unwrap(),
             "device-2",
             DeviceRoles::reader(),
-            &admin_pin,
         )
         .unwrap();
     let floor_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
@@ -1097,11 +1145,26 @@ fn carrier_recovery_offers_hidden_legitimate_content_descendant() {
             .unwrap(),
     )
     .unwrap();
-    repository.fetch_into(&returning, "private").unwrap();
+    // The returning client is another machine; the writer's floor is not its floor.
+    let returning_machine = temporary.path().join("returning-machine");
+    EncryptedRepository::new(
+        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        owner.clone(),
+        &returning_machine,
+    )
+    .fetch_into(&returning, "private")
+    .unwrap();
 
     let pushed_object = git(&source, &["rev-parse", "HEAD"], false);
     repository
-        .push_ref(&source, "refs/heads/main", false)
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap();
     let (legitimate_id, legitimate) = repository.current_manifest().unwrap();
     assert_eq!(legitimate.refs["refs/heads/main"], pushed_object);
@@ -1136,8 +1199,11 @@ fn carrier_recovery_offers_hidden_legitimate_content_descendant() {
         .compare_and_swap_head(Some(&floor_id), &junk_id)
         .unwrap();
 
-    let recoverer =
-        EncryptedRepository::new(GitStorage::open(carrier.to_str().unwrap()).unwrap(), owner);
+    let recoverer = EncryptedRepository::new(
+        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        owner,
+        &returning_machine,
+    );
     let report = recoverer
         .recover(
             &returning,
@@ -1220,19 +1286,17 @@ fn carrier_recovery_refuses_history_with_a_merge_hiding_a_legitimate_state() {
 
     let owner = KeyFile::generate();
     let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
-    let admin_pin = temporary.path().join("owner.admin-state.json");
     let repository = EncryptedRepository::new(
         GitStorage::open(carrier.to_str().unwrap()).unwrap(),
         owner.clone(),
+        support::state_dir(),
     );
     repository.initialize("owner").unwrap();
-    repository.pin_admin_state(&admin_pin).unwrap();
     let (floor_id, _) = repository
         .add_device(
             reader.public_device().unwrap(),
             "device-3",
             DeviceRoles::reader(),
-            &admin_pin,
         )
         .unwrap();
     let floor_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
@@ -1252,7 +1316,14 @@ fn carrier_recovery_refuses_history_with_a_merge_hiding_a_legitimate_state() {
     .unwrap();
     repository.fetch_into(&returning, "private").unwrap();
     repository
-        .push_ref(&source, "refs/heads/main", false)
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap();
 
     // Put a replay of the floor on the first-parent path and the legitimate
@@ -1299,8 +1370,11 @@ fn carrier_recovery_refuses_history_with_a_merge_hiding_a_legitimate_state() {
         .compare_and_swap_head(Some(&floor_id), &junk_id)
         .unwrap();
 
-    let recoverer =
-        EncryptedRepository::new(GitStorage::open(carrier.to_str().unwrap()).unwrap(), owner);
+    let recoverer = EncryptedRepository::new(
+        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        owner,
+        support::state_dir(),
+    );
     let error = recoverer
         .recover(
             &returning,
@@ -1335,19 +1409,17 @@ fn carrier_recovery_refuses_conflicting_authenticated_descendants() {
 
     let owner = KeyFile::generate();
     let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
-    let admin_pin = temporary.path().join("owner.admin-state.json");
     let repository = EncryptedRepository::new(
         GitStorage::open(carrier.to_str().unwrap()).unwrap(),
         owner.clone(),
+        support::state_dir(),
     );
     repository.initialize("owner").unwrap();
-    repository.pin_admin_state(&admin_pin).unwrap();
     let (floor_id, _) = repository
         .add_device(
             reader.public_device().unwrap(),
             "device-4",
             DeviceRoles::reader(),
-            &admin_pin,
         )
         .unwrap();
     repository.fetch_into(&returning, "private").unwrap();
@@ -1397,7 +1469,7 @@ fn carrier_recovery_refuses_conflicting_authenticated_descendants() {
         .unwrap();
 
     let recovery_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
-    let report = EncryptedRepository::new(recovery_storage, owner)
+    let report = EncryptedRepository::new(recovery_storage, owner, support::state_dir())
         .recover(
             &returning,
             RecoveryOptions {
@@ -1451,19 +1523,17 @@ fn carrier_recovery_loses_cas_without_retrying_when_another_writer_publishes() {
 
     let owner = KeyFile::generate();
     let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
-    let admin_pin = temporary.path().join("owner.admin-state.json");
     let repository = EncryptedRepository::new(
         GitStorage::open(carrier.to_str().unwrap()).unwrap(),
         owner.clone(),
+        support::state_dir(),
     );
     repository.initialize("owner").unwrap();
-    repository.pin_admin_state(&admin_pin).unwrap();
     let (floor_id, _) = repository
         .add_device(
             reader.public_device().unwrap(),
             "device-5",
             DeviceRoles::reader(),
-            &admin_pin,
         )
         .unwrap();
     repository.fetch_into(&returning, "private").unwrap();
@@ -1489,7 +1559,8 @@ fn carrier_recovery_loses_cas_without_retrying_when_another_writer_publishes() {
         .compare_and_swap_head(Some(&floor_id), &junk)
         .unwrap();
     let stale_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
-    let stale_recoverer = EncryptedRepository::new(stale_storage, owner.clone());
+    let stale_recoverer =
+        EncryptedRepository::new(stale_storage, owner.clone(), support::state_dir());
     let offered = stale_recoverer
         .recover(
             &returning,
@@ -1528,8 +1599,11 @@ fn carrier_recovery_loses_cas_without_retrying_when_another_writer_publishes() {
         )
         .unwrap_err();
     assert!(error.to_string().contains("concurrently"));
-    let latest =
-        EncryptedRepository::new(GitStorage::open(carrier.to_str().unwrap()).unwrap(), owner);
+    let latest = EncryptedRepository::new(
+        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        owner,
+        support::state_dir(),
+    );
     assert_eq!(latest.current_manifest().unwrap().0, winner);
 }
 
@@ -1543,11 +1617,11 @@ fn carrier_refs(carrier: &Path) -> String {
 
 fn helper_command(cwd: &Path, home: &Path) -> Command {
     let mut command = Command::new("git");
+    add_helper_to_path(&mut command);
     command
         .current_dir(cwd)
         .env("XDG_STATE_HOME", home.join("state"))
         .env("XDG_CONFIG_HOME", home.join("config"));
-    add_helper_to_path(&mut command);
     command
 }
 
@@ -1674,6 +1748,7 @@ fn carrier_format_mismatch_names_the_found_format() {
         let repository = EncryptedRepository::new(
             GitStorage::open(carrier.to_str().unwrap()).unwrap(),
             key.clone(),
+            support::state_dir(),
         );
         format!("{:#}", repository.current_manifest().unwrap_err())
     };
@@ -1717,9 +1792,13 @@ fn carrier_branch_fragment_selects_the_branch_through_the_helper() {
         false,
     );
     let location = format!("{}#vault", carrier.display());
-    EncryptedRepository::new(GitStorage::open(&location).unwrap(), key.clone())
-        .initialize("owner")
-        .unwrap();
+    EncryptedRepository::new(
+        GitStorage::open(&location).unwrap(),
+        key.clone(),
+        support::state_dir(),
+    )
+    .initialize("owner")
+    .unwrap();
 
     let url = format!("e2ee::{location}");
     push_through_helper(&source, &url, &key_path, temporary.path());
@@ -1773,6 +1852,7 @@ fn carrier_init_refuses_an_existing_branch_and_another_branch_works() {
     let refused = EncryptedRepository::new(
         GitStorage::open(carrier.to_str().unwrap()).unwrap(),
         key.clone(),
+        support::state_dir(),
     )
     .initialize("owner")
     .unwrap_err();
@@ -1786,7 +1866,11 @@ fn carrier_init_refuses_an_existing_branch_and_another_branch_works() {
     assert_eq!(carrier_refs(&carrier), refs_before);
 
     let location = format!("{}#vault", carrier.display());
-    let encrypted = EncryptedRepository::new(GitStorage::open(&location).unwrap(), key);
+    let encrypted = EncryptedRepository::new(
+        GitStorage::open(&location).unwrap(),
+        key,
+        support::state_dir(),
+    );
     let caches = fs::read_dir(temporary.path().join("carrier-cache"))
         .unwrap()
         .filter(|entry| entry.as_ref().unwrap().path().is_dir())
@@ -1989,10 +2073,13 @@ fn failed_ref_in_a_helper_push_batch_is_not_published_by_the_next_ref() {
     assert!(status(failed).starts_with('!'), "{stdout}");
     assert!(!status(published).starts_with('!'), "{stdout}");
 
-    let manifest =
-        EncryptedRepository::new(GitStorage::open(carrier.to_str().unwrap()).unwrap(), key)
-            .verify()
-            .unwrap();
+    let manifest = EncryptedRepository::new(
+        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        key,
+        support::state_dir(),
+    )
+    .verify()
+    .unwrap();
     let names: Vec<_> = manifest.refs.keys().map(String::as_str).collect();
     assert!(names.contains(&published), "{names:?}");
     assert!(
@@ -2025,9 +2112,17 @@ fn carrier_recovery_classifies_missing_head_manifest_as_unavailable() {
     let repository = EncryptedRepository::new(
         GitStorage::open(carrier.to_str().unwrap()).unwrap(),
         owner.clone(),
+        support::state_dir(),
     );
     repository
-        .push_ref(&source, "refs/heads/main", false)
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap();
     repository.fetch_into(&returning, "private").unwrap();
 
@@ -2036,9 +2131,17 @@ fn carrier_recovery_classifies_missing_head_manifest_as_unavailable() {
     let repository = EncryptedRepository::new(
         GitStorage::open(carrier.to_str().unwrap()).unwrap(),
         owner.clone(),
+        support::state_dir(),
     );
     repository
-        .push_ref(&source, "refs/heads/main", false)
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap();
     let (head_id, _) = repository.current_manifest().unwrap();
 
@@ -2055,6 +2158,7 @@ fn carrier_recovery_classifies_missing_head_manifest_as_unavailable() {
         EncryptedRepository::new(
             GitStorage::open(carrier.to_str().unwrap()).unwrap(),
             owner.clone(),
+            support::state_dir(),
         )
         .recover(
             &returning,
@@ -2098,9 +2202,17 @@ fn carrier_recovery_refuses_to_skip_a_historical_head_with_missing_objects() {
     let repository = EncryptedRepository::new(
         GitStorage::open(carrier.to_str().unwrap()).unwrap(),
         owner.clone(),
+        support::state_dir(),
     );
     repository
-        .push_ref(&source, "refs/heads/main", false)
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap();
     repository.fetch_into(&returning, "private").unwrap();
     let (floor_id, floor) = repository.current_manifest().unwrap();
@@ -2138,6 +2250,7 @@ fn carrier_recovery_refuses_to_skip_a_historical_head_with_missing_objects() {
     let report = EncryptedRepository::new(
         GitStorage::open(carrier.to_str().unwrap()).unwrap(),
         owner.clone(),
+        support::state_dir(),
     )
     .recover(
         &returning,
@@ -2175,9 +2288,17 @@ fn carrier_history_reads_skip_corrupt_copies_for_an_older_valid_one() {
     let repository = EncryptedRepository::new(
         GitStorage::open(carrier.to_str().unwrap()).unwrap(),
         owner.clone(),
+        support::state_dir(),
     );
     repository
-        .push_ref(&source, "refs/heads/main", false)
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap();
     let (head_id, head) = repository.current_manifest().unwrap();
     let pack_id = head.new_packs[0].id.clone();
@@ -2244,30 +2365,29 @@ fn recover_junk_head_after_later_writer_push(recover_as_owner: bool) {
 
     let owner = KeyFile::generate();
     let writer = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
-    let admin_pin = temporary.path().join("owner.admin-state.json");
     init_carrier(temporary.path(), &carrier, &owner);
     let open = |key: &KeyFile| {
         EncryptedRepository::new(
             GitStorage::open(carrier.to_str().unwrap()).unwrap(),
             key.clone(),
+            support::state_dir(),
         )
     };
-    open(&owner).pin_admin_state(&admin_pin).unwrap();
     open(&owner)
         .add_device(
             writer.public_device().unwrap(),
             "writer",
             DeviceRoles::collaborator(),
-            &admin_pin,
         )
         .unwrap();
     open(&writer)
-        .push_update_for_remote(
+        .push(
             &writer_checkout,
-            "origin",
             "refs/heads/main",
-            "refs/heads/main",
-            false,
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
         )
         .unwrap();
     open(&owner).fetch_into(&owner_checkout, "origin").unwrap();

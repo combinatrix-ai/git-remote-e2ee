@@ -212,8 +212,8 @@ mod tests {
         STAGE_AFTER_ACKNOWLEDGE, STAGE_AFTER_FILE_FLUSH, STAGE_AFTER_NAME_PUBLISH,
         create_dir_all_durable, set_durability_hook, sync_directory,
     };
+    use crate::continuity::testing_write_floor;
     use crate::crypto::object_id;
-    use crate::repository::testing_write_client_state;
     use crate::storage::{FilesystemStorage, ObjectKind, Storage};
 
     const CLIENT_V1: &[u8] = b"e2ee-durability-client-v1";
@@ -273,7 +273,9 @@ mod tests {
     }
 
     fn client_path(fixture: &Path) -> PathBuf {
-        op_dir(fixture, "client_state").join("state.json")
+        op_dir(fixture, "client_state")
+            .join(ROOT_LABEL)
+            .join("continuity.json")
     }
 
     fn object_file(root: &Path, id: &str) -> PathBuf {
@@ -305,11 +307,7 @@ mod tests {
             .get("generation")
             .and_then(|item| item.as_u64())
             .ok_or("client state is missing generation")?;
-        let imported = value
-            .get("imported_generation")
-            .and_then(|item| item.as_u64())
-            .ok_or("client state is missing imported_generation")?;
-        if imported != generation || root != ROOT_LABEL {
+        if root != ROOT_LABEL {
             return Err("client state fields are not a complete baseline or successor".into());
         }
         let (v1, v2) = client_ids();
@@ -380,7 +378,7 @@ mod tests {
                 let dir = op_dir(fixture, op);
                 reset_dir(&dir);
                 let (v1, _) = client_ids();
-                testing_write_client_state(&dir.join("state.json"), &v1, 1).unwrap();
+                testing_write_floor(&dir, ROOT_LABEL, &v1, 1).unwrap();
             }
             "head" => {
                 let dir = op_dir(fixture, op);
@@ -418,7 +416,7 @@ mod tests {
         match op {
             "client_state" => {
                 let (_, v2) = client_ids();
-                testing_write_client_state(&client_path(fixture), &v2, 2).unwrap();
+                testing_write_floor(&op_dir(fixture, op), ROOT_LABEL, &v2, 2).unwrap();
             }
             "head" => {
                 let (v1, v2) = head_ids();
@@ -617,8 +615,9 @@ mod tests {
         let path = client_path(fixture.path());
         let second = object_id(b"e2ee-durability-client-v2");
         let third = object_id(b"e2ee-durability-client-v3");
-        testing_write_client_state(&path, &second, 2).unwrap();
-        testing_write_client_state(&path, &third, 3).unwrap();
+        let state_dir = op_dir(fixture.path(), "client_state");
+        testing_write_floor(&state_dir, ROOT_LABEL, &second, 2).unwrap();
+        testing_write_floor(&state_dir, ROOT_LABEL, &third, 3).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(value["head_id"], third);
         assert_eq!(value["generation"], 3);

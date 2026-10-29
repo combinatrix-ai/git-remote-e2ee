@@ -9,8 +9,7 @@ Compares a local bare Git remote with the git-remote-e2ee filesystem backend.
 The source repository is cloned into an isolated temporary directory and is
 never modified. Set BENCH_TOTAL_READERS to an integer of at least 2 to exercise
 recipient scaling (default: 2). Set BENCH_KEEP_WORK=1 to retain the temporary
-directory. Set BENCH_E2EE_PUSH_MODE=native to measure pushes through the Git
-remote helper instead of the direct diagnostic CLI (default: direct).
+directory. e2ee pushes and fetches run through the Git remote helper.
 EOF
 }
 
@@ -21,13 +20,8 @@ fi
 
 source_repo=$1
 total_readers=${BENCH_TOTAL_READERS:-2}
-e2ee_push_mode=${BENCH_E2EE_PUSH_MODE:-direct}
 if [[ ! $total_readers =~ ^[0-9]+$ ]] || (( total_readers < 2 )); then
   echo "BENCH_TOTAL_READERS must be an integer of at least 2" >&2
-  exit 2
-fi
-if [[ $e2ee_push_mode != direct && $e2ee_push_mode != native ]]; then
-  echo "BENCH_E2EE_PUSH_MODE must be direct or native" >&2
   exit 2
 fi
 project_root=$(cd "$(dirname "$0")/.." && pwd -P)
@@ -65,10 +59,11 @@ if [[ ${BENCH_SKIP_BUILD:-0} != 1 ]]; then
   cargo build --release --bins --manifest-path "$project_root/Cargo.toml"
 fi
 git_e2ee="$project_root/target/release/git-e2ee"
-[[ -x $git_e2ee ]] || {
-  echo "release binary not found: $git_e2ee" >&2
+[[ -x $git_e2ee && -x $project_root/target/release/git-remote-e2ee ]] || {
+  echo "release binaries not found under $project_root/target/release" >&2
   exit 1
 }
+export PATH="$project_root/target/release:$PATH"
 
 work_parent=${TMPDIR:-/tmp}
 work=$(mktemp -d "$work_parent/git-remote-e2ee-compare.XXXXXX")
@@ -258,19 +253,13 @@ git -C "$work/e2ee-new-client" config maintenance.auto false
 "$git_e2ee" keygen --output "$work/repository.key.json" >/dev/null
 (cd "$work" && "$git_e2ee" init "e2ee::dir:$work/e2ee-storage" \
   --key "$work/repository.key.json" >/dev/null)
-if [[ $e2ee_push_mode == native ]]; then
-  git -C "$work/source" remote add private "e2ee::dir:$work/e2ee-storage"
-  git -C "$work/source" config remote.private.e2ee-key "$work/repository.key.json"
-  e2ee_push_command=(
-    env "PATH=$project_root/target/release:$PATH"
-    git -C "$work/source" push --quiet private "$source_ref:$source_ref"
-  )
-else
-  e2ee_push_command=(
-    "$git_e2ee" push --storage "$work/e2ee-storage"
-    --key "$work/repository.key.json" --repo "$work/source" --ref "$source_ref"
-  )
-fi
+git -C "$work/source" remote add private "e2ee::dir:$work/e2ee-storage"
+git -C "$work/source" config remote.private.e2ee-key "$work/repository.key.json"
+e2ee_push_command=(git -C "$work/source" push --quiet private "$source_ref:$source_ref")
+for client in e2ee-client e2ee-new-client; do
+  git -C "$work/$client" remote add benchmark "e2ee::dir:$work/e2ee-storage"
+done
+git -C "$work/e2ee-client" config remote.benchmark.e2ee-key "$work/repository.key.json"
 
 run_phase initial git push "$work/raw.git" "$work/source" \
   git -C "$work/source" push --quiet "$work/raw.git" "$source_ref:$source_ref"
@@ -280,9 +269,7 @@ run_phase initial git fetch "$work/raw.git" "$work/raw-client" \
   git -C "$work/raw-client" fetch --quiet "$work/raw.git" \
     "$source_ref:refs/remotes/benchmark/$source_branch"
 run_phase initial e2ee fetch "$work/e2ee-storage" "$work/e2ee-client" \
-  "$git_e2ee" fetch --storage "$work/e2ee-storage" \
-    --key "$work/repository.key.json" --repo "$work/e2ee-client" \
-    --remote-name benchmark
+  git -C "$work/e2ee-client" fetch --quiet benchmark
 
 repository_root=$(sed -n 's/^[[:space:]]*"repository_root": "\([^"]*\)",$/\1/p' \
   "$work/repository.key.json")
@@ -314,11 +301,10 @@ if (( total_readers > 2 )); then
 fi
 object_snapshot "$work/e2ee-storage" >"$work/packs-after-device-add.sha256"
 cmp "$work/packs-before-device-add.sha256" "$work/packs-after-device-add.sha256"
+git -C "$work/e2ee-new-client" config remote.benchmark.e2ee-key "$active_reader_key"
 run_phase add_user e2ee fetch-new-user "$work/e2ee-storage" \
   "$work/e2ee-new-client" \
-  "$git_e2ee" fetch --storage "$work/e2ee-storage" \
-    --key "$active_reader_key" --repo "$work/e2ee-new-client" \
-    --remote-name benchmark
+  git -C "$work/e2ee-new-client" fetch --quiet benchmark
 initial_head=$(git -C "$work/source" rev-parse "$source_ref")
 new_user_head=$(git -C "$work/e2ee-new-client" \
   rev-parse "refs/remotes/benchmark/$source_branch")
@@ -334,9 +320,7 @@ for scenario in tiny_change add_10mib modify_10mib_one_byte add_1000_small; do
     git -C "$work/raw-client" fetch --quiet "$work/raw.git" \
       "$source_ref:refs/remotes/benchmark/$source_branch"
   run_phase "$scenario" e2ee fetch "$work/e2ee-storage" "$work/e2ee-new-client" \
-    "$git_e2ee" fetch --storage "$work/e2ee-storage" \
-      --key "$active_reader_key" --repo "$work/e2ee-new-client" \
-      --remote-name benchmark
+    git -C "$work/e2ee-new-client" fetch --quiet benchmark
 done
 
 expected=$(git -C "$work/source" rev-parse "$source_ref")
@@ -347,7 +331,7 @@ e2ee_received=$(git -C "$work/e2ee-new-client" \
 [[ $e2ee_received == "$expected" ]]
 git -C "$work/raw-client" fsck --full --no-dangling >/dev/null
 git -C "$work/e2ee-new-client" fsck --full --no-dangling >/dev/null
-"$git_e2ee" verify --storage "$work/e2ee-storage" \
+"$git_e2ee" verify "e2ee::dir:$work/e2ee-storage" \
   --key "$work/repository.key.json" >/dev/null
 
 source_commits=$(git -C "$source_repo" rev-list --count HEAD)
@@ -368,7 +352,6 @@ cat >"$results_dir/summary.json" <<JSON
   "architecture": "$(uname -m)",
   "crate_commit": "$crate_sha",
   "crate_dirty": $crate_dirty,
-  "e2ee_push_mode": "$e2ee_push_mode",
   "source_head": "$source_head",
   "source_commits": $source_commits,
   "source_files": $source_files,

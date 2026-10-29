@@ -65,10 +65,8 @@ fn run_metadata_scenario<S: Storage>(
     scratch: &Path,
 ) {
     let owner = KeyFile::generate();
-    let pin = scratch.join("owner.admin-state.json");
-    let repository = EncryptedRepository::new(make_storage(), owner.clone());
+    let repository = EncryptedRepository::new(make_storage(), owner.clone(), scratch.join("state"));
     repository.initialize("owner").unwrap();
-    repository.pin_admin_state(&pin).unwrap();
     let mut devices = vec![owner.public_device().unwrap()];
     assert_eq!(
         stored_header(make_storage()).generation_key_envelopes.len(),
@@ -86,7 +84,6 @@ fn run_metadata_scenario<S: Storage>(
                 reader.public_device().unwrap(),
                 &format!("phone-{index}"),
                 DeviceRoles::collaborator(),
-                &pin,
             )
             .unwrap();
         devices.push(reader.public_device().unwrap());
@@ -100,7 +97,7 @@ fn run_metadata_scenario<S: Storage>(
     }
 
     repository
-        .revoke_device(&readers[0].device_id().unwrap(), &pin)
+        .revoke_device(&readers[0].device_id().unwrap())
         .unwrap();
     assert_eq!(
         stored_header(make_storage()).generation_key_envelopes.len(),

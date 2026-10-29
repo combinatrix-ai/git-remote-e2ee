@@ -1,3 +1,5 @@
+mod support;
+
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -6,7 +8,7 @@ use std::process::{Command, Output, Stdio};
 
 use git_remote_e2ee::crypto::KeyFile;
 use git_remote_e2ee::policy::DeviceRoles;
-use git_remote_e2ee::repository::EncryptedRepository;
+use git_remote_e2ee::repository::{EncryptedRepository, RefChange};
 use git_remote_e2ee::storage::FilesystemStorage;
 
 fn git_output(repo: &Path, args: &[&str], with_helper: bool) -> Output {
@@ -16,7 +18,9 @@ fn git_output(repo: &Path, args: &[&str], with_helper: bool) -> Output {
         let helper = Path::new(env!("CARGO_BIN_EXE_git-remote-e2ee"));
         let mut paths = vec![helper.parent().unwrap().to_path_buf()];
         paths.extend(env::split_paths(&env::var_os("PATH").unwrap_or_default()));
-        command.env("PATH", env::join_paths(paths).unwrap());
+        command
+            .env("PATH", env::join_paths(paths).unwrap())
+            .env("XDG_STATE_HOME", support::state_home());
     }
     command.output().unwrap()
 }
@@ -89,9 +93,13 @@ fn native_git_push_and_fetch_use_the_remote_helper() {
 
     let key = KeyFile::generate();
     key.write_new(&key_path).unwrap();
-    EncryptedRepository::new(FilesystemStorage::new(&remote_path), key)
-        .initialize("owner")
-        .unwrap();
+    EncryptedRepository::new(
+        FilesystemStorage::new(&remote_path),
+        key,
+        support::state_dir(),
+    )
+    .initialize("owner")
+    .unwrap();
 
     fs::write(source.join("note.md"), "through native Git\n").unwrap();
     git(&source, &["add", "note.md"], false);
@@ -154,7 +162,11 @@ fn concurrent_helper_processes_preserve_the_client_state_floor() {
 
     let key = KeyFile::generate();
     key.write_new(&key_path).unwrap();
-    let encrypted = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key);
+    let encrypted = EncryptedRepository::new(
+        FilesystemStorage::new(&remote_path),
+        key,
+        support::state_dir(),
+    );
     encrypted.initialize("owner").unwrap();
     configure_remote(&source, &remote_path, &key_path);
     configure_remote(&destination, &remote_path, &key_path);
@@ -184,6 +196,7 @@ fn concurrent_helper_processes_preserve_the_client_state_floor() {
                 .arg("private")
                 .arg(remote_url)
                 .current_dir(&destination)
+                .env("XDG_STATE_HOME", support::state_home())
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -225,11 +238,16 @@ fn concurrent_helper_processes_preserve_the_client_state_floor() {
     }
     assert_eq!(current_successes, 2);
 
-    let state_path = state_dir(&destination).join("state.json");
-    let state: serde_json::Value = serde_json::from_slice(&fs::read(state_path).unwrap()).unwrap();
-    assert_eq!(state["generation"], expected_manifest.generation);
-    assert_eq!(state["imported_generation"], expected_manifest.generation);
-    assert_eq!(state["head_id"], expected_head);
+    let progress_path = state_dir(&destination).join("progress.json");
+    let progress: serde_json::Value =
+        serde_json::from_slice(&fs::read(progress_path).unwrap()).unwrap();
+    assert_eq!(
+        progress["imported_generation"],
+        expected_manifest.generation
+    );
+    let floor = support::read_floor(&expected_manifest.repository_root);
+    assert_eq!(floor["generation"], expected_manifest.generation);
+    assert_eq!(floor["head_id"], expected_head);
 }
 
 #[test]
@@ -242,7 +260,11 @@ fn native_git_dry_run_does_not_mutate_remote() {
 
     let key = KeyFile::generate();
     key.write_new(&key_path).unwrap();
-    let encrypted = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key);
+    let encrypted = EncryptedRepository::new(
+        FilesystemStorage::new(&remote_path),
+        key,
+        support::state_dir(),
+    );
     encrypted.initialize("owner").unwrap();
 
     fs::write(source.join("note.md"), "dry run only\n").unwrap();
@@ -284,7 +306,11 @@ fn native_git_fetch_rejects_rollback_even_when_objects_are_local() {
 
     let key = KeyFile::generate();
     key.write_new(&key_path).unwrap();
-    let encrypted = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key);
+    let encrypted = EncryptedRepository::new(
+        FilesystemStorage::new(&remote_path),
+        key,
+        support::state_dir(),
+    );
     encrypted.initialize("owner").unwrap();
     configure_remote(&source, &remote_path, &key_path);
     configure_remote(&destination, &remote_path, &key_path);
@@ -339,7 +365,11 @@ fn native_git_push_rejects_storage_rollback_before_creating_a_fork() {
 
     let key = KeyFile::generate();
     key.write_new(&key_path).unwrap();
-    let encrypted = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key);
+    let encrypted = EncryptedRepository::new(
+        FilesystemStorage::new(&remote_path),
+        key,
+        support::state_dir(),
+    );
     encrypted.initialize("owner").unwrap();
     configure_remote(&source, &remote_path, &key_path);
 
@@ -365,7 +395,10 @@ fn native_git_push_rejects_storage_rollback_before_creating_a_fork() {
         "stderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(encrypted.current_manifest().unwrap().0, first_remote_head);
+    assert_eq!(
+        fs::read_to_string(remote_path.join("HEAD")).unwrap().trim(),
+        first_remote_head
+    );
 }
 
 #[test]
@@ -381,7 +414,11 @@ fn native_git_fetch_rejects_same_generation_manifest_fork() {
 
     let key = KeyFile::generate();
     key.write_new(&key_path).unwrap();
-    let encrypted = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key.clone());
+    let encrypted = EncryptedRepository::new(
+        FilesystemStorage::new(&remote_path),
+        key.clone(),
+        support::state_dir(),
+    );
     encrypted.initialize("owner").unwrap();
     configure_remote(&source, &remote_path, &key_path);
     configure_remote(&destination, &remote_path, &key_path);
@@ -392,9 +429,22 @@ fn native_git_fetch_rejects_same_generation_manifest_fork() {
     git(&source, &["push", "private", "main"], true);
     git(&destination, &["fetch", "private"], true);
 
-    let fork = EncryptedRepository::new(FilesystemStorage::new(&fork_path), key);
+    let fork = EncryptedRepository::new(
+        FilesystemStorage::new(&fork_path),
+        key,
+        temporary.path().join("forker-machine"),
+    );
     fork.initialize("owner").unwrap();
-    let fork_head = fork.push_ref(&source, "refs/heads/main", false).unwrap();
+    let fork_head = fork
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
+        .unwrap();
     copy_tree(&fork_path.join("manifests"), &remote_path.join("manifests"));
     fs::write(remote_path.join("HEAD"), format!("{fork_head}\n")).unwrap();
 
@@ -414,18 +464,18 @@ fn native_git_fetch_pins_membership_changes_that_transfer_no_objects() {
     let destination = temporary.path().join("destination");
     let remote_path = temporary.path().join("remote");
     let key_path = temporary.path().join("repository.key.json");
-    let admin_pin = temporary
-        .path()
-        .join("repository.key.json.admin-state.json");
     initialize_git(&source);
     initialize_git(&destination);
 
     let key = KeyFile::generate();
     key.write_new(&key_path).unwrap();
     let extra = KeyFile::generate_for_repository(key.repository_root.clone()).unwrap();
-    let encrypted = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key);
+    let encrypted = EncryptedRepository::new(
+        FilesystemStorage::new(&remote_path),
+        key,
+        support::state_dir(),
+    );
     encrypted.initialize("owner").unwrap();
-    encrypted.pin_admin_state(&admin_pin).unwrap();
     configure_remote(&source, &remote_path, &key_path);
     configure_remote(&destination, &remote_path, &key_path);
 
@@ -443,7 +493,6 @@ fn native_git_fetch_pins_membership_changes_that_transfer_no_objects() {
             extra.public_device().unwrap(),
             "device-1",
             DeviceRoles::reader(),
-            &admin_pin,
         )
         .unwrap();
     git(&destination, &["fetch", "private"], true);
@@ -477,7 +526,11 @@ fn native_git_fetch_pins_branch_deletions_that_transfer_no_objects() {
 
     let key = KeyFile::generate();
     key.write_new(&key_path).unwrap();
-    let encrypted = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key);
+    let encrypted = EncryptedRepository::new(
+        FilesystemStorage::new(&remote_path),
+        key,
+        support::state_dir(),
+    );
     encrypted.initialize("owner").unwrap();
     configure_remote(&source, &remote_path, &key_path);
     configure_remote(&destination, &remote_path, &key_path);
@@ -517,9 +570,13 @@ fn native_git_fetch_reimports_packs_after_local_objects_are_pruned() {
     initialize_git(&destination);
     let key = KeyFile::generate();
     key.write_new(&key_path).unwrap();
-    EncryptedRepository::new(FilesystemStorage::new(&remote_path), key)
-        .initialize("owner")
-        .unwrap();
+    EncryptedRepository::new(
+        FilesystemStorage::new(&remote_path),
+        key,
+        support::state_dir(),
+    )
+    .initialize("owner")
+    .unwrap();
     configure_remote(&source, &remote_path, &key_path);
     configure_remote(&destination, &remote_path, &key_path);
 

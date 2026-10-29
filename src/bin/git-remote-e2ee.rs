@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
+use git_remote_e2ee::continuity::default_state_dir;
 use git_remote_e2ee::crypto::KeyFile;
-use git_remote_e2ee::repository::{EncryptedRepository, PushRejection};
+use git_remote_e2ee::repository::{EncryptedRepository, PushRejection, ReadOnlyDevice, RefChange};
 use git_remote_e2ee::storage::{CasConflict, FilesystemStorage, GitStorage, Storage};
 use git_remote_e2ee::url::StorageUrl;
 
@@ -27,13 +28,14 @@ fn run() -> Result<()> {
     let key = KeyFile::read(&key_path)?;
     let storage = StorageUrl::parse(&url)?;
     persist_absolute_url(&remote_name, &url, &storage)?;
+    let state_dir = default_state_dir()?;
     match storage {
         StorageUrl::Directory(path) => run_protocol(
-            EncryptedRepository::new(FilesystemStorage::new(path), key),
+            EncryptedRepository::new(FilesystemStorage::new(path), key, state_dir),
             remote_name,
         ),
         StorageUrl::Git(remote) => run_protocol(
-            EncryptedRepository::new(GitStorage::open(&remote)?, key),
+            EncryptedRepository::new(GitStorage::open(&remote)?, key, state_dir),
             remote_name,
         ),
     }
@@ -148,33 +150,27 @@ fn process_push_batch<S: git_remote_e2ee::storage::Storage>(
         let (source, destination) = spec
             .split_once(':')
             .context("push refspec must contain ':'")?;
-        let result = if source.is_empty() && dry_run {
-            repository
-                .validate_delete_ref_for_remote(local_repository, remote_name, destination)
-                .map(|_| String::new())
-        } else if source.is_empty() {
-            repository.delete_ref_for_remote(local_repository, remote_name, destination)
-        } else if dry_run {
-            repository
-                .validate_push_update_for_remote(
-                    local_repository,
-                    remote_name,
-                    source,
-                    destination,
-                    force,
-                )
-                .map(|_| String::new())
+        let change = if source.is_empty() {
+            RefChange::Delete
         } else {
-            repository.push_update_for_remote(
-                local_repository,
-                remote_name,
-                source,
-                destination,
-                force,
-            )
+            RefChange::Update { source, force }
+        };
+        let result = if dry_run {
+            repository.check_push(local_repository, destination, change)
+        } else {
+            repository
+                .push(local_repository, destination, change)
+                .map(drop)
         };
         match result {
-            Ok(_) => writeln!(output, "ok {destination}")?,
+            Ok(()) => writeln!(output, "ok {destination}")?,
+            Err(error) if error.is::<ReadOnlyDevice>() => {
+                let message = format!(
+                    "this device is read-only for {remote_name}; ask an administrator for the write role"
+                );
+                writeln!(output, "error {destination} {message}")?;
+                eprintln!("e2ee: {destination}: {message}");
+            }
             Err(error) => {
                 writeln!(output, "error {destination} {}", push_status(&error))?;
                 eprintln!("e2ee: {destination}: {}", single_line(&error));

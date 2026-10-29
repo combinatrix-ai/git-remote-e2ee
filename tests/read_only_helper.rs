@@ -1,3 +1,5 @@
+mod support;
+
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -36,7 +38,9 @@ fn add_helper_to_path(command: &mut Command) {
     let helper = Path::new(env!("CARGO_BIN_EXE_git-remote-e2ee"));
     let mut paths = vec![helper.parent().unwrap().to_path_buf()];
     paths.extend(env::split_paths(&env::var_os("PATH").unwrap_or_default()));
-    command.env("PATH", env::join_paths(paths).unwrap());
+    command
+        .env("PATH", env::join_paths(paths).unwrap())
+        .env("XDG_STATE_HOME", support::state_home());
 }
 
 fn initialize_git(repo: &Path) {
@@ -106,16 +110,13 @@ fn exercise_read_only_helper<S: Storage>(
     owner_key.write_new(&owner_key_path).unwrap();
     reader_key.write_new(&reader_key_path).unwrap();
 
-    let owner = EncryptedRepository::new(storage, owner_key);
+    let owner = EncryptedRepository::new(storage, owner_key, support::state_dir());
     owner.initialize("owner").unwrap();
-    let admin_pin = temporary.join("owner.admin-state.json");
-    owner.pin_admin_state(&admin_pin).unwrap();
     owner
         .add_device(
             reader_key.public_device().unwrap(),
             "device-1",
             DeviceRoles::reader(),
-            &admin_pin,
         )
         .unwrap();
 
@@ -262,16 +263,13 @@ fn read_only_device_cannot_publish_recovery() {
     let owner = KeyFile::generate();
     let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
     let storage = FilesystemStorage::new(&storage_path);
-    let owner_repository = EncryptedRepository::new(storage.clone(), owner);
+    let owner_repository = EncryptedRepository::new(storage.clone(), owner, support::state_dir());
     owner_repository.initialize("owner").unwrap();
-    let admin_pin = temporary.path().join("owner.admin-state.json");
-    owner_repository.pin_admin_state(&admin_pin).unwrap();
     owner_repository
         .add_device(
             reader.public_device().unwrap(),
             "device-2",
             DeviceRoles::reader(),
-            &admin_pin,
         )
         .unwrap();
     owner_repository.fetch_into(&reader_repo, "origin").unwrap();
@@ -285,7 +283,7 @@ fn read_only_device_cannot_publish_recovery() {
         .compare_and_swap_head(Some(&floor_id), &invalid_id)
         .unwrap();
 
-    let read_only = EncryptedRepository::new(storage.clone(), reader);
+    let read_only = EncryptedRepository::new(storage.clone(), reader, support::state_dir());
     let report = read_only
         .recover(
             &reader_repo,

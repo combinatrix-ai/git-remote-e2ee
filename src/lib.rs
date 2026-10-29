@@ -1,3 +1,4 @@
+pub mod continuity;
 pub mod crypto;
 pub mod error;
 pub mod git;

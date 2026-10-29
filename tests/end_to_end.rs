@@ -1,3 +1,5 @@
+mod support;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
@@ -15,7 +17,7 @@ use git_remote_e2ee::manifest::{
     unwrap_generation_key, verify_manifest, wrap_predecessor_key,
 };
 use git_remote_e2ee::policy::{DeviceRoles, PolicyState};
-use git_remote_e2ee::repository::{EncryptedRepository, RecoveryClass, RecoveryOptions};
+use git_remote_e2ee::repository::{EncryptedRepository, RecoveryClass, RecoveryOptions, RefChange};
 use git_remote_e2ee::storage::{
     FilesystemStorage, ObjectKind, ObjectStage, RecoveryCommit, RecoveryHistory, Storage,
 };
@@ -126,7 +128,7 @@ fn floor_with_malformed_head(
     initialize_git(&repo);
     let key = KeyFile::generate();
     let storage = FilesystemStorage::new(temporary.join("storage"));
-    let repository = EncryptedRepository::new(storage.clone(), key.clone());
+    let repository = EncryptedRepository::new(storage.clone(), key.clone(), support::state_dir());
     repository.initialize("owner").unwrap();
     repository.fetch_into(&repo, "encrypted").unwrap();
     let floor = storage.read_head().unwrap().unwrap();
@@ -193,6 +195,7 @@ fn recovery_budget_exhaustion_inside_candidate_discovery_is_fatal() {
             manifests: BTreeMap::from([(oversized_id, oversized)]),
         },
         key,
+        support::state_dir(),
     );
 
     let error = publish_recovery(&recovery, &repo).unwrap_err();
@@ -204,7 +207,7 @@ fn recovery_budget_exhaustion_inside_candidate_discovery_is_fatal() {
         storage.read_head().unwrap().as_deref(),
         Some(junk_id.as_str())
     );
-    assert_eq!(client_state(&repo)["head_id"], floor);
+    assert_eq!(machine_floor(&repo)["head_id"], floor);
 }
 
 #[test]
@@ -212,9 +215,13 @@ fn recovery_refuses_to_skip_a_discontinuous_historical_head() {
     let temporary = tempfile::tempdir().unwrap();
     let (key, storage, repo, floor, junk_id) = floor_with_malformed_head(temporary.path());
     let foreign_storage = FilesystemStorage::new(temporary.path().join("foreign"));
-    EncryptedRepository::new(foreign_storage.clone(), KeyFile::generate())
-        .initialize("foreign")
-        .unwrap();
+    EncryptedRepository::new(
+        foreign_storage.clone(),
+        KeyFile::generate(),
+        support::state_dir(),
+    )
+    .initialize("foreign")
+    .unwrap();
     let foreign_id = foreign_storage.read_head().unwrap().unwrap();
     let foreign = foreign_storage
         .get_object(ObjectKind::Manifest, &foreign_id)
@@ -226,6 +233,7 @@ fn recovery_refuses_to_skip_a_discontinuous_historical_head() {
             manifests: BTreeMap::from([(foreign_id.clone(), foreign)]),
         },
         key,
+        support::state_dir(),
     );
 
     let report = publish_recovery(&recovery, &repo).unwrap();
@@ -242,7 +250,7 @@ fn recovery_refuses_to_skip_a_discontinuous_historical_head() {
         storage.read_head().unwrap().as_deref(),
         Some(junk_id.as_str())
     );
-    assert_eq!(client_state(&repo)["head_id"], floor);
+    assert_eq!(machine_floor(&repo)["head_id"], floor);
 }
 
 #[test]
@@ -267,7 +275,11 @@ fn recover_refuses_a_head_with_a_future_manifest_schema() {
         .compare_and_swap_head(Some(&junk_id), &future_id)
         .unwrap();
 
-    let report = publish_recovery(&EncryptedRepository::new(storage.clone(), key), &repo).unwrap();
+    let report = publish_recovery(
+        &EncryptedRepository::new(storage.clone(), key, support::state_dir()),
+        &repo,
+    )
+    .unwrap();
     assert_eq!(
         report.classification,
         RecoveryClass::Unsupported,
@@ -279,7 +291,7 @@ fn recover_refuses_a_head_with_a_future_manifest_schema() {
         storage.read_head().unwrap().as_deref(),
         Some(future_id.as_str())
     );
-    assert_eq!(client_state(&repo)["head_id"], floor);
+    assert_eq!(machine_floor(&repo)["head_id"], floor);
 }
 
 impl Storage for BarrierStorage {
@@ -337,8 +349,14 @@ fn commit(repo: &Path, contents: &str, message: &str) -> String {
     git(repo, &["rev-parse", "HEAD"])
 }
 
-fn client_state(repo: &Path) -> serde_json::Value {
-    let path = state_dir(repo).join("state.json");
+/// This machine's continuity floor for the repository `repo` is a checkout of.
+fn machine_floor(repo: &Path) -> serde_json::Value {
+    let directory = state_dir(repo);
+    support::read_floor(directory.file_name().unwrap().to_str().unwrap())
+}
+
+fn progress(repo: &Path) -> serde_json::Value {
+    let path = state_dir(repo).join("progress.json");
     serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
 }
 
@@ -389,18 +407,33 @@ fn shallow_push_is_rejected_before_publication_and_unshallow_recovers() {
         "true"
     );
     let key = KeyFile::generate();
-    let encrypted = EncryptedRepository::new(FilesystemStorage::new(&storage), key);
+    let encrypted =
+        EncryptedRepository::new(FilesystemStorage::new(&storage), key, support::state_dir());
     encrypted.initialize("owner").unwrap();
     let head_before = fs::read(storage.join("HEAD")).unwrap();
     let error = encrypted
-        .push_ref(&shallow, "refs/heads/main", false)
+        .push(
+            &shallow,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap_err();
     assert!(error.to_string().contains("shallow"), "{error:#}");
     assert_eq!(fs::read(storage.join("HEAD")).unwrap(), head_before);
     assert!(encrypted.verify().unwrap().refs.is_empty());
     git(&shallow, &["fetch", "--unshallow"]);
     encrypted
-        .push_ref(&shallow, "refs/heads/main", false)
+        .push(
+            &shallow,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap();
     initialize_git(&destination);
     encrypted.fetch_into(&destination, "encrypted").unwrap();
@@ -424,12 +457,23 @@ fn pushes_incrementally_and_fetches_into_another_repository() {
     initialize_git(&destination);
 
     let key = KeyFile::generate();
-    let encrypted = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key.clone());
+    let encrypted = EncryptedRepository::new(
+        FilesystemStorage::new(&remote_path),
+        key.clone(),
+        support::state_dir(),
+    );
     encrypted.initialize("owner").unwrap();
 
     let first = commit(&source, "first\n", "first");
     encrypted
-        .push_ref(&source, "refs/heads/main", false)
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap();
     let first_state = encrypted.verify().unwrap();
     assert_eq!(first_state.generation, 1);
@@ -437,7 +481,14 @@ fn pushes_incrementally_and_fetches_into_another_repository() {
 
     let second = commit(&source, "second\n", "second");
     encrypted
-        .push_ref(&source, "refs/heads/main", false)
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap();
     let second_state = encrypted.verify().unwrap();
     assert_eq!(second_state.generation, 2);
@@ -460,7 +511,7 @@ fn pushes_incrementally_and_fetches_into_another_repository() {
 }
 
 #[test]
-fn missing_pack_observation_does_not_advance_the_floor() {
+fn missing_pack_observation_does_not_advance_import_progress() {
     let temporary = tempfile::tempdir().unwrap();
     let source = temporary.path().join("source");
     let destination = temporary.path().join("destination");
@@ -469,30 +520,36 @@ fn missing_pack_observation_does_not_advance_the_floor() {
     initialize_git(&destination);
 
     let key = KeyFile::generate();
-    let repository = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key);
+    let repository = EncryptedRepository::new(
+        FilesystemStorage::new(&remote_path),
+        key,
+        support::state_dir(),
+    );
     repository.initialize("owner").unwrap();
     commit(&source, "first\n", "first");
     repository
-        .push_update_for_remote(
+        .push(
             &source,
-            "encrypted",
             "refs/heads/main",
-            "refs/heads/main",
-            false,
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
         )
         .unwrap();
     repository.fetch_into(&destination, "encrypted").unwrap();
-    assert_eq!(client_state(&destination)["generation"], 1);
-    assert_eq!(client_state(&destination)["imported_generation"], 1);
+    assert_eq!(machine_floor(&destination)["generation"], 1);
+    assert_eq!(progress(&destination)["imported_generation"], 1);
 
     commit(&source, "second\n", "second");
     repository
-        .push_update_for_remote(
+        .push(
             &source,
-            "encrypted",
             "refs/heads/main",
-            "refs/heads/main",
-            false,
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
         )
         .unwrap();
     let (_, manifest) = repository.current_manifest().unwrap();
@@ -503,20 +560,19 @@ fn missing_pack_observation_does_not_advance_the_floor() {
 
     let listed = repository.observe_manifest(&destination).unwrap();
     assert_eq!(listed.generation, 2);
-    assert_eq!(client_state(&destination)["generation"], 1);
+    assert_eq!(progress(&destination)["imported_generation"], 1);
     let error = repository
         .fetch_into(&destination, "encrypted")
         .unwrap_err()
         .to_string();
     assert!(error.contains(&pack_id), "unexpected error: {error}");
-    assert_eq!(client_state(&destination)["generation"], 1);
+    assert_eq!(progress(&destination)["imported_generation"], 1);
 
     write_stored_object(&remote_path, "packs", &pack_id, &saved_pack);
     let fetched = repository.fetch_into(&destination, "encrypted").unwrap();
     assert_eq!(fetched.generation, 2);
-    let state = client_state(&destination);
-    assert_eq!(state["generation"], 2);
-    assert_eq!(state["imported_generation"], 2);
+    assert_eq!(machine_floor(&destination)["generation"], 2);
+    assert_eq!(progress(&destination)["imported_generation"], 2);
 }
 
 #[test]
@@ -527,24 +583,30 @@ fn successful_own_publication_advances_the_client_floor() {
     initialize_git(&source);
 
     let key = KeyFile::generate();
-    let repository = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key);
+    let repository = EncryptedRepository::new(
+        FilesystemStorage::new(&remote_path),
+        key,
+        support::state_dir(),
+    );
     repository.initialize("owner").unwrap();
     commit(&source, "published\n", "published");
     let head = repository
-        .push_update_for_remote(
+        .push(
             &source,
-            "encrypted",
             "refs/heads/main",
-            "refs/heads/main",
-            false,
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
         )
         .unwrap();
 
-    let state_path = state_dir(&source).join("state.json");
-    let state: serde_json::Value = serde_json::from_slice(&fs::read(state_path).unwrap()).unwrap();
-    assert_eq!(state["head_id"], head);
-    assert_eq!(state["generation"], 1);
-    assert_eq!(state["imported_generation"], serde_json::Value::Null);
+    assert_eq!(machine_floor(&source)["head_id"], head);
+    assert_eq!(machine_floor(&source)["generation"], 1);
+    assert_eq!(
+        progress(&source)["imported_generation"],
+        serde_json::Value::Null
+    );
 }
 
 #[test]
@@ -556,19 +618,34 @@ fn returning_client_fetches_multiple_offline_generations_from_deltas() {
     initialize_git(&source);
     initialize_git(&destination);
     let key = KeyFile::generate();
-    let repository = EncryptedRepository::new(FilesystemStorage::new(&remote), key);
+    let repository =
+        EncryptedRepository::new(FilesystemStorage::new(&remote), key, support::state_dir());
     repository.initialize("owner").unwrap();
 
     commit(&source, "one\n", "one");
     repository
-        .push_ref(&source, "refs/heads/main", false)
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap();
     repository.fetch_into(&destination, "e2ee").unwrap();
 
     for value in ["two\n", "three\n", "four\n"] {
         commit(&source, value, value.trim());
         repository
-            .push_ref(&source, "refs/heads/main", false)
+            .push(
+                &source,
+                "refs/heads/main",
+                RefChange::Update {
+                    source: "refs/heads/main",
+                    force: false,
+                },
+            )
             .unwrap();
     }
     let latest = repository.fetch_into(&destination, "e2ee").unwrap();
@@ -588,11 +665,22 @@ fn returning_client_rejects_signed_ref_advance_without_its_pack() {
     initialize_git(&source);
     initialize_git(&destination);
     let key = KeyFile::generate();
-    let repository = EncryptedRepository::new(FilesystemStorage::new(&remote), key.clone());
+    let repository = EncryptedRepository::new(
+        FilesystemStorage::new(&remote),
+        key.clone(),
+        support::state_dir(),
+    );
     repository.initialize("owner").unwrap();
     commit(&source, "valid\n", "valid");
     repository
-        .push_ref(&source, "refs/heads/main", false)
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap();
     repository.fetch_into(&destination, "e2ee").unwrap();
 
@@ -656,8 +744,8 @@ fn returning_client_rejects_signed_ref_advance_without_its_pack() {
         error.contains("does not resolve") || error.contains("missing Git objects"),
         "unexpected connectivity error: {error}"
     );
-    assert_eq!(client_state(&destination)["generation"], 1);
-    assert_eq!(client_state(&destination)["imported_generation"], 1);
+    assert_eq!(machine_floor(&destination)["generation"], 1);
+    assert_eq!(progress(&destination)["imported_generation"], 1);
 }
 
 #[test]
@@ -670,15 +758,23 @@ fn missing_verified_frontier_tip_forces_full_reverification() {
     initialize_git(&destination);
 
     let key = KeyFile::generate();
-    let repository = EncryptedRepository::new(FilesystemStorage::new(&remote), key);
+    let repository =
+        EncryptedRepository::new(FilesystemStorage::new(&remote), key, support::state_dir());
     repository.initialize("owner").unwrap();
     commit(&source, "valid\n", "valid");
     repository
-        .push_ref(&source, "refs/heads/main", false)
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap();
     repository.fetch_into(&destination, "e2ee").unwrap();
 
-    let state_path = state_dir(&destination).join("state.json");
+    let state_path = state_dir(&destination).join("progress.json");
     let mut state: serde_json::Value =
         serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
     state["verified_refs"]["refs/heads/main"] = serde_json::Value::String("1".repeat(40));
@@ -732,39 +828,39 @@ fn local_publication_advances_verified_frontier_before_observation() {
     initialize_git(&source);
 
     let key = KeyFile::generate();
-    let repository = EncryptedRepository::new(FilesystemStorage::new(&remote), key);
+    let repository =
+        EncryptedRepository::new(FilesystemStorage::new(&remote), key, support::state_dir());
     repository.initialize("owner").unwrap();
 
     let first = commit(&source, "first\n", "first");
     repository
-        .push_update_for_remote(
+        .push(
             &source,
-            "origin",
             "refs/heads/main",
-            "refs/heads/main",
-            false,
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
         )
         .unwrap();
-    assert_eq!(
-        client_state(&source)["verified_refs"]["refs/heads/main"],
-        first
-    );
+    assert_eq!(progress(&source)["verified_refs"]["refs/heads/main"], first);
 
     let observed = repository.observe_manifest(&source).unwrap();
     assert_eq!(observed.refs.get("refs/heads/main"), Some(&first));
 
     let second = commit(&source, "second\n", "second");
     repository
-        .push_update_for_remote(
+        .push(
             &source,
-            "origin",
             "refs/heads/main",
-            "refs/heads/main",
-            false,
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
         )
         .unwrap();
     assert_eq!(
-        client_state(&source)["verified_refs"]["refs/heads/main"],
+        progress(&source)["verified_refs"]["refs/heads/main"],
         second
     );
 }
@@ -787,21 +883,46 @@ fn rejects_non_fast_forward_update() {
     initialize_git(&source);
 
     let key = KeyFile::generate();
-    let encrypted = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key);
+    let encrypted = EncryptedRepository::new(
+        FilesystemStorage::new(&remote_path),
+        key,
+        support::state_dir(),
+    );
     encrypted.initialize("owner").unwrap();
     let first = commit(&source, "first\n", "first");
     encrypted
-        .push_ref(&source, "refs/heads/main", false)
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap();
     commit(&source, "second\n", "second");
     encrypted
-        .push_ref(&source, "refs/heads/main", false)
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap();
     git(&source, &["reset", "--hard", &first]);
     commit(&source, "diverged\n", "diverged");
 
     let error = encrypted
-        .push_ref(&source, "refs/heads/main", false)
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap_err();
     assert!(error.to_string().contains("non-fast-forward"));
     assert_eq!(encrypted.verify().unwrap().generation, 2);
@@ -817,20 +938,45 @@ fn explicit_force_can_publish_a_rollback() {
     initialize_git(&destination);
 
     let key = KeyFile::generate();
-    let encrypted = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key);
+    let encrypted = EncryptedRepository::new(
+        FilesystemStorage::new(&remote_path),
+        key,
+        support::state_dir(),
+    );
     encrypted.initialize("owner").unwrap();
     let first = commit(&source, "first\n", "first");
     encrypted
-        .push_ref(&source, "refs/heads/main", false)
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap();
     commit(&source, "second\n", "second");
     encrypted
-        .push_ref(&source, "refs/heads/main", false)
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap();
 
     git(&source, &["reset", "--hard", &first]);
     encrypted
-        .push_ref(&source, "refs/heads/main", true)
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: true,
+            },
+        )
         .unwrap();
     assert_eq!(encrypted.verify().unwrap().refs["refs/heads/main"], first);
 
@@ -849,11 +995,22 @@ fn detects_tampered_pack_ciphertext() {
     initialize_git(&source);
 
     let key = KeyFile::generate();
-    let encrypted = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key);
+    let encrypted = EncryptedRepository::new(
+        FilesystemStorage::new(&remote_path),
+        key,
+        support::state_dir(),
+    );
     encrypted.initialize("owner").unwrap();
     commit(&source, "secret\n", "secret");
     encrypted
-        .push_ref(&source, "refs/heads/main", false)
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap();
     let manifest = encrypted.verify().unwrap();
     let id = &manifest.new_packs[0].id;
@@ -889,10 +1046,21 @@ fn late_stream_authentication_failure_does_not_advance_refs_or_pins() {
     git(&source, &["commit", "-q", "-m", "large"]);
 
     let key = KeyFile::generate();
-    let encrypted = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key);
+    let encrypted = EncryptedRepository::new(
+        FilesystemStorage::new(&remote_path),
+        key,
+        support::state_dir(),
+    );
     encrypted.initialize("owner").unwrap();
     encrypted
-        .push_ref(&source, "refs/heads/main", false)
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap();
     let manifest = encrypted.current_manifest().unwrap().1;
     let id = &manifest.new_packs[0].id;
@@ -904,7 +1072,7 @@ fn late_stream_authentication_failure_does_not_advance_refs_or_pins() {
     fs::write(path, bytes).unwrap();
 
     assert!(encrypted.fetch_into(&destination, "encrypted").is_err());
-    assert!(!state_dir(&destination).join("state.json").exists());
+    assert!(!state_dir(&destination).join("progress.json").exists());
     let output = Command::new("git")
         .arg("-C")
         .arg(&destination)
@@ -924,15 +1092,33 @@ fn rejects_storage_head_rollback_after_fetch_pins_history() {
     initialize_git(&destination);
 
     let key = KeyFile::generate();
-    let encrypted = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key);
+    let encrypted = EncryptedRepository::new(
+        FilesystemStorage::new(&remote_path),
+        key,
+        support::state_dir(),
+    );
     encrypted.initialize("owner").unwrap();
     commit(&source, "first\n", "first");
     let first_head = encrypted
-        .push_ref(&source, "refs/heads/main", false)
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap();
     commit(&source, "second\n", "second");
     encrypted
-        .push_ref(&source, "refs/heads/main", false)
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap();
     encrypted.fetch_into(&destination, "encrypted").unwrap();
 
@@ -952,17 +1138,41 @@ fn rejects_same_generation_manifest_fork_after_fetch_pins_history() {
     initialize_git(&destination);
 
     let key = KeyFile::generate();
-    let encrypted = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key.clone());
+    let encrypted = EncryptedRepository::new(
+        FilesystemStorage::new(&remote_path),
+        key.clone(),
+        support::state_dir(),
+    );
     encrypted.initialize("owner").unwrap();
     commit(&source, "first\n", "first");
     encrypted
-        .push_ref(&source, "refs/heads/main", false)
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap();
     encrypted.fetch_into(&destination, "encrypted").unwrap();
 
-    let fork = EncryptedRepository::new(FilesystemStorage::new(&fork_path), key);
+    let fork = EncryptedRepository::new(
+        FilesystemStorage::new(&fork_path),
+        key,
+        temporary.path().join("forker-machine"),
+    );
     fork.initialize("owner").unwrap();
-    let fork_head = fork.push_ref(&source, "refs/heads/main", false).unwrap();
+    let fork_head = fork
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
+        .unwrap();
     copy_tree(&fork_path.join("manifests"), &remote_path.join("manifests"));
     fs::write(remote_path.join("HEAD"), format!("{fork_head}\n")).unwrap();
 
@@ -983,28 +1193,31 @@ fn recover_replaces_reader_signed_junk_from_the_directory_floor() {
 
     let owner = KeyFile::generate();
     let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
-    let admin_pin = temporary.path().join("owner.admin-state.json");
     let storage = FilesystemStorage::new(&storage_path);
-    let repository = EncryptedRepository::new(storage.clone(), owner.clone());
+    let repository = EncryptedRepository::new(storage.clone(), owner.clone(), support::state_dir());
     repository.initialize("owner").unwrap();
-    repository.pin_admin_state(&admin_pin).unwrap();
     commit(&source, "recovery keeps this content\n", "base");
     repository
-        .push_ref(&source, "refs/heads/main", false)
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap();
     repository
         .add_device(
             reader.public_device().unwrap(),
             "device-1",
             DeviceRoles::reader(),
-            &admin_pin,
         )
         .unwrap();
     repository.fetch_into(&returning, "encrypted").unwrap();
     let (floor_id, floor_manifest) = repository.current_manifest().unwrap();
     let floor_generation = floor_manifest.generation;
-    let floor_state = client_state(&returning);
-    assert_eq!(floor_state["head_id"], floor_id);
+    assert_eq!(machine_floor(&returning)["head_id"], floor_id);
 
     let encrypted = storage.get_object(ObjectKind::Manifest, &floor_id).unwrap();
     let header = peek_manifest_header(&encrypted).unwrap();
@@ -1052,7 +1265,7 @@ fn recover_replaces_reader_signed_junk_from_the_directory_floor() {
         .compare_and_swap_head(Some(&floor_id), &junk_id)
         .unwrap();
 
-    let recoverer = EncryptedRepository::new(storage.clone(), owner.clone());
+    let recoverer = EncryptedRepository::new(storage.clone(), owner.clone(), support::state_dir());
     let blocked = recoverer
         .recover(
             &returning,
@@ -1080,7 +1293,7 @@ fn recover_replaces_reader_signed_junk_from_the_directory_floor() {
             .unwrap()
             .contains("--accept-stale-floor")
     );
-    assert_eq!(client_state(&returning)["head_id"], floor_id);
+    assert_eq!(machine_floor(&returning)["head_id"], floor_id);
 
     let recovered = recoverer
         .recover(
@@ -1099,7 +1312,7 @@ fn recover_replaces_reader_signed_junk_from_the_directory_floor() {
     assert_eq!(current.previous.as_deref(), Some(floor_id.as_str()));
     assert_eq!(current.generation, floor_generation + 1);
     assert_ne!(current_id, junk_id);
-    assert_eq!(client_state(&returning)["head_id"], current_id);
+    assert_eq!(machine_floor(&returning)["head_id"], current_id);
     let rejected = fs::read(state_dir(&returning).join("rejected-heads.json")).unwrap();
     assert!(String::from_utf8_lossy(&rejected).contains(&junk_id));
 
@@ -1109,8 +1322,8 @@ fn recover_replaces_reader_signed_junk_from_the_directory_floor() {
         git(&fresh, &["show", "refs/remotes/encrypted/main:note.md"]),
         "recovery keeps this content"
     );
-    assert_eq!(client_state(&returning)["head_id"], current_id);
-    assert_eq!(client_state(&fresh)["head_id"], current_id);
+    assert_eq!(machine_floor(&returning)["head_id"], current_id);
+    assert_eq!(machine_floor(&fresh)["head_id"], current_id);
 }
 
 #[test]
@@ -1121,32 +1334,31 @@ fn recover_refuses_a_revoked_devices_unverifiable_head() {
     initialize_git(&reader_repo);
     let owner = KeyFile::generate();
     let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
-    let admin_pin = temporary.path().join("owner.admin-state.json");
     let storage = FilesystemStorage::new(&storage_path);
-    let owner_repository = EncryptedRepository::new(storage.clone(), owner);
+    let owner_repository = EncryptedRepository::new(storage.clone(), owner, support::state_dir());
     owner_repository.initialize("owner").unwrap();
-    owner_repository.pin_admin_state(&admin_pin).unwrap();
     owner_repository
         .add_device(
             reader.public_device().unwrap(),
             "device-2",
             DeviceRoles::reader(),
-            &admin_pin,
         )
         .unwrap();
-    owner_repository
+    let reader_machine = temporary.path().join("reader-machine");
+    let reader_floor = reader_machine
+        .join(&reader.repository_root)
+        .join("continuity.json");
+    let reader_repository =
+        EncryptedRepository::new(storage.clone(), reader.clone(), &reader_machine);
+    reader_repository
         .fetch_into(&reader_repo, "encrypted")
         .unwrap();
-    let old_floor = client_state(&reader_repo)["head_id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    let old_floor = fs::read(&reader_floor).unwrap();
     owner_repository
-        .revoke_device(&reader.device_id().unwrap(), &admin_pin)
+        .revoke_device(&reader.device_id().unwrap())
         .unwrap();
     let revoked_head = storage.read_head().unwrap().unwrap();
 
-    let reader_repository = EncryptedRepository::new(storage.clone(), reader);
     let report = reader_repository
         .recover(
             &reader_repo,
@@ -1164,7 +1376,7 @@ fn recover_refuses_a_revoked_devices_unverifiable_head() {
         storage.read_head().unwrap().as_deref(),
         Some(revoked_head.as_str())
     );
-    assert_eq!(client_state(&reader_repo)["head_id"], old_floor);
+    assert_eq!(fs::read(&reader_floor).unwrap(), old_floor);
     assert!(!state_dir(&reader_repo).join("rejected-heads.json").exists());
 }
 
@@ -1177,7 +1389,8 @@ fn recover_refuses_unknown_formats_and_missing_floor_objects() {
     initialize_git(&unknown_repo);
     let key = KeyFile::generate();
     let unknown_storage = FilesystemStorage::new(&unknown_storage_path);
-    let unknown_repository = EncryptedRepository::new(unknown_storage.clone(), key.clone());
+    let unknown_repository =
+        EncryptedRepository::new(unknown_storage.clone(), key.clone(), support::state_dir());
     unknown_repository.initialize("owner").unwrap();
     unknown_repository
         .fetch_into(&unknown_repo, "encrypted")
@@ -1207,7 +1420,7 @@ fn recover_refuses_unknown_formats_and_missing_floor_objects() {
     unknown_storage
         .compare_and_swap_head(Some(&floor_id), &unsupported_id)
         .unwrap();
-    let unsupported = EncryptedRepository::new(unknown_storage.clone(), key)
+    let unsupported = EncryptedRepository::new(unknown_storage.clone(), key, support::state_dir())
         .recover(
             &unknown_repo,
             RecoveryOptions {
@@ -1229,13 +1442,24 @@ fn recover_refuses_unknown_formats_and_missing_floor_objects() {
     initialize_git(&missing_repo);
     let missing_key = KeyFile::generate();
     let missing_storage = FilesystemStorage::new(&missing_storage_path);
-    let missing_repository = EncryptedRepository::new(missing_storage.clone(), missing_key.clone());
+    let missing_repository = EncryptedRepository::new(
+        missing_storage.clone(),
+        missing_key.clone(),
+        support::state_dir(),
+    );
     missing_repository.initialize("owner").unwrap();
     let source = temporary.path().join("missing-source");
     initialize_git(&source);
     commit(&source, "required floor object\n", "required");
     missing_repository
-        .push_ref(&source, "refs/heads/main", false)
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap();
     missing_repository
         .fetch_into(&missing_repo, "encrypted")
@@ -1270,17 +1494,18 @@ fn recover_refuses_unknown_formats_and_missing_floor_objects() {
     missing_storage
         .compare_and_swap_head(Some(&floor_id), &invalid_id)
         .unwrap();
-    let refused = EncryptedRepository::new(missing_storage.clone(), missing_key)
-        .recover(
-            &missing_repo,
-            RecoveryOptions {
-                publish: true,
-                base: None,
-                discard_newer: false,
-                accept_stale_floor: true,
-            },
-        )
-        .unwrap();
+    let refused =
+        EncryptedRepository::new(missing_storage.clone(), missing_key, support::state_dir())
+            .recover(
+                &missing_repo,
+                RecoveryOptions {
+                    publish: true,
+                    base: None,
+                    discard_newer: false,
+                    accept_stale_floor: true,
+                },
+            )
+            .unwrap();
     assert_eq!(refused.classification, RecoveryClass::Invalid);
     assert!(
         refused
@@ -1293,7 +1518,7 @@ fn recover_refuses_unknown_formats_and_missing_floor_objects() {
         missing_storage.read_head().unwrap().as_deref(),
         Some(invalid_id.as_str())
     );
-    assert_eq!(client_state(&missing_repo)["head_id"], floor_id);
+    assert_eq!(machine_floor(&missing_repo)["head_id"], floor_id);
 }
 
 #[test]
@@ -1306,15 +1531,29 @@ fn recover_never_overrides_authenticated_rollback() {
     initialize_git(&returning);
     let key = KeyFile::generate();
     let storage = FilesystemStorage::new(&storage_path);
-    let repository = EncryptedRepository::new(storage.clone(), key);
+    let repository = EncryptedRepository::new(storage.clone(), key, support::state_dir());
     repository.initialize("owner").unwrap();
     commit(&source, "one\n", "one");
     let first = repository
-        .push_ref(&source, "refs/heads/main", false)
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap();
     commit(&source, "two\n", "two");
     repository
-        .push_ref(&source, "refs/heads/main", false)
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap();
     repository.fetch_into(&returning, "encrypted").unwrap();
     storage
@@ -1348,7 +1587,7 @@ fn recovery_discovery_budget_exhaustion_fails_closed() {
     initialize_git(&repo);
     let key = KeyFile::generate();
     let inner = FilesystemStorage::new(&storage_path);
-    let repository = EncryptedRepository::new(inner.clone(), key.clone());
+    let repository = EncryptedRepository::new(inner.clone(), key.clone(), support::state_dir());
     repository.initialize("owner").unwrap();
     repository.fetch_into(&repo, "encrypted").unwrap();
     let floor = inner.read_head().unwrap().unwrap();
@@ -1366,6 +1605,7 @@ fn recovery_discovery_budget_exhaustion_fails_closed() {
             inner: inner.clone(),
         },
         key,
+        support::state_dir(),
     );
     let error = recovery
         .recover(
@@ -1383,7 +1623,7 @@ fn recovery_discovery_budget_exhaustion_fails_closed() {
         inner.read_head().unwrap().as_deref(),
         Some(invalid_id.as_str())
     );
-    assert_eq!(client_state(&repo)["head_id"], floor);
+    assert_eq!(machine_floor(&repo)["head_id"], floor);
 }
 
 #[test]
@@ -1396,11 +1636,22 @@ fn writer_can_add_branch_without_having_other_remote_branch_objects() {
     initialize_git(&second_writer);
 
     let key = KeyFile::generate();
-    let encrypted = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key);
+    let encrypted = EncryptedRepository::new(
+        FilesystemStorage::new(&remote_path),
+        key,
+        support::state_dir(),
+    );
     encrypted.initialize("owner").unwrap();
     let main = commit(&first_writer, "main\n", "main");
     encrypted
-        .push_ref(&first_writer, "refs/heads/main", false)
+        .push(
+            &first_writer,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap();
     encrypted.fetch_into(&second_writer, "encrypted").unwrap();
     git(
@@ -1411,17 +1662,25 @@ fn writer_can_add_branch_without_having_other_remote_branch_objects() {
     git(&first_writer, &["switch", "-q", "-c", "feature"]);
     let feature = commit(&first_writer, "feature\n", "feature");
     encrypted
-        .push_ref(&first_writer, "refs/heads/feature", false)
+        .push(
+            &first_writer,
+            "refs/heads/feature",
+            RefChange::Update {
+                source: "refs/heads/feature",
+                force: false,
+            },
+        )
         .unwrap();
 
     let other = commit(&second_writer, "other\n", "other");
     encrypted
-        .push_update_for_remote(
+        .push(
             &second_writer,
-            "encrypted",
             "refs/heads/other",
-            "refs/heads/other",
-            false,
+            RefChange::Update {
+                source: "refs/heads/other",
+                force: false,
+            },
         )
         .unwrap();
 
@@ -1456,15 +1715,33 @@ fn deletion_and_tag_publication_race_with_exactly_one_cas_winner() {
     let remote = temporary.path().join("remote");
     initialize_git(&source);
     let key = KeyFile::generate();
-    let seed_repository = EncryptedRepository::new(FilesystemStorage::new(&remote), key.clone());
+    let seed_repository = EncryptedRepository::new(
+        FilesystemStorage::new(&remote),
+        key.clone(),
+        support::state_dir(),
+    );
     seed_repository.initialize("owner").unwrap();
     let main = commit(&source, "main\n", "main");
     seed_repository
-        .push_ref(&source, "refs/heads/main", false)
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap();
     git(&source, &["branch", "doomed", &main]);
     seed_repository
-        .push_ref(&source, "refs/heads/doomed", false)
+        .push(
+            &source,
+            "refs/heads/doomed",
+            RefChange::Update {
+                source: "refs/heads/doomed",
+                force: false,
+            },
+        )
         .unwrap();
     git(&source, &["tag", "race-tag", &main]);
     let before = seed_repository.verify().unwrap();
@@ -1475,13 +1752,26 @@ fn deletion_and_tag_publication_race_with_exactly_one_cas_winner() {
         reads: Arc::new(AtomicUsize::new(0)),
         barrier: Arc::new(Barrier::new(2)),
     };
-    let deleter = EncryptedRepository::new(storage.clone(), key.clone());
-    let tagger = EncryptedRepository::new(storage, key);
+    // Two machines: one machine's floor lock would serialize the racers.
+    let deleter = EncryptedRepository::new(
+        storage.clone(),
+        key.clone(),
+        temporary.path().join("deleter-machine"),
+    );
+    let tagger = EncryptedRepository::new(storage, key, temporary.path().join("tagger-machine"));
     let deletion_repo = source.clone();
     let tag_repo = source.clone();
-    let deletion = thread::spawn(move || deleter.delete_ref(&deletion_repo, "refs/heads/doomed"));
+    let deletion =
+        thread::spawn(move || deleter.push(&deletion_repo, "refs/heads/doomed", RefChange::Delete));
     let tag_push = thread::spawn(move || {
-        tagger.push_update(&tag_repo, "refs/tags/race-tag", "refs/tags/race-tag", false)
+        tagger.push(
+            &tag_repo,
+            "refs/tags/race-tag",
+            RefChange::Update {
+                source: "refs/tags/race-tag",
+                force: false,
+            },
+        )
     });
     let deletion = deletion.join().unwrap();
     let tag_push = tag_push.join().unwrap();
@@ -1517,11 +1807,22 @@ fn rejects_unsupported_ref_namespaces_consistently() {
     initialize_git(&source);
 
     let key = KeyFile::generate();
-    let encrypted = EncryptedRepository::new(FilesystemStorage::new(&remote_path), key);
+    let encrypted = EncryptedRepository::new(
+        FilesystemStorage::new(&remote_path),
+        key,
+        support::state_dir(),
+    );
     encrypted.initialize("owner").unwrap();
     commit(&source, "tagged\n", "tagged");
     let error = encrypted
-        .push_update(&source, "refs/heads/main", "refs/notes/review", false)
+        .push(
+            &source,
+            "refs/notes/review",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap_err();
     assert!(error.to_string().contains("unsupported ref namespace"));
     assert_eq!(encrypted.verify().unwrap().generation, 0);
@@ -1531,6 +1832,7 @@ fn git_e2ee(workdir: &Path, args: &[impl AsRef<std::ffi::OsStr>]) -> std::proces
     let output = Command::new(env!("CARGO_BIN_EXE_git-e2ee"))
         .current_dir(workdir)
         .env("XDG_STATE_HOME", workdir.join("state"))
+        .env("XDG_CONFIG_HOME", workdir.join("config"))
         .args(args)
         .output()
         .unwrap();
@@ -1616,12 +1918,22 @@ fn directory_root_holds_exactly_the_v6_layout() {
     let source = temporary.path().join("source");
     let remote_path = temporary.path().join("remote");
     initialize_git(&source);
-    let encrypted =
-        EncryptedRepository::new(FilesystemStorage::new(&remote_path), KeyFile::generate());
+    let encrypted = EncryptedRepository::new(
+        FilesystemStorage::new(&remote_path),
+        KeyFile::generate(),
+        support::state_dir(),
+    );
     encrypted.initialize("owner").unwrap();
     commit(&source, "layout\n", "layout");
     encrypted
-        .push_ref(&source, "refs/heads/main", false)
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap();
 
     // HEAD.lock and .staging are local coordination files of this backend.
@@ -1654,12 +1966,22 @@ fn directory_format_mismatch_names_the_found_format() {
     let source = temporary.path().join("source");
     let remote_path = temporary.path().join("remote");
     initialize_git(&source);
-    let encrypted =
-        EncryptedRepository::new(FilesystemStorage::new(&remote_path), KeyFile::generate());
+    let encrypted = EncryptedRepository::new(
+        FilesystemStorage::new(&remote_path),
+        KeyFile::generate(),
+        support::state_dir(),
+    );
     encrypted.initialize("owner").unwrap();
     commit(&source, "format\n", "format");
     encrypted
-        .push_ref(&source, "refs/heads/main", false)
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap();
 
     fs::write(remote_path.join("FORMAT"), "git-remote-e2ee storage 7\n").unwrap();

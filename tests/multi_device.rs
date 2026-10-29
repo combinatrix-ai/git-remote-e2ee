@@ -4,7 +4,7 @@ use std::process::Command;
 
 use git_remote_e2ee::crypto::KeyFile;
 use git_remote_e2ee::policy::DeviceRoles;
-use git_remote_e2ee::repository::EncryptedRepository;
+use git_remote_e2ee::repository::{EncryptedRepository, RefChange};
 use git_remote_e2ee::storage::FilesystemStorage;
 
 fn git(repo: &Path, args: &[&str]) -> String {
@@ -21,15 +21,6 @@ fn git(repo: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
-}
-
-fn state_dir(repo: &Path) -> std::path::PathBuf {
-    let entries: Vec<_> = fs::read_dir(repo.join(".git/git-remote-e2ee"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .collect();
-    assert_eq!(entries.len(), 1, "{entries:?}");
-    entries.into_iter().next().unwrap()
 }
 
 fn initialize_git(repo: &Path) {
@@ -55,29 +46,41 @@ fn two_devices_can_decrypt_and_push_independently() {
     let remote = temp.path().join("remote");
     let source_a = temp.path().join("a");
     let source_b = temp.path().join("b");
-    let admin_pin = temp.path().join("a-admin-state.json");
     initialize_git(&source_a);
     initialize_git(&source_b);
 
     let key_a = KeyFile::generate();
     let key_b = KeyFile::generate_for_repository(key_a.repository_root.clone()).unwrap();
-    let repo_a = EncryptedRepository::new(FilesystemStorage::new(&remote), key_a.clone());
+    let repo_a = EncryptedRepository::new(
+        FilesystemStorage::new(&remote),
+        key_a.clone(),
+        temp.path().join("a-machine"),
+    );
     repo_a.initialize("owner").unwrap();
-    repo_a.pin_admin_state(&admin_pin).unwrap();
     let first = commit(&source_a, "from a\n", "from a");
     repo_a
-        .push_ref(&source_a, "refs/heads/main", false)
+        .push(
+            &source_a,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap();
     repo_a
         .add_device(
             key_b.public_device().unwrap(),
             "device-1",
             DeviceRoles::collaborator(),
-            &admin_pin,
         )
         .unwrap();
 
-    let repo_b = EncryptedRepository::new(FilesystemStorage::new(&remote), key_b.clone());
+    let repo_b = EncryptedRepository::new(
+        FilesystemStorage::new(&remote),
+        key_b.clone(),
+        temp.path().join("b-machine"),
+    );
     repo_b.fetch_into(&source_b, "e2ee").unwrap();
     assert_eq!(
         git(&source_b, &["rev-parse", "refs/remotes/e2ee/main"]),
@@ -89,7 +92,14 @@ fn two_devices_can_decrypt_and_push_independently() {
     );
     let second = commit(&source_b, "from b\n", "from b");
     repo_b
-        .push_ref(&source_b, "refs/heads/main", false)
+        .push(
+            &source_b,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap();
 
     let destination = temp.path().join("destination");
@@ -107,31 +117,54 @@ fn revoked_reader_cannot_reach_later_history_but_keeps_prior_snapshot() {
     let remote = temp.path().join("remote");
     let source = temp.path().join("source");
     let client_b = temp.path().join("client-b");
-    let admin_pin = temp.path().join("a-admin-state.json");
     initialize_git(&source);
     initialize_git(&client_b);
 
     let key_a = KeyFile::generate();
     let key_b = KeyFile::generate_for_repository(key_a.repository_root.clone()).unwrap();
     let key_c = KeyFile::generate_for_repository(key_a.repository_root.clone()).unwrap();
-    let repo_a = EncryptedRepository::new(FilesystemStorage::new(&remote), key_a.clone());
+    let repo_a = EncryptedRepository::new(
+        FilesystemStorage::new(&remote),
+        key_a.clone(),
+        temp.path().join("a-machine"),
+    );
     repo_a.initialize("owner").unwrap();
-    repo_a.pin_admin_state(&admin_pin).unwrap();
     let before = commit(&source, "before revoke\n", "before revoke");
-    repo_a.push_ref(&source, "refs/heads/main", false).unwrap();
+    repo_a
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
+        .unwrap();
     let before_tip = commit(&source, "second pack\n", "second pack");
-    repo_a.push_ref(&source, "refs/heads/main", false).unwrap();
+    repo_a
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
+        .unwrap();
     assert_eq!(count_files(&remote.join("packs")), 2);
     repo_a
         .add_device(
             key_b.public_device().unwrap(),
             "device-2",
             DeviceRoles::collaborator(),
-            &admin_pin,
         )
         .unwrap();
     assert_eq!(count_files(&remote.join("packs")), 2);
-    let repo_b = EncryptedRepository::new(FilesystemStorage::new(&remote), key_b.clone());
+    let repo_b = EncryptedRepository::new(
+        FilesystemStorage::new(&remote),
+        key_b.clone(),
+        temp.path().join("b-machine"),
+    );
     repo_b.fetch_into(&client_b, "e2ee").unwrap();
     assert_eq!(
         git(&client_b, &["show", "refs/remotes/e2ee/main:note.md"]),
@@ -145,14 +178,21 @@ fn revoked_reader_cannot_reach_later_history_but_keeps_prior_snapshot() {
     copy_directory(&remote, &before_revoke);
     let old_objects = snapshot_files(&remote.join("packs"));
 
-    repo_a
-        .revoke_device(&key_b.device_id().unwrap(), &admin_pin)
-        .unwrap();
+    repo_a.revoke_device(&key_b.device_id().unwrap()).unwrap();
     assert_eq!(count_files(&remote.join("packs")), 2);
     assert!(repo_b.current_manifest().is_err());
 
     let after = commit(&source, "after revoke secret\n", "after revoke");
-    repo_a.push_ref(&source, "refs/heads/main", false).unwrap();
+    repo_a
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
+        .unwrap();
     assert_eq!(count_files(&remote.join("packs")), 3);
     for (path, contents) in old_objects {
         assert_eq!(fs::read(path).unwrap(), contents);
@@ -174,12 +214,13 @@ fn revoked_reader_cannot_reach_later_history_but_keeps_prior_snapshot() {
 
     commit(&client_b, "revoked writer\n", "revoked writer");
     let push_error = repo_b
-        .push_update_for_remote(
+        .push(
             &client_b,
-            "e2ee",
             "refs/heads/main",
-            "refs/heads/main",
-            false,
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
         )
         .unwrap_err()
         .to_string();
@@ -191,8 +232,11 @@ fn revoked_reader_cannot_reach_later_history_but_keeps_prior_snapshot() {
 
     let snapshot_destination = temp.path().join("snapshot-destination");
     initialize_git(&snapshot_destination);
-    let old_repo_b =
-        EncryptedRepository::new(FilesystemStorage::new(&before_revoke), key_b.clone());
+    let old_repo_b = EncryptedRepository::new(
+        FilesystemStorage::new(&before_revoke),
+        key_b.clone(),
+        temp.path().join("b-machine"),
+    );
     old_repo_b
         .fetch_into(&snapshot_destination, "snapshot")
         .unwrap();
@@ -216,13 +260,16 @@ fn revoked_reader_cannot_reach_later_history_but_keeps_prior_snapshot() {
             key_c.public_device().unwrap(),
             "device-3",
             DeviceRoles::collaborator(),
-            &admin_pin,
         )
         .unwrap();
     assert_eq!(count_files(&remote.join("packs")), 3);
     let destination = temp.path().join("destination");
     initialize_git(&destination);
-    let repo_c = EncryptedRepository::new(FilesystemStorage::new(&remote), key_c);
+    let repo_c = EncryptedRepository::new(
+        FilesystemStorage::new(&remote),
+        key_c,
+        temp.path().join("c-machine"),
+    );
     let manifest = repo_c.fetch_into(&destination, "e2ee").unwrap();
     repo_c.verify().unwrap();
     assert_eq!(manifest.total_pack_count, 3);
@@ -242,20 +289,34 @@ fn connected_membership_observation_pins_and_rejects_replay() {
     let remote = temp.path().join("remote");
     let source = temp.path().join("source");
     let client = temp.path().join("client");
-    let admin_pin = temp.path().join("admin-state.json");
     initialize_git(&source);
     initialize_git(&client);
 
     let key_a = KeyFile::generate();
     let key_b = KeyFile::generate_for_repository(key_a.repository_root.clone()).unwrap();
-    let repository = EncryptedRepository::new(FilesystemStorage::new(&remote), key_a);
+    let root = key_a.repository_root.clone();
+    let repository = EncryptedRepository::new(
+        FilesystemStorage::new(&remote),
+        key_a.clone(),
+        temp.path().join("a-machine"),
+    );
+    // The client is another machine, so only its own operations move its floor.
+    let client_machine = temp.path().join("client-machine");
+    let client_view =
+        EncryptedRepository::new(FilesystemStorage::new(&remote), key_a, &client_machine);
     repository.initialize("owner").unwrap();
-    repository.pin_admin_state(&admin_pin).unwrap();
     commit(&source, "one\n", "one");
     repository
-        .push_ref(&source, "refs/heads/main", false)
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap();
-    repository.fetch_into(&client, "e2ee").unwrap();
+    client_view.fetch_into(&client, "e2ee").unwrap();
     let before_membership = fs::read_to_string(remote.join("HEAD")).unwrap();
 
     // The membership change keeps every ref, so the client already holds a
@@ -266,19 +327,18 @@ fn connected_membership_observation_pins_and_rejects_replay() {
             key_b.public_device().unwrap(),
             "device-4",
             DeviceRoles::collaborator(),
-            &admin_pin,
         )
         .unwrap();
-    let observed = repository.observe_manifest(&client).unwrap();
+    let observed = client_view.observe_manifest(&client).unwrap();
     assert_eq!(observed.generation, 2);
-    let state_path = state_dir(&client).join("state.json");
+    let state_path = client_machine.join(&root).join("continuity.json");
     let state: serde_json::Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
     assert_eq!(state["generation"], 2);
     assert_eq!(state["policy_generation"], 1);
     let after_membership = fs::read_to_string(remote.join("HEAD")).unwrap();
 
     fs::write(remote.join("HEAD"), &before_membership).unwrap();
-    let error = repository.observe_manifest(&client).unwrap_err();
+    let error = client_view.observe_manifest(&client).unwrap_err();
     assert!(format!("{error:#}").contains("rolled back"), "{error:#}");
     let state: serde_json::Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
     assert_eq!(state["generation"], 2);
@@ -286,9 +346,16 @@ fn connected_membership_observation_pins_and_rejects_replay() {
     fs::write(remote.join("HEAD"), after_membership).unwrap();
     commit(&source, "two\n", "two");
     repository
-        .push_ref(&source, "refs/heads/main", false)
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
         .unwrap();
-    repository.fetch_into(&client, "e2ee").unwrap();
+    client_view.fetch_into(&client, "e2ee").unwrap();
     assert_eq!(
         git(&client, &["show", "refs/remotes/e2ee/main:note.md"]),
         "two"
@@ -299,19 +366,20 @@ fn connected_membership_observation_pins_and_rejects_replay() {
 fn administrative_pin_rejects_policy_rollback() {
     let temp = tempfile::tempdir().unwrap();
     let remote = temp.path().join("remote");
-    let pin = temp.path().join("admin-state.json");
     let owner = KeyFile::generate();
     let first = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
     let second = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
-    let repository = EncryptedRepository::new(FilesystemStorage::new(&remote), owner);
+    let repository = EncryptedRepository::new(
+        FilesystemStorage::new(&remote),
+        owner,
+        temp.path().join("owner-machine"),
+    );
     let genesis = repository.initialize("owner").unwrap();
-    repository.pin_admin_state(&pin).unwrap();
     repository
         .add_device(
             first.public_device().unwrap(),
             "device-5",
             DeviceRoles::collaborator(),
-            &pin,
         )
         .unwrap();
 
@@ -321,8 +389,7 @@ fn administrative_pin_rejects_policy_rollback() {
             .add_device(
                 second.public_device().unwrap(),
                 "device-6",
-                DeviceRoles::collaborator(),
-                &pin,
+                DeviceRoles::collaborator()
             )
             .unwrap_err()
             .to_string()
@@ -337,27 +404,30 @@ fn non_admin_device_cannot_change_policy() {
     let key_a = KeyFile::generate();
     let key_b = KeyFile::generate_for_repository(key_a.repository_root.clone()).unwrap();
     let key_c = KeyFile::generate_for_repository(key_a.repository_root.clone()).unwrap();
-    let admin_pin = temp.path().join("a-admin-state.json");
-    let non_admin_pin = temp.path().join("b-admin-state.json");
-    let repo_a = EncryptedRepository::new(FilesystemStorage::new(&remote), key_a);
+    let repo_a = EncryptedRepository::new(
+        FilesystemStorage::new(&remote),
+        key_a,
+        temp.path().join("a-machine"),
+    );
     repo_a.initialize("owner").unwrap();
-    repo_a.pin_admin_state(&admin_pin).unwrap();
     repo_a
         .add_device(
             key_b.public_device().unwrap(),
             "device-7",
             DeviceRoles::collaborator(),
-            &admin_pin,
         )
         .unwrap();
-    let repo_b = EncryptedRepository::new(FilesystemStorage::new(&remote), key_b);
+    let repo_b = EncryptedRepository::new(
+        FilesystemStorage::new(&remote),
+        key_b,
+        temp.path().join("b-machine"),
+    );
     assert!(
         repo_b
             .add_device(
                 key_c.public_device().unwrap(),
                 "device-8",
-                DeviceRoles::collaborator(),
-                &non_admin_pin,
+                DeviceRoles::collaborator()
             )
             .unwrap_err()
             .to_string()
@@ -373,28 +443,32 @@ fn read_only_device_cannot_add_or_revoke_devices() {
     let reader_key = KeyFile::generate_for_repository(owner_key.repository_root.clone()).unwrap();
     let candidate_key =
         KeyFile::generate_for_repository(owner_key.repository_root.clone()).unwrap();
-    let admin_pin = temp.path().join("owner-admin-state.json");
-    let owner = EncryptedRepository::new(FilesystemStorage::new(&remote), owner_key);
+    let owner = EncryptedRepository::new(
+        FilesystemStorage::new(&remote),
+        owner_key,
+        temp.path().join("owner-machine"),
+    );
     owner.initialize("owner").unwrap();
-    owner.pin_admin_state(&admin_pin).unwrap();
     owner
         .add_device(
             reader_key.public_device().unwrap(),
             "device-9",
             DeviceRoles::reader(),
-            &admin_pin,
         )
         .unwrap();
 
-    let reader = EncryptedRepository::new(FilesystemStorage::new(&remote), reader_key.clone());
+    let reader = EncryptedRepository::new(
+        FilesystemStorage::new(&remote),
+        reader_key.clone(),
+        temp.path().join("reader-machine"),
+    );
     let before = snapshot_files(&remote);
     assert!(
         reader
             .add_device(
                 candidate_key.public_device().unwrap(),
                 "device-10",
-                DeviceRoles::collaborator(),
-                &admin_pin,
+                DeviceRoles::collaborator()
             )
             .unwrap_err()
             .to_string()
@@ -402,7 +476,7 @@ fn read_only_device_cannot_add_or_revoke_devices() {
     );
     assert!(
         reader
-            .revoke_device(&reader_key.device_id().unwrap(), &admin_pin)
+            .revoke_device(&reader_key.device_id().unwrap())
             .unwrap_err()
             .to_string()
             .contains("not an active administrator")

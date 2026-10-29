@@ -55,10 +55,11 @@ if [[ ${BENCH_SKIP_BUILD:-0} != 1 ]]; then
   cargo build --release --bins --manifest-path "$project_root/Cargo.toml"
 fi
 git_e2ee="$project_root/target/release/git-e2ee"
-[[ -x "$git_e2ee" ]] || {
-  echo "release binary not found: $git_e2ee" >&2
+[[ -x "$git_e2ee" && -x "$project_root/target/release/git-remote-e2ee" ]] || {
+  echo "release binaries not found under $project_root/target/release" >&2
   exit 1
 }
+export PATH="$project_root/target/release:$PATH"
 
 case $(uname -s) in
   Darwin) time_style=bsd ;;
@@ -134,19 +135,19 @@ git -C "$work/source" remote remove origin
 mkdir -p "$work/storage"
 "$git_e2ee" keygen --output "$work/repository.key.json" >/dev/null
 (cd "$work" && "$git_e2ee" init "e2ee::dir:$work/storage" --key "$work/repository.key.json" >/dev/null)
+git -C "$work/source" remote add private "e2ee::dir:$work/storage"
+git -C "$work/source" config remote.private.e2ee-key "$work/repository.key.json"
 
-run_phase initial_push "$git_e2ee" push \
-  --storage "$work/storage" --key "$work/repository.key.json" \
-  --repo "$work/source" --ref "$source_ref"
+run_phase initial_push git -C "$work/source" push --quiet private "$source_ref:$source_ref"
 storage_after_initial=$(storage_bytes)
 storage_logical_after_initial=$(tree_logical_bytes "$work/storage")
 pack_logical_after_initial=$(tree_logical_bytes "$work/storage/packs")
 initial_pack_files=$(find "$work/storage/packs" -type f | wc -l | tr -d ' ')
 
 git init -q "$work/destination"
-run_phase fresh_fetch "$git_e2ee" fetch \
-  --storage "$work/storage" --key "$work/repository.key.json" \
-  --repo "$work/destination" --remote-name benchmark
+git -C "$work/destination" remote add benchmark "e2ee::dir:$work/storage"
+git -C "$work/destination" config remote.benchmark.e2ee-key "$work/repository.key.json"
+run_phase fresh_fetch git -C "$work/destination" fetch --quiet benchmark
 run_phase verify "$git_e2ee" verify \
   "e2ee::dir:$work/storage" --key "$work/repository.key.json"
 
@@ -164,12 +165,8 @@ new_head=$(printf 'git-remote-e2ee benchmark increment\n' | \
     commit-tree "$tree" -p "$old_head")
 git -C "$work/source" update-ref "$source_ref" "$new_head" "$old_head"
 
-run_phase incremental_push "$git_e2ee" push \
-  --storage "$work/storage" --key "$work/repository.key.json" \
-  --repo "$work/source" --ref "$source_ref"
-run_phase returning_fetch "$git_e2ee" fetch \
-  --storage "$work/storage" --key "$work/repository.key.json" \
-  --repo "$work/destination" --remote-name benchmark
+run_phase incremental_push git -C "$work/source" push --quiet private "$source_ref:$source_ref"
+run_phase returning_fetch git -C "$work/destination" fetch --quiet benchmark
 
 destination_ref="refs/remotes/benchmark/$source_branch"
 [[ $(git -C "$work/destination" rev-parse "$destination_ref") == "$new_head" ]]
