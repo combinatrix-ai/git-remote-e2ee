@@ -15,13 +15,13 @@ use crate::crypto::{
     random_key, seal_pack_stream,
 };
 use crate::error::{
-    BudgetExhausted, ForeignRepository, MissingStorageHead, NotActiveReader, ObjectUnavailable,
-    Unsupported,
+    BudgetExhausted, ForeignRepository, InvalidState, MissingStorageHead, NotActiveReader,
+    ObjectUnavailable, Unsupported,
 };
 use crate::git;
 use crate::manifest::{
-    Manifest, ManifestAuthorization, ManifestHeader, PackDescriptor, open_manifest, pack_aad,
-    peek_manifest_header, seal_manifest, unwrap_generation_key, unwrap_predecessor_key,
+    Manifest, ManifestAuthorization, ManifestHeader, OpenedManifest, PackDescriptor, open_manifest,
+    pack_aad, peek_manifest_header, seal_manifest, unwrap_generation_key, unwrap_predecessor_key,
     verify_manifest, wrap_predecessor_key,
 };
 use crate::policy::{DeviceRecord, DeviceRoles, PolicyState};
@@ -966,9 +966,9 @@ impl<S: Storage> EncryptedRepository<S> {
                 &mut |id| self.read_manifest_material(id),
                 Some(&mut budget),
             ),
-            None if observation.head_bytes.is_some() => Err(anyhow::anyhow!(
+            None if observation.head_bytes.is_some() => Err(proven_invalid(anyhow::anyhow!(
                 "storage HEAD is not a valid manifest object ID"
-            )),
+            ))),
             None => Err(MissingStorageHead.into()),
         };
         match current_chain {
@@ -1126,9 +1126,11 @@ impl<S: Storage> EncryptedRepository<S> {
                         )));
                     };
                     if object_id(bytes) != id {
-                        bail!("historical manifest {id} content ID mismatch")
+                        return Err(proven_invalid(anyhow::anyhow!(
+                            "historical manifest {id} content ID mismatch"
+                        )));
                     }
-                    let header = peek_manifest_header(bytes)?;
+                    let header = peek_manifest_header(bytes).map_err(proven_invalid)?;
                     Ok((id.to_owned(), bytes.clone(), header))
                 }
             }
@@ -1139,6 +1141,9 @@ impl<S: Storage> EncryptedRepository<S> {
             Some(&mut budget),
         ) {
             Ok(chain) => chain,
+            Err(error) if error.is::<BudgetExhausted>() => {
+                return Err(error).context("bounded recovery discovery failed");
+            }
             Err(error) => {
                 report.blocked_reason = Some(format!(
                     "pinned floor is unavailable or cannot be authenticated: {error:#}"
@@ -1206,37 +1211,35 @@ impl<S: Storage> EncryptedRepository<S> {
                 if candidate_id == floor_id {
                     continue;
                 }
+                // Membership needs no key: a device added after genesis cannot
+                // open the heads that predate it, but they are in its floor chain.
+                if floor_chain.iter().any(|entry| entry.id == *candidate_id) {
+                    replay_ids.insert(candidate_id.clone());
+                    continue;
+                }
                 let candidate_chain = match self.chain_from(
                     candidate_id,
                     &mut |id| read_history_material(id),
                     Some(&mut budget),
                 ) {
                     Ok(chain) => chain,
-                    Err(error) => {
-                        let (class, _) = classify_recovery_error(&error);
-                        match class {
-                            RecoveryClass::Invalid => continue,
-                            RecoveryClass::Unverifiable
-                            | RecoveryClass::Unsupported
-                            | RecoveryClass::Unavailable => {
-                                report.blocked_reason = Some(format!(
-                                    "historical carrier head {candidate_id} is {}: {error:#}",
-                                    class.name()
-                                ));
-                                return Ok(report);
-                            }
-                            RecoveryClass::Discontinuous | RecoveryClass::Valid => continue,
-                        }
+                    Err(error) if error.is::<BudgetExhausted>() => {
+                        return Err(error).context("bounded recovery discovery failed");
                     }
+                    Err(error) => match classify_recovery_error(&error).0 {
+                        RecoveryClass::Invalid => continue,
+                        class => {
+                            report.blocked_reason = Some(format!(
+                                "historical carrier head {candidate_id} is {}: {error:#}",
+                                class.name()
+                            ));
+                            return Ok(report);
+                        }
+                    },
                 };
                 let candidate = candidate_chain
                     .first()
                     .context("validated candidate chain is empty")?;
-                let candidate_in_floor = floor_chain.iter().any(|entry| entry.id == *candidate_id);
-                if candidate.manifest.generation < floor_generation && candidate_in_floor {
-                    replay_ids.insert(candidate_id.clone());
-                    continue;
-                }
                 let floor_position = candidate_chain.iter().position(|entry| {
                     entry.id == floor_id && entry.manifest.generation == floor_generation
                 });
@@ -1522,17 +1525,21 @@ impl<S: Storage> EncryptedRepository<S> {
             budget.charge_manifest(&header, encrypted.len())?;
         }
         let mut generation_key = unwrap_generation_key(&header, &self.key)?;
-        let mut opened = open_manifest(&encrypted, &generation_key)?;
+        let mut opened = open_manifest(&encrypted, &generation_key).map_err(proven_invalid)?;
         let mut unverified = Vec::new();
         let mut seen = HashSet::new();
 
         loop {
             if !seen.insert(id.clone()) {
-                bail!("manifest chain contains a cycle")
+                return Err(proven_invalid(anyhow::anyhow!(
+                    "manifest chain contains a cycle"
+                )));
             }
             let Some(previous_id) = opened.manifest.previous.clone() else {
                 if opened.manifest.generation != 0 {
-                    bail!("manifest chain terminated above generation zero")
+                    return Err(proven_invalid(anyhow::anyhow!(
+                        "manifest chain terminated above generation zero"
+                    )));
                 }
                 unverified.push((id, opened, generation_key));
                 break;
@@ -1542,18 +1549,29 @@ impl<S: Storage> EncryptedRepository<S> {
                 budget.charge_manifest(&parent_header, parent_encrypted.len())?;
             }
             let parent_key =
-                unwrap_predecessor_key(&generation_key, &opened.manifest, &parent_header)?;
+                unwrap_predecessor_key(&generation_key, &opened.manifest, &parent_header)
+                    .map_err(proven_invalid)?;
             unverified.push((id, opened, generation_key));
             id = parent_id;
             encrypted = parent_encrypted;
             header = parent_header;
             generation_key = parent_key;
-            opened = open_manifest(&encrypted, &generation_key)?;
+            opened = open_manifest(&encrypted, &generation_key).map_err(proven_invalid)?;
             if opened.header != header {
-                bail!("predecessor manifest header changed while opening")
+                return Err(proven_invalid(anyhow::anyhow!(
+                    "predecessor manifest header changed while opening"
+                )));
             }
         }
+        self.verify_opened_chain(unverified).map_err(proven_invalid)
+    }
 
+    /// Authenticates opened manifests oldest first against their policies.
+    /// Every failure here is a property of authenticated bytes.
+    fn verify_opened_chain(
+        &self,
+        unverified: Vec<(String, OpenedManifest, SecretKey)>,
+    ) -> Result<Vec<OpenedState>> {
         let mut chain_oldest_first: Vec<OpenedState> = Vec::with_capacity(unverified.len());
         let mut seen_pack_ids = HashSet::new();
         for (index, (id, opened, generation_key)) in unverified.into_iter().rev().enumerate() {
@@ -1619,9 +1637,11 @@ impl<S: Storage> EncryptedRepository<S> {
     fn read_manifest_material(&self, id: &str) -> Result<(String, Vec<u8>, ManifestHeader)> {
         let bytes = self.storage.get_object(ObjectKind::Manifest, id)?;
         if object_id(&bytes) != id {
-            bail!("manifest ciphertext hash mismatch")
+            return Err(proven_invalid(anyhow::anyhow!(
+                "manifest ciphertext hash mismatch"
+            )));
         }
-        let header = peek_manifest_header(&bytes)?;
+        let header = peek_manifest_header(&bytes).map_err(proven_invalid)?;
         Ok((id.to_owned(), bytes, header))
     }
 
@@ -1762,10 +1782,22 @@ fn classify_recovery_error(error: &anyhow::Error) -> (RecoveryClass, String) {
                 .is_some_and(|source| source.kind() != io::ErrorKind::InvalidData)
     }) {
         RecoveryClass::Unavailable
-    } else {
+    } else if error.downcast_ref::<InvalidState>().is_some() {
         RecoveryClass::Invalid
+    } else {
+        RecoveryClass::Unverifiable
     };
     (class, format!("{error:#}"))
+}
+
+/// Marks a failure of authenticated content as proven invalid, unless the
+/// content is merely in a format this implementation does not support.
+fn proven_invalid(error: anyhow::Error) -> anyhow::Error {
+    if error.chain().any(|cause| cause.is::<Unsupported>()) {
+        error
+    } else {
+        error.context(InvalidState)
+    }
 }
 
 fn record_rejected_head(
@@ -2034,8 +2066,8 @@ mod tests {
     use std::io;
 
     use super::{
-        ClientState, ForeignRepository, MissingStorageHead, NotActiveReader, ObjectUnavailable,
-        RecoveryClass, Unsupported, classify_recovery_error, read_client_state,
+        ClientState, ForeignRepository, InvalidState, MissingStorageHead, NotActiveReader,
+        ObjectUnavailable, RecoveryClass, Unsupported, classify_recovery_error, read_client_state,
         testing_write_client_state,
     };
 
@@ -2149,15 +2181,16 @@ mod tests {
             "carrier object 00 is unavailable",
             "encrypted repository has no storage HEAD",
             "recovery manifest byte budget exhausted",
+            "authenticated repository state is invalid",
         ] {
             let (class, _) = classify_recovery_error(&anyhow::anyhow!(text.to_owned()));
-            assert_eq!(class, RecoveryClass::Invalid, "{text}");
+            assert_eq!(class, RecoveryClass::Unverifiable, "{text}");
         }
     }
 
     #[test]
     fn recovery_classification_follows_error_types_through_context() {
-        let cases: [(anyhow::Error, RecoveryClass); 6] = [
+        let cases: [(anyhow::Error, RecoveryClass); 9] = [
             (
                 Unsupported("manifest format 99".to_owned()).into(),
                 RecoveryClass::Unsupported,
@@ -2176,7 +2209,16 @@ mod tests {
             (MissingStorageHead.into(), RecoveryClass::Unavailable),
             (
                 io::Error::from(io::ErrorKind::InvalidData).into(),
+                RecoveryClass::Unverifiable,
+            ),
+            (InvalidState.into(), RecoveryClass::Invalid),
+            (
+                anyhow::anyhow!("manifest body digest mismatch").context(InvalidState),
                 RecoveryClass::Invalid,
+            ),
+            (
+                anyhow::Error::from(NotActiveReader).context(InvalidState),
+                RecoveryClass::Unverifiable,
             ),
         ];
         for (error, expected) in cases {

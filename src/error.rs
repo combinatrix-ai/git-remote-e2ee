@@ -41,3 +41,11 @@ pub struct ForeignRepository;
 #[derive(Debug, Error)]
 #[error("{0}")]
 pub struct BudgetExhausted(pub String);
+
+/// Authenticated content is proven bad: it fails decryption, a signature,
+/// a key commitment, or a content ID, or it is malformed or semantically
+/// invalid. Recovery classifies a head as invalid only through this type;
+/// every unrecognized failure blocks recovery.
+#[derive(Debug, Error)]
+#[error("authenticated repository state is invalid")]
+pub struct InvalidState;
