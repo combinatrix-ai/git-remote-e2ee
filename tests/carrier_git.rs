@@ -2396,7 +2396,7 @@ fn carrier_history_reads_skip_corrupt_copies_for_an_older_valid_one() {
 
     assert!(
         storage
-            .restore_historical_object(ObjectKind::Pack, &pack_id)
+            .restore_historical_object(ObjectKind::Pack, &pack_id, u64::MAX)
             .unwrap()
     );
     assert_eq!(
@@ -2405,8 +2405,75 @@ fn carrier_history_reads_skip_corrupt_copies_for_an_older_valid_one() {
     );
     assert!(
         !storage
-            .restore_historical_object(ObjectKind::Pack, &"0".repeat(64))
+            .restore_historical_object(ObjectKind::Pack, &"0".repeat(64), u64::MAX)
             .unwrap()
+    );
+}
+
+#[test]
+fn carrier_historical_restore_charges_rejected_copies_against_its_byte_budget() {
+    let temporary = tempfile::tempdir().unwrap();
+    let _cache = isolated_cache(&temporary);
+    let carrier = temporary.path().join("carrier.git");
+    let source = temporary.path().join("source");
+    init_source(&source, "content");
+
+    let owner = KeyFile::generate();
+    init_carrier(temporary.path(), &carrier, &owner);
+    let repository = EncryptedRepository::new(
+        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        owner.clone(),
+        support::state_dir(),
+    );
+    repository
+        .push(
+            &source,
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
+        .unwrap();
+    let (_, head) = repository.current_manifest().unwrap();
+    let pack_id = head.new_packs[0].id.clone();
+    let pack_bytes = GitStorage::open(carrier.to_str().unwrap())
+        .unwrap()
+        .get_object(ObjectKind::Pack, &pack_id)
+        .unwrap();
+    let corrupt = b"corrupt copy";
+    edit_carrier(
+        &carrier,
+        &temporary.path().join("carrier-edit"),
+        |workdir| {
+            let chunk = workdir
+                .join("packs")
+                .join(&pack_id[..2])
+                .join(&pack_id)
+                .join("00000000");
+            fs::write(chunk, corrupt).unwrap();
+        },
+    );
+
+    let needed = (corrupt.len() + pack_bytes.len()) as u64;
+    let storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let error = storage
+        .restore_historical_object(ObjectKind::Pack, &pack_id, needed - 1)
+        .unwrap_err();
+    assert!(
+        error
+            .downcast_ref::<git_remote_e2ee::error::BudgetExhausted>()
+            .is_some(),
+        "{error:#}"
+    );
+    assert!(
+        storage
+            .restore_historical_object(ObjectKind::Pack, &pack_id, needed)
+            .unwrap()
+    );
+    assert_eq!(
+        storage.get_object(ObjectKind::Pack, &pack_id).unwrap(),
+        pack_bytes
     );
 }
 
