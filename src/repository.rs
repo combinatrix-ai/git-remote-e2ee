@@ -23,7 +23,7 @@ use crate::manifest::{
     verify_manifest, wrap_predecessor_key,
 };
 use crate::policy::{DeviceRecord, DeviceRoles, PolicyState};
-use crate::storage::{HeadObservation, ObjectKind, Storage};
+use crate::storage::{HeadObservation, ObjectKind, Storage, StorageOccupied};
 use crate::trace;
 
 const MAX_RECOVERY_OUTER_COMMITS: usize = 2048;
@@ -55,6 +55,26 @@ impl PushRejection {
             Self::AlreadyExists(_) => "already exists",
         }
     }
+}
+
+/// Where [`EncryptedRepository::initialize`] stopped.
+#[derive(Debug, thiserror::Error)]
+pub enum InitializeError {
+    /// The genesis compare-and-swap was not attempted, or storage refused it
+    /// as [`StorageOccupied`] before writing. Storage has no head from this
+    /// call.
+    #[error(transparent)]
+    BeforePublication(anyhow::Error),
+    /// The genesis compare-and-swap returned an error. It may have landed.
+    #[error("storage may already be initialized: genesis publication reported an error")]
+    PublicationUncertain(#[source] anyhow::Error),
+    /// The genesis head is published. Pinning it on this machine failed.
+    #[error("storage is initialized with genesis {id}, but pinning it on this machine failed")]
+    AfterPublication {
+        id: String,
+        #[source]
+        error: anyhow::Error,
+    },
 }
 
 /// The device may read but not publish.
@@ -277,7 +297,32 @@ impl<S: Storage> EncryptedRepository<S> {
         }
     }
 
-    pub fn initialize(&self, owner_label: &str) -> Result<String> {
+    /// Publishes the genesis head and pins it on this machine. The error says
+    /// whether the genesis compare-and-swap was attempted, so a caller knows
+    /// whether a key it created for this call may still be discarded.
+    pub fn initialize(&self, owner_label: &str) -> Result<String, InitializeError> {
+        let (floor, genesis, id) = self
+            .prepare_genesis(owner_label)
+            .map_err(InitializeError::BeforePublication)?;
+        self.storage
+            .compare_and_swap_head(None, &id)
+            .map_err(|error| {
+                if error.downcast_ref::<StorageOccupied>().is_some() {
+                    InitializeError::BeforePublication(error)
+                } else {
+                    InitializeError::PublicationUncertain(error)
+                }
+            })?;
+        floor
+            .advance(ContinuityFloor::at(&id, &genesis))
+            .map_err(|error| InitializeError::AfterPublication {
+                id: id.clone(),
+                error,
+            })?;
+        Ok(id)
+    }
+
+    fn prepare_genesis(&self, owner_label: &str) -> Result<(FloorGuard, Manifest, String)> {
         let floor = self.lock_floor()?;
         if self.storage.read_head()?.is_some() {
             bail!("encrypted repository is already initialized")
@@ -291,7 +336,7 @@ impl<S: Storage> EncryptedRepository<S> {
         let (policy, policy_bytes) = PolicyState::genesis(&self.key, owner_label)?;
         let generation_key = random_key();
         let genesis = Manifest::genesis(self.key.repository_root.clone(), &policy, policy_bytes);
-        let id = self.commit_manifest(
+        let id = self.seal_and_store_manifest(
             None,
             &policy,
             None,
@@ -299,8 +344,7 @@ impl<S: Storage> EncryptedRepository<S> {
             ManifestAuthorization::PolicyTransition,
             genesis.clone(),
         )?;
-        floor.advance(ContinuityFloor::at(&id, &genesis))?;
-        Ok(id)
+        Ok((floor, genesis, id))
     }
 
     pub fn add_device(
@@ -1515,8 +1559,39 @@ impl<S: Storage> EncryptedRepository<S> {
         authorization: ManifestAuthorization,
         manifest: Manifest,
     ) -> Result<String> {
-        let manifest_timer = trace::Span::new("manifest_seal_and_self_verify");
-        match head.previous {
+        let id = self.seal_and_store_manifest(
+            head.previous,
+            policy,
+            parent_policy,
+            generation_key,
+            authorization,
+            manifest,
+        )?;
+        let cas_timer = trace::Span::new("manifest_compare_and_swap_publish");
+        if let Some(observation) = head.observation {
+            self.storage
+                .compare_and_swap_observed_head(observation, &id)?;
+        } else {
+            self.storage
+                .compare_and_swap_head(head.previous.map(|state| state.id.as_str()), &id)?;
+        }
+        drop(cas_timer);
+        Ok(id)
+    }
+
+    /// Seals `manifest`, stores it as an object, and checks that it opens.
+    /// No head moves.
+    fn seal_and_store_manifest(
+        &self,
+        previous: Option<&OpenedState>,
+        policy: &PolicyState,
+        parent_policy: Option<&PolicyState>,
+        generation_key: &[u8; 32],
+        authorization: ManifestAuthorization,
+        manifest: Manifest,
+    ) -> Result<String> {
+        let _manifest_timer = trace::Span::new("manifest_seal_and_self_verify");
+        match previous {
             Some(previous) => {
                 manifest.validate_successor(&previous.id, &previous.manifest, policy)?
             }
@@ -1535,7 +1610,7 @@ impl<S: Storage> EncryptedRepository<S> {
 
         let opened = open_manifest(&encrypted, generation_key)?;
         verify_manifest(&opened, policy, parent_policy, generation_key)?;
-        if let Some(previous) = head.previous {
+        if let Some(previous) = previous {
             let recovered =
                 unwrap_predecessor_key(generation_key, &opened.manifest, &previous.header)?;
             if *recovered != *previous.generation_key {
@@ -1545,16 +1620,6 @@ impl<S: Storage> EncryptedRepository<S> {
         if opened.header.generation != manifest.generation {
             bail!("new manifest self-check changed generation")
         }
-        drop(manifest_timer);
-        let cas_timer = trace::Span::new("manifest_compare_and_swap_publish");
-        if let Some(observation) = head.observation {
-            self.storage
-                .compare_and_swap_observed_head(observation, &id)?;
-        } else {
-            self.storage
-                .compare_and_swap_head(head.previous.map(|state| state.id.as_str()), &id)?;
-        }
-        drop(cas_timer);
         Ok(id)
     }
 }

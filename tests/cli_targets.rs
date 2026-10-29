@@ -191,3 +191,78 @@ fn unknown_or_plain_remote_names_are_rejected() {
     assert!(!plain.status.success());
     assert!(String::from_utf8_lossy(&plain.stderr).contains("not an e2ee:: remote"));
 }
+
+#[cfg(unix)]
+fn init_with_carrier_hook(sandbox: &Sandbox, hook: &str, body: &str) -> (String, String) {
+    use std::os::unix::fs::PermissionsExt;
+
+    sandbox.git(sandbox.path(), &["init", "-q", "--bare", "carrier.git"]);
+    let path = sandbox.path().join("carrier.git/hooks").join(hook);
+    fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    let url = format!("e2ee::{}", sandbox.path().join("carrier.git").display());
+    let output = sandbox.e2ee(sandbox.path(), &["init", &url]);
+    assert!(!output.status.success());
+    fs::remove_file(&path).unwrap();
+    (url, String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
+#[cfg(unix)]
+#[test]
+fn init_keeps_its_key_when_the_floor_fails_after_publication() {
+    let sandbox = Sandbox::new();
+    let state = sandbox.path().join("state/git-e2ee");
+    let (url, stderr) = init_with_carrier_hook(
+        &sandbox,
+        "post-receive",
+        &format!(
+            "for root in '{}'/*/; do mkdir \"${{root}}continuity.json\"; done",
+            state.display()
+        ),
+    );
+    let keys = sandbox.keys();
+    assert_eq!(
+        keys.len(),
+        1,
+        "the published owner key was deleted: {stderr}"
+    );
+    assert!(
+        stderr.contains(&*keys[0].to_string_lossy()),
+        "error must name the kept key: {stderr}"
+    );
+    assert!(stderr.contains("storage is initialized"), "{stderr}");
+
+    for root in fs::read_dir(&state).unwrap() {
+        fs::remove_dir(root.unwrap().path().join("continuity.json")).unwrap();
+    }
+    let key = keys[0].to_string_lossy().into_owned();
+    let verified = success(&sandbox.e2ee(sandbox.path(), &["verify", &url, "--key", &key]));
+    assert!(verified.contains("verified generation 0"), "{verified}");
+}
+
+#[cfg(unix)]
+#[test]
+fn init_keeps_its_key_when_genesis_publication_reports_an_error() {
+    let sandbox = Sandbox::new();
+    let (_, stderr) = init_with_carrier_hook(&sandbox, "pre-receive", "exit 1");
+    let keys = sandbox.keys();
+    assert_eq!(keys.len(), 1, "{stderr}");
+    assert!(stderr.contains(&*keys[0].to_string_lossy()), "{stderr}");
+    assert!(stderr.contains("may already be initialized"), "{stderr}");
+}
+
+#[test]
+fn init_refused_by_an_occupied_carrier_branch_removes_its_key() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repository("notes");
+    sandbox.git(sandbox.path(), &["init", "-q", "--bare", "carrier.git"]);
+    let carrier = sandbox.path().join("carrier.git");
+    sandbox.git(&repo, &["push", "-q", &carrier.to_string_lossy(), "main"]);
+    let url = format!("e2ee::{}", carrier.display());
+
+    let output = sandbox.e2ee(sandbox.path(), &["init", &url]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("already exists"), "{stderr}");
+    assert!(sandbox.keys().is_empty(), "{stderr}");
+}
