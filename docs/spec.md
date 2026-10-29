@@ -556,8 +556,8 @@ and an ordinary `git push` MUST NOT trigger it.
 Force pushes append a normal pack delta and new ref state. Like any other
 push, the delta excludes objects reachable from the parent's ref tips held
 locally, which every reader that accepted the parent already holds, so a force
-push uploads only the rewritten objects. Older packs remain in historical manifests and may
-become unreachable in the inner Git graph.
+push uploads only the rewritten objects. Older packs remain in historical
+manifests and may become unreachable in the inner Git graph.
 
 ## 10. Concurrency
 
