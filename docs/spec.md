@@ -1,8 +1,8 @@
 # Protocol specification
 
 > [!WARNING]
-> This document specifies the experimental v5 format implemented by the current
-> prototype. The format is incompatible with v2, v3, and v4. There is no
+> This document specifies the experimental v6 format implemented by the current
+> prototype. It does not read v5 or earlier repositories. There is no
 > automatic migration; keep an independent plaintext copy and every device key.
 
 ## 1. Requirements
@@ -55,7 +55,7 @@ prevent an authorized reader from exporting plaintext.
 
 ## 3. Cryptographic construction
 
-The v5 format uses:
+The v6 format uses:
 
 - Ed25519 signatures;
 - X25519/HKDF-SHA-256/ChaCha20-Poly1305 HPKE Base mode;
@@ -64,12 +64,17 @@ The v5 format uses:
 - XChaCha20-Poly1305 STREAM with a big-endian 32-bit counter for packs;
 - SHA-256 for content IDs and generation-key commitments.
 
-The domain strings are `git-remote-e2ee subkey derivation v5\0`,
-`git-remote-e2ee generation key commitment v5\0`,
-`git-remote-e2ee manifest v5\0`, and `git-remote-e2ee policy v6\0`.
+Every format marker carries the one format number, 6. The domain strings are
+`git-remote-e2ee subkey derivation v6\0`,
+`git-remote-e2ee generation key commitment v6\0`,
+`git-remote-e2ee manifest v6\0`, `git-remote-e2ee policy v6\0`,
+`git-remote-e2ee generation envelope v6\0`,
+`git-remote-e2ee manifest body v6\0`,
+`git-remote-e2ee predecessor link v6\0`, `git-remote-e2ee pack v6\0`, and
+`git-remote-e2ee pack stream v6\0`.
 `sign_domain` signs `domain || SHA-256(exact_bytes)` with Ed25519. Symmetric
 XChaCha20-Poly1305 envelopes are encoded as
-`E2EES05\0 || nonce_24 || ciphertext`. Subkey kind values are
+`E2EES06\0 || nonce_24 || ciphertext`. Subkey kind values are
 `manifest-body=1`, `pack=2`, `predecessor-link=3`, and `sealed-header=4`.
 
 Every successful publisher samples `K_t` independently from the operating
@@ -82,7 +87,7 @@ The publisher derives distinct subkeys using an injective, fixed-width context:
 ```text
 HKDF-SHA-256(
   input_key = K_t,
-  salt = protocol-specific v5 domain,
+  salt = "git-remote-e2ee subkey derivation v6\0",
   info = repository_root || generation_u64_le || kind_u8 || ordinal_u64_le
 )
 ```
@@ -92,20 +97,20 @@ The defined kinds are `manifest-body`, `pack`, `predecessor-link`, and
 predecessor-link, and sealed-header envelopes each carry a fresh random 24-byte
 nonce. Pack streams carry a fresh random 19-byte nonce prefix; the STREAM
 counter and final-segment marker complete the nonce. Associated data binds the
-v5 domain, repository root, generation, object kind, ordinal or parent manifest
+object's domain string, repository root, generation, object kind, ordinal or parent manifest
 ID as applicable, and the complete pack-stream header. Sealed-header AAD is the
 exact plaintext header bytes.
 
 The signed manifest header contains the full, untruncated commitment:
 
 ```text
-C_t = SHA-256("git-remote-e2ee generation key commitment v5\0" || K_t)
+C_t = SHA-256("git-remote-e2ee generation key commitment v6\0" || K_t)
 ```
 
 Generation envelopes use HPKE Base mode with info
-`git-remote-e2ee generation key v5`. Their AAD binds the repository root,
+`git-remote-e2ee generation key v6`. Their AAD binds the repository root,
 format version, generation, `C_t`, and recipient device ID. The recipient ID
-and AAD are not transmitted. AAD encoding is the v5 envelope domain string,
+and AAD are not transmitted. AAD encoding is the envelope domain string,
 then a little-endian `u32` length and bytes for repository root, format version
 as little-endian `u32`, generation as little-endian `u64`, then a length and
 bytes for the ASCII `C_t` and ASCII recipient device ID. Each real envelope uses an independent random
@@ -140,7 +145,7 @@ Consequences:
   compromise of a device private key that remains an active recipient.
 - A new reader given `K_t` can traverse to genesis and therefore always gets
   full history.
-- Future-only onboarding is not supported by v5 because the predecessor link is
+- Future-only onboarding is not supported because the predecessor link is
   available to every reader of the current generation.
 
 ## 5. Stored objects
@@ -219,7 +224,7 @@ policy ID and generation.
 
 Genesis has exactly one active owner with all three roles and is self-signed.
 Every child policy is signed by an administrator in its direct parent, never
-solely by authority introduced in the child. v5 supports threshold 1 and one
+solely by authority introduced in the child. The format supports threshold 1 and one
 signature; other thresholds fail closed. A future M-of-N format must count
 distinct parent administrators under the parent's threshold.
 
@@ -229,7 +234,7 @@ distinct parent administrators under the parent's threshold.
 
 The plaintext header contains only:
 
-- format version 5, repository root, generation, and exact previous manifest
+- format version 6, repository root, generation, and exact previous manifest
   ID;
 - `C_t`;
 - the generation-envelope list, with no recipient IDs;
@@ -270,7 +275,7 @@ re-serialized interpretation.
 After opening its own envelope, every verifier MUST validate the complete
 sealed audit. For each real entry it initializes `rand_chacha` 0.9.0
 `ChaCha20Rng` from the 32-byte seed, deterministically seals `K_t` to that
-device's HPKE public key using the v5 envelope AAD, and requires byte equality
+device's HPKE public key using the envelope AAD, and requires byte equality
 with the corresponding stored envelope. Real audit device IDs MUST equal the
 policy's active-reader set exactly: no missing, duplicate, extra, or revoked
 readers. Dummy entries MUST have no reader mapping. HPKE Base mode does not
@@ -294,7 +299,8 @@ direct-parent relationship before accepting the manifest.
 
 A pack descriptor contains ciphertext ID, plaintext size, creation generation,
 and a dense generation-local ordinal beginning at zero. Its subkey and AAD bind
-that generation and ordinal. Descriptor IDs must be unique within the delta and
+that generation and ordinal. Descriptor IDs must be unique across the whole
+authenticated chain, so a chain that repeats a pack ID is invalid, and
 plaintext size must be nonzero.
 
 The manifest chain is the append-only pack inventory. Manifests do not repeat
@@ -305,7 +311,7 @@ historical descriptors, avoiding quadratic cumulative-inventory metadata.
 Each pack is encoded as:
 
 ```text
-"E2EEPK5\0" || chunk_size_u32_le || nonce_prefix_19 || segments...
+"E2EEPK6\0" || chunk_size_u32_le || nonce_prefix_19 || segments...
 ```
 
 `chunk_size` MUST equal 1,048,576 bytes. Every non-final plaintext segment is
@@ -438,8 +444,9 @@ validates each hop, collects pack deltas, decrypts packs with their creation
 generation keys, and imports them oldest-first.
 
 A returning client traverses from `HEAD` to its pinned manifest, validates each
-new hop, and imports only unseen pack IDs. Imported pack IDs are local cache
-state, not an authorization source.
+new hop, and imports only the deltas of generations newer than its recorded
+import progress. Import progress is local cache state, not an authorization
+source.
 
 After importing the required deltas, the client MUST verify that every current
 ref resolves to a complete local Git object graph before moving remote-tracking
@@ -464,8 +471,7 @@ it. Holding the lock across validation and publication serializes processes
 on one machine.
 
 The floor records what storage has shown, not what a checkout has imported.
-Import progress (imported generation, imported pack IDs, and the verified
-frontier below) is kept per checkout and never substitutes for the floor. A
+Import progress (imported generation and the verified frontier below) is kept per checkout and never substitutes for the floor. A
 signed head whose packs are missing still advances the floor once it
 authenticates and descends from it; import progress stays where it was until
 a fetch succeeds.
@@ -636,7 +642,7 @@ work is linear in manifest generations until checkpoint compaction exists.
 - Compromise of an active device private key is stronger: the attacker can
   unwrap later generation keys while the device remains active.
 - Old immutable headers retain anonymous envelopes. Later device-key compromise
-  can retroactively expose every generation addressed to that device. v5 has no
+  can retroactively expose every generation addressed to that device. The format has no
   forward secrecy for stored history.
 - Full-history onboarding is mandatory; future-only access requires a new
   format or an explicit compartment.
@@ -650,12 +656,13 @@ work is linear in manifest generations until checkpoint compaction exists.
 
 ## 14. Migration and future work
 
-v5 is intentionally wire-incompatible with v2, v3, and v4. Migration must occur
-on a trusted client able to decrypt the older repository and republish under a
-new v5 repository boundary. Automatic migration is not implemented. The local key
-file remains format 3 because its stable repository/device identity material did
-not change; manifest, policy, signature, KDF, HPKE, and AEAD domains changed and
-therefore fail closed across wire versions.
+v6 is intentionally wire-incompatible with v5 and earlier and does not read
+them; it ships no migration. Moving a repository requires a trusted client able
+to decrypt the older repository and republish under a new v6 repository
+boundary. The local key file remains format 3 because its stable
+repository/device identity material did not change; the storage layout,
+manifest, policy, signature, KDF, HPKE, and AEAD domains all carry format 6 and
+therefore fail closed across format versions.
 
 Planned extensions:
 

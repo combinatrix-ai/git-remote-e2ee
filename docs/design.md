@@ -1,6 +1,6 @@
 # Design
 
-This document summarizes the implemented v5 architecture. [`spec.md`](spec.md)
+This document summarizes the implemented v6 architecture. [`spec.md`](spec.md)
 defines the protocol invariants and security claims in detail.
 
 ## Goal
@@ -96,7 +96,7 @@ Genesis contains exactly that active owner with reader, writer, and
 administrator roles and is self-signed. Child policies are authorized by an
 administrator in the parent policy.
 
-The format retains an administrator threshold and signature array, but v5
+The format retains an administrator threshold and signature array, but
 accepts threshold 1 and one signature only. Unsupported thresholds fail closed.
 
 ## Device operations
@@ -143,8 +143,7 @@ administrative CAS is never automatically rebased.
   existing object), so a floor that waited for fetch would never pin such a
   state.
 - Each checkout's import progress (`.git/git-remote-e2ee/<root>/progress.json`)
-  records the imported generation, imported pack IDs, and verified ref
-  frontier. It is a cache under its own lock, taken after the floor's, and is
+  records the imported generation and verified ref frontier. It is a cache under its own lock, taken after the floor's, and is
   never consulted for continuity.
 - The helper advertises `refs/heads/*` and `refs/tags/*`; every other ref
   namespace is rejected before publication.
@@ -414,16 +413,16 @@ bare Git repository to verify complete ref connectivity. The temporary
 repository is deleted when the command exits; the persistent carrier cache
 continues to contain ciphertext Git objects only.
 
-## Anonymous recipients (v5)
+## Anonymous recipients
 
-v4 let storage see each device's per-repository public keys, its roles, and
-every membership change. The reason was structural: envelopes carried a
-recipient device ID so a device could find its own, and verifiers compared
-that ID set with a plaintext policy. v5 removes that exposure so storage learns
+Storage does not see device public keys, roles, or membership changes. Format
+v4 exposed them for a structural reason: envelopes carried a recipient device
+ID so a device could find its own, and verifiers compared that ID set with a
+plaintext policy. The current design removes that exposure so storage learns
 only the padded reader count, the same class of leak as `gpg --throw-keyids` in
 git-remote-gcrypt.
 
-### What changes
+### How it works
 
 1. **Anonymous, padded envelopes.** The plaintext header carries a list of
    HPKE envelopes with no recipient ID. The list is padded with dummy
@@ -438,7 +437,7 @@ git-remote-gcrypt.
    knows its own ID, and the AAD is not transmitted.
 2. **Trial decryption, once per fetch.** A device tries its HPKE key against
    each envelope of the newest manifest until one opens and the result matches
-   `C_t`. Older generation keys come from the backward link chain as in v4, so
+   `C_t`. Older generation keys come from the backward link chain, so
    only the head generation costs trial decryption: O(padded reader count)
    X25519 operations per fetch, not per generation. The list length is capped
    (4096) to bound work on malicious input. If nothing opens, the client
@@ -453,11 +452,11 @@ git-remote-gcrypt.
    plaintext header keeps only the format version, repository root,
    generation, previous manifest ID, `C_t`, the envelope list, and the digests
    needed to locate and authenticate the sealed parts.
-4. **Policy inside the transition manifest.** v5 removes the separate
+4. **Policy inside the transition manifest.** There are no separate
    plaintext `policies/` objects. A policy travels inside the encrypted body of
    the manifest that introduces it: genesis, device add, revoke, or rotate.
    Later manifests reference it by policy ID inside their sealed header, and
-   readers reach it through the backward key chain. Storage can no longer tell
+   readers reach it through the backward key chain. Storage cannot tell
    a membership change from a content push, except by size.
 5. **Envelope audit.** Without visible recipient IDs, verifiers cannot compare
    an envelope ID set with the active-reader set, so a malicious writer could
@@ -481,14 +480,13 @@ encrypted, though size patterns can still suggest a transition.
 
 ### Costs and limits
 
-- Format break: v5 does not read v4 repositories and ships no migration, which
-  is acceptable for a prototype.
+- Format break: v6 does not read v5 or earlier repositories and ships no
+  migration, which is acceptable for a prototype.
 - For four or more active readers, padding adds fewer than 2x envelope metadata;
   one to three readers use the four-entry minimum.
 - A device that cannot open any envelope cannot tell revocation from
   corruption. Continuity pins still reject rollback for returning clients.
-- A reader can still see the complete policy after decryption, exactly as in
-  v4.
+- A reader can still see the complete policy after decryption.
 - The revocation race window, retroactive exposure on device-key compromise,
   and the absence of forward secrecy are unchanged.
 
@@ -505,6 +503,6 @@ large content storage   sum(pack ciphertext sizes), independent of N
 
 Envelope metadata remains linear in padded readers per generation. A policy
 transition also carries the signed policy history in its encrypted body. Fresh
-clone time is linear in generations until checkpoint compaction exists. The v5
+clone time is linear in generations until checkpoint compaction exists. The
 wire format reserves a checkpoint transition, but current clients reject it as
 unimplemented.
