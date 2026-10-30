@@ -19,3 +19,4 @@ jobs:
       - run: cargo test --all-targets
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo fmt --all -- --check
+      - run: for script in scripts/*.sh; do bash -n "$script"; done
