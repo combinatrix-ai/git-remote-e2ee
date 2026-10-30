@@ -387,7 +387,7 @@ fn carrier_git_supports_tags_and_ref_deletion() {
         key,
         support::state_dir(),
     )
-    .verify()
+    .verify_ciphertext()
     .unwrap();
     assert!(!manifest.refs.contains_key("refs/heads/doomed"));
     assert!(!manifest.refs.contains_key("refs/tags/v-carrier"));
@@ -461,7 +461,7 @@ fn carrier_git_allows_exactly_one_concurrent_writer() {
         key,
         support::state_dir(),
     );
-    let manifest = fresh.verify().unwrap();
+    let manifest = fresh.verify_ciphertext().unwrap();
     assert_eq!(manifest.generation, 1);
     assert_eq!(manifest.refs.len(), 1);
     assert_eq!(manifest.total_pack_count, 1);
@@ -546,7 +546,7 @@ fn stale_carrier_views_on_one_machine_refresh_instead_of_reporting_rollback() {
             update,
         )
         .unwrap();
-    let manifest = open().verify().unwrap();
+    let manifest = open().verify_ciphertext().unwrap();
     assert_eq!(manifest.generation, 2);
     assert!(manifest.refs.contains_key("refs/heads/main"));
     assert!(manifest.refs.contains_key("refs/heads/writer-b"));
@@ -959,7 +959,7 @@ fn carrier_git_detects_tampered_ciphertext_chunk() {
         key,
         support::state_dir(),
     );
-    let error = fresh.verify().unwrap_err();
+    let error = fresh.verify_ciphertext().unwrap_err();
     assert!(
         error.to_string().contains("invalid pack stream magic"),
         "unexpected verification error: {error:#}"
@@ -2174,7 +2174,7 @@ fn storage_failure_in_a_helper_push_batch_publishes_none_of_its_refs() {
         key,
         support::state_dir(),
     )
-    .verify()
+    .verify_ciphertext()
     .unwrap();
     assert_eq!(manifest.generation, 1);
     assert_eq!(

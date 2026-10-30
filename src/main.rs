@@ -294,7 +294,8 @@ fn main() -> Result<()> {
         Command::Verify { target, key } => {
             let target =
                 Target::resolve(&target, key, GitRepository::from_environment()?.as_ref())?;
-            let manifest = with_repository!(&target, |repository| repository.verify()?);
+            let manifest =
+                with_repository!(&target, |repository| repository.verify_ciphertext()?);
             println!(
                 "verified generation {} ({} refs, {} packs)",
                 manifest.generation,

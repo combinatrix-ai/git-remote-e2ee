@@ -15,8 +15,8 @@ use anyhow::Result;
 use base64::Engine;
 use git_remote_e2ee::crypto::{KeyFile, object_id, random_key};
 use git_remote_e2ee::manifest::{
-    Manifest, ManifestAuthorization, open_manifest, peek_manifest_header, seal_manifest,
-    unwrap_generation_key, verify_manifest, wrap_predecessor_key,
+    Manifest, ManifestAuthorization, PackDescriptor, open_manifest, peek_manifest_header,
+    seal_manifest, unwrap_generation_key, verify_manifest, wrap_predecessor_key,
 };
 use git_remote_e2ee::policy::{DeviceRoles, PolicyState};
 use git_remote_e2ee::repository::{
@@ -209,7 +209,7 @@ fn recovery_budget_exhaustion_inside_candidate_discovery_is_fatal() {
     let temporary = tempfile::tempdir().unwrap();
     let (key, storage, repo, floor, junk_id) = floor_with_malformed_head(temporary.path());
     let oversized = manifest_with_header(serde_json::json!({
-        "format_version": 5,
+        "format_version": git_remote_e2ee::FORMAT_VERSION,
         "repository_root": key.repository_root,
         "generation": 1,
         "previous": floor,
@@ -294,7 +294,7 @@ fn recover_refuses_a_head_with_a_future_manifest_schema() {
     let temporary = tempfile::tempdir().unwrap();
     let (key, storage, repo, floor, junk_id) = floor_with_malformed_head(temporary.path());
     let future = manifest_with_header(serde_json::json!({
-        "format_version": 6,
+        "format_version": git_remote_e2ee::FORMAT_VERSION + 1,
         "repository_root": key.repository_root,
         "generation": 1,
         "previous": floor,
@@ -459,7 +459,7 @@ fn shallow_push_is_rejected_before_publication_and_unshallow_recovers() {
         .unwrap_err();
     assert!(error.to_string().contains("shallow"), "{error:#}");
     assert_eq!(fs::read(storage.join("HEAD")).unwrap(), head_before);
-    assert!(encrypted.verify().unwrap().refs.is_empty());
+    assert!(encrypted.verify_ciphertext().unwrap().refs.is_empty());
     git(&shallow, &["fetch", "--unshallow"]);
     encrypted
         .push_ref(
@@ -513,7 +513,7 @@ fn pushes_incrementally_and_fetches_into_another_repository() {
             },
         )
         .unwrap();
-    let first_state = encrypted.verify().unwrap();
+    let first_state = encrypted.verify_ciphertext().unwrap();
     assert_eq!(first_state.generation, 1);
     assert_eq!(first_state.total_pack_count, 1);
 
@@ -528,7 +528,7 @@ fn pushes_incrementally_and_fetches_into_another_repository() {
             },
         )
         .unwrap();
-    let second_state = encrypted.verify().unwrap();
+    let second_state = encrypted.verify_ciphertext().unwrap();
     assert_eq!(second_state.generation, 2);
     assert_eq!(second_state.total_pack_count, 2);
     assert_eq!(second_state.refs["refs/heads/main"], second);
@@ -801,6 +801,101 @@ fn returning_client_rejects_signed_ref_advance_without_its_pack() {
 }
 
 #[test]
+fn returning_client_rejects_a_signed_chain_that_repeats_a_pack() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let destination = temporary.path().join("destination");
+    let remote = temporary.path().join("remote");
+    initialize_git(&source);
+    initialize_git(&destination);
+    let key = KeyFile::generate();
+    let repository = EncryptedRepository::new(
+        FilesystemStorage::new(&remote),
+        key.clone(),
+        support::state_dir(),
+    );
+    repository.initialize("owner").unwrap();
+    commit(&source, "valid\n", "valid");
+    repository
+        .push_ref(
+            &GitRepository::open(&source).unwrap(),
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
+        .unwrap();
+    repository
+        .fetch_into(&GitRepository::open(&destination).unwrap(), "e2ee")
+        .unwrap();
+
+    let head = fs::read_to_string(remote.join("HEAD"))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let manifest_bytes = read_stored_object(&remote, "manifests", &head);
+    let header = peek_manifest_header(&manifest_bytes).unwrap();
+    let (policy, _) = PolicyState::genesis(&key, "owner").unwrap();
+    let current_key = unwrap_generation_key(&header, &key).unwrap();
+    let current = open_manifest(&manifest_bytes, &current_key)
+        .unwrap()
+        .manifest()
+        .clone();
+    let reused = current.new_packs.first().unwrap().clone();
+
+    let next_key = random_key();
+    let generation = current.generation + 1;
+    let malicious = Manifest {
+        format_version: current.format_version,
+        repository_root: current.repository_root.clone(),
+        generation,
+        previous: Some(head.clone()),
+        policy_id: policy.id.clone(),
+        policy_generation: policy.body.generation,
+        authorization: ManifestAuthorization::Writer,
+        total_pack_count: current.total_pack_count + 1,
+        refs: current.refs.clone(),
+        new_packs: vec![PackDescriptor {
+            generation,
+            ordinal: 0,
+            ..reused.clone()
+        }],
+        predecessor_key_wrap: Some(
+            wrap_predecessor_key(
+                &next_key,
+                &current_key,
+                &current.repository_root,
+                generation,
+                &head,
+            )
+            .unwrap(),
+        ),
+        introduced_policy: None,
+    };
+    let malicious_bytes = seal_manifest(
+        &key,
+        &policy,
+        &next_key,
+        ManifestAuthorization::Writer,
+        malicious,
+    )
+    .unwrap();
+    let malicious_id = object_id(&malicious_bytes);
+    write_stored_object(&remote, "manifests", &malicious_id, &malicious_bytes);
+    fs::write(remote.join("HEAD"), format!("{malicious_id}\n")).unwrap();
+
+    let error = repository
+        .fetch_into(&GitRepository::open(&destination).unwrap(), "e2ee")
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains(&format!("manifest chain repeats pack {}", reused.id)),
+        "unexpected error: {error:#}"
+    );
+    assert_eq!(machine_floor(&destination)["generation"], 1);
+}
+
+#[test]
 fn missing_verified_frontier_tip_forces_full_reverification() {
     let temporary = tempfile::tempdir().unwrap();
     let source = temporary.path().join("source");
@@ -983,7 +1078,7 @@ fn rejects_non_fast_forward_update() {
         )
         .unwrap_err();
     assert!(error.to_string().contains("non-fast-forward"));
-    assert_eq!(encrypted.verify().unwrap().generation, 2);
+    assert_eq!(encrypted.verify_ciphertext().unwrap().generation, 2);
 }
 
 #[test]
@@ -1036,7 +1131,10 @@ fn explicit_force_can_publish_a_rollback() {
             },
         )
         .unwrap();
-    assert_eq!(encrypted.verify().unwrap().refs["refs/heads/main"], first);
+    assert_eq!(
+        encrypted.verify_ciphertext().unwrap().refs["refs/heads/main"],
+        first
+    );
 
     encrypted
         .fetch_into(&GitRepository::open(&destination).unwrap(), "encrypted")
@@ -1072,7 +1170,7 @@ fn detects_tampered_pack_ciphertext() {
             },
         )
         .unwrap();
-    let manifest = encrypted.verify().unwrap();
+    let manifest = encrypted.verify_ciphertext().unwrap();
     let id = &manifest.new_packs[0].id;
     let path = remote_path.join("packs").join(&id[..2]).join(id);
     let mut bytes = fs::read(&path).unwrap();
@@ -1080,7 +1178,7 @@ fn detects_tampered_pack_ciphertext() {
     bytes[last] ^= 1;
     fs::write(path, bytes).unwrap();
 
-    assert!(encrypted.verify().is_err());
+    assert!(encrypted.verify_ciphertext().is_err());
 }
 
 #[test]
@@ -1867,7 +1965,7 @@ fn deletion_and_tag_publication_race_with_exactly_one_cas_winner() {
         )
         .unwrap();
     git(&source, &["tag", "race-tag", &main]);
-    let before = seed_repository.verify().unwrap();
+    let before = seed_repository.verify_ciphertext().unwrap();
 
     let storage = BarrierStorage {
         inner: FilesystemStorage::new(&remote),
@@ -1916,7 +2014,7 @@ fn deletion_and_tag_publication_race_with_exactly_one_cas_winner() {
             .contains("head changed concurrently")
     );
 
-    let after = seed_repository.verify().unwrap();
+    let after = seed_repository.verify_ciphertext().unwrap();
     assert_eq!(after.generation, before.generation + 1);
     let deletion_won = !after.refs.contains_key("refs/heads/doomed");
     let tag_push_won = after.refs.contains_key("refs/tags/race-tag");
@@ -1953,7 +2051,7 @@ fn rejects_unsupported_ref_namespaces_consistently() {
         )
         .unwrap_err();
     assert!(error.to_string().contains("unsupported ref namespace"));
-    assert_eq!(encrypted.verify().unwrap().generation, 0);
+    assert_eq!(encrypted.verify_ciphertext().unwrap().generation, 0);
 }
 
 fn git_e2ee(workdir: &Path, args: &[impl AsRef<std::ffi::OsStr>]) -> std::process::Output {
@@ -2113,7 +2211,7 @@ fn directory_format_mismatch_names_the_found_format() {
         .unwrap();
 
     fs::write(remote_path.join("FORMAT"), "git-remote-e2ee storage 7\n").unwrap();
-    let error = format!("{:#}", encrypted.verify().unwrap_err());
+    let error = format!("{:#}", encrypted.verify_ciphertext().unwrap_err());
     assert!(
         error.contains(&format!(
             "storage at {} uses format 7; this git-remote-e2ee reads format 6",
@@ -2124,7 +2222,7 @@ fn directory_format_mismatch_names_the_found_format() {
     assert!(encrypted.initialize("owner").is_err());
 
     fs::remove_file(remote_path.join("FORMAT")).unwrap();
-    let error = format!("{:#}", encrypted.verify().unwrap_err());
+    let error = format!("{:#}", encrypted.verify_ciphertext().unwrap_err());
     assert!(
         error.contains("uses format 5 or earlier; this git-remote-e2ee reads format 6"),
         "{error}"
@@ -2225,7 +2323,7 @@ fn push_batch_that_loses_the_compare_and_swap_publishes_none_of_its_refs() {
         "{publication_error:#}"
     );
 
-    let manifest = setup.verify().unwrap();
+    let manifest = setup.verify_ciphertext().unwrap();
     assert_eq!(manifest.generation, 3, "only the competitor published");
     assert_eq!(
         manifest.refs.keys().collect::<Vec<_>>(),

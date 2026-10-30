@@ -246,7 +246,8 @@ pub enum ObjectKind {
 }
 
 /// The storage layout version this build reads and writes.
-const STORAGE_FORMAT: &[u8] = b"git-remote-e2ee storage 6\n";
+const STORAGE_FORMAT: &[u8] =
+    concat!("git-remote-e2ee storage ", format_version!(), "\n").as_bytes();
 const STORAGE_FORMAT_PREFIX: &str = "git-remote-e2ee storage ";
 const MAX_STORAGE_FORMAT_BYTES: u64 = 256;
 
@@ -285,7 +286,10 @@ fn check_storage_format(location: &str, format: Option<&[u8]>, head_present: boo
             }
         }
     };
-    bail!("storage at {location} uses format {found}; this git-remote-e2ee reads format 6")
+    bail!(
+        "storage at {location} uses format {found}; this git-remote-e2ee reads format {}",
+        crate::FORMAT_VERSION
+    )
 }
 
 /// Reads a small root file through the bounded opener.
