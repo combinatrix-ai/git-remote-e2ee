@@ -2729,6 +2729,7 @@ mod tests {
             location: "unused".to_owned(),
             remote: "unused".to_owned(),
             branch: "main".to_owned(),
+            format_4_branch: false,
             state: Mutex::new(GitStorageState { base_commit: None }),
         };
         let id = "ab".repeat(32);
