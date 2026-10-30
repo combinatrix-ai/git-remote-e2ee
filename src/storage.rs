@@ -14,7 +14,7 @@ use thiserror::Error;
 
 use crate::bounded::{self, Bounded, Opened};
 use crate::catfile::{BatchHeader, CatFile, GitObjectType};
-use crate::error::{BudgetExhausted, ObjectUnavailable};
+use crate::error::{BudgetExhausted, ObjectUnavailable, Unsupported};
 use crate::gitcmd::{self, GitRepository};
 use crate::refname;
 use crate::trace;
@@ -640,12 +640,18 @@ const CARRIER_ROOT_ENTRIES: [&str; 6] = [
 const MAX_RECOVERY_OUTER_COMMITS: usize = 2048;
 const CARRIER_COMMIT_MESSAGE: &str = "git-remote-e2ee storage update";
 const CARRIER_IDENTITY: (&str, &str) = ("git-remote-e2ee", "git-remote-e2ee@invalid");
+/// Format 4 kept its storage under `e2ee/` on this fixed branch.
+const FORMAT_4_BRANCH: &str = "git-remote-e2ee";
 
 pub struct GitStorage {
     checkout: tempfile::TempDir,
     location: String,
     remote: String,
     branch: String,
+    /// Set when the selected branch is absent but the remote still has a
+    /// format 4 branch, so reads and initialization stop instead of
+    /// starting a second storage beside it.
+    format_4_branch: bool,
     state: Mutex<GitStorageState>,
 }
 
@@ -966,6 +972,9 @@ impl GitStorage {
                 .context("create carrier checkout after rebuilding corrupt cache")?;
         }
         drop(checkout_timer);
+        let format_4_branch = base_commit.is_none()
+            && branch != FORMAT_4_BRANCH
+            && remote_has_branch(&cache.path, remote, FORMAT_4_BRANCH)?;
         drop(cache);
 
         Ok(Self {
@@ -973,6 +982,7 @@ impl GitStorage {
             location: location.to_owned(),
             remote: remote.to_owned(),
             branch: branch.to_owned(),
+            format_4_branch,
             state: Mutex::new(GitStorageState { base_commit }),
         })
     }
@@ -1015,6 +1025,27 @@ impl GitStorage {
             self.local_root_file("HEAD", MAX_HEAD_BYTES)?,
             Bounded::Absent
         );
+        if format.is_none() && !head_present {
+            if !matches!(
+                self.local_root_file("e2ee/HEAD", MAX_HEAD_BYTES)?,
+                Bounded::Absent
+            ) {
+                bail!(Unsupported(format!(
+                    "branch {} of {} holds format 4 storage; this git-remote-e2ee reads format {}",
+                    self.branch,
+                    self.remote,
+                    crate::FORMAT_VERSION
+                )))
+            }
+            if self.format_4_branch {
+                bail!(Unsupported(format!(
+                    "{remote} has no storage on branch {branch}, but its branch {FORMAT_4_BRANCH} holds format 4 storage; this git-remote-e2ee reads format {}. Migrate that storage to format {0} and delete the branch before using this remote",
+                    crate::FORMAT_VERSION,
+                    remote = self.remote,
+                    branch = self.branch,
+                )))
+            }
+        }
         check_storage_format(&self.location, format.as_deref(), head_present)
     }
 
@@ -2071,6 +2102,20 @@ fn fetch_carrier_branch(
     )))
 }
 
+fn remote_has_branch(cache: &Path, remote: &str, branch: &str) -> Result<bool> {
+    let output = cache_transport_output(
+        cache,
+        &[
+            "ls-remote",
+            "--heads",
+            remote,
+            &format!("refs/heads/{branch}"),
+        ],
+    )?;
+    ensure_git_success(&output, "git ls-remote carrier branches")?;
+    Ok(!output.stdout.is_empty())
+}
+
 fn create_carrier_checkout(
     checkout: &Path,
     cache: &Path,
@@ -2684,6 +2729,7 @@ mod tests {
             location: "unused".to_owned(),
             remote: "unused".to_owned(),
             branch: "main".to_owned(),
+            format_4_branch: false,
             state: Mutex::new(GitStorageState { base_commit: None }),
         };
         let id = "ab".repeat(32);

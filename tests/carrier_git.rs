@@ -1927,6 +1927,93 @@ fn carrier_branch_fragment_selects_the_branch_through_the_helper() {
     assert_eq!(names, ["refs/heads/vault"]);
 }
 
+/// A carrier as format 4 left it: storage under `e2ee/` on branch
+/// `git-remote-e2ee`, nothing on `main`.
+fn format_4_carrier(temporary: &tempfile::TempDir) -> std::path::PathBuf {
+    let carrier = temporary.path().join("format-4.git");
+    git(
+        temporary.path(),
+        &["init", "--bare", "-q", carrier.to_str().unwrap()],
+        false,
+    );
+    let writer = temporary.path().join("format-4-writer");
+    init_source(&writer, "unused");
+    git(
+        &writer,
+        &["checkout", "-q", "--orphan", "git-remote-e2ee"],
+        false,
+    );
+    git(&writer, &["rm", "-q", "-r", "--cached", "."], false);
+    fs::create_dir_all(writer.join("e2ee")).unwrap();
+    fs::write(writer.join("e2ee/HEAD"), format!("{}\n", "a".repeat(64))).unwrap();
+    git(&writer, &["add", "e2ee/HEAD"], false);
+    git(&writer, &["commit", "-q", "-m", "format 4 storage"], false);
+    git(
+        &writer,
+        &[
+            "push",
+            "-q",
+            carrier.to_str().unwrap(),
+            "git-remote-e2ee:refs/heads/git-remote-e2ee",
+        ],
+        false,
+    );
+    carrier
+}
+
+#[test]
+fn format_4_carrier_is_reported_and_blocks_a_second_storage_beside_it() {
+    let temporary = tempfile::tempdir().unwrap();
+    let _cache = isolated_cache(&temporary);
+    let carrier = format_4_carrier(&temporary);
+    let refs_before = carrier_refs(&carrier);
+    let key = KeyFile::generate();
+
+    let refused = EncryptedRepository::new(
+        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        key.clone(),
+        support::state_dir(),
+    )
+    .initialize("owner")
+    .unwrap_err();
+    assert!(
+        format!("{refused:#}").contains(&format!(
+            "{} has no storage on branch main, but its branch git-remote-e2ee holds format 4 storage",
+            carrier.display()
+        )),
+        "{refused:#}"
+    );
+    assert_eq!(carrier_refs(&carrier), refs_before);
+
+    let read = EncryptedRepository::new(
+        GitStorage::open(&format!("{}#git-remote-e2ee", carrier.display())).unwrap(),
+        key.clone(),
+        support::state_dir(),
+    )
+    .current_manifest()
+    .unwrap_err();
+    assert!(
+        format!("{read:#}").contains(&format!(
+            "branch git-remote-e2ee of {} holds format 4 storage",
+            carrier.display()
+        )),
+        "{read:#}"
+    );
+
+    git(
+        &carrier,
+        &["update-ref", "-d", "refs/heads/git-remote-e2ee"],
+        false,
+    );
+    EncryptedRepository::new(
+        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        key,
+        support::state_dir(),
+    )
+    .initialize("owner")
+    .unwrap();
+}
+
 #[test]
 fn carrier_init_refuses_an_existing_branch_and_another_branch_works() {
     let temporary = tempfile::tempdir().unwrap();
