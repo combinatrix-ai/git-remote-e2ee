@@ -237,7 +237,7 @@ fn revoked_reader_cannot_reach_later_history_but_keeps_prior_snapshot() {
         push_error.contains("not an active reader"),
         "unexpected push error: {push_error}"
     );
-    assert!(repo_b.verify().is_err());
+    assert!(repo_b.verify_ciphertext().is_err());
 
     let snapshot_destination = temp.path().join("snapshot-destination");
     initialize_git(&snapshot_destination);
@@ -285,7 +285,7 @@ fn revoked_reader_cannot_reach_later_history_but_keeps_prior_snapshot() {
     let manifest = repo_c
         .fetch_into(&GitRepository::open(&destination).unwrap(), "e2ee")
         .unwrap();
-    repo_c.verify().unwrap();
+    repo_c.verify_ciphertext().unwrap();
     assert_eq!(manifest.total_pack_count, 3);
     assert_eq!(
         git(&destination, &["show", "refs/remotes/e2ee/main:note.md"]),

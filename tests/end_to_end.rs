@@ -459,7 +459,7 @@ fn shallow_push_is_rejected_before_publication_and_unshallow_recovers() {
         .unwrap_err();
     assert!(error.to_string().contains("shallow"), "{error:#}");
     assert_eq!(fs::read(storage.join("HEAD")).unwrap(), head_before);
-    assert!(encrypted.verify().unwrap().refs.is_empty());
+    assert!(encrypted.verify_ciphertext().unwrap().refs.is_empty());
     git(&shallow, &["fetch", "--unshallow"]);
     encrypted
         .push_ref(
@@ -513,7 +513,7 @@ fn pushes_incrementally_and_fetches_into_another_repository() {
             },
         )
         .unwrap();
-    let first_state = encrypted.verify().unwrap();
+    let first_state = encrypted.verify_ciphertext().unwrap();
     assert_eq!(first_state.generation, 1);
     assert_eq!(first_state.total_pack_count, 1);
 
@@ -528,7 +528,7 @@ fn pushes_incrementally_and_fetches_into_another_repository() {
             },
         )
         .unwrap();
-    let second_state = encrypted.verify().unwrap();
+    let second_state = encrypted.verify_ciphertext().unwrap();
     assert_eq!(second_state.generation, 2);
     assert_eq!(second_state.total_pack_count, 2);
     assert_eq!(second_state.refs["refs/heads/main"], second);
@@ -1078,7 +1078,7 @@ fn rejects_non_fast_forward_update() {
         )
         .unwrap_err();
     assert!(error.to_string().contains("non-fast-forward"));
-    assert_eq!(encrypted.verify().unwrap().generation, 2);
+    assert_eq!(encrypted.verify_ciphertext().unwrap().generation, 2);
 }
 
 #[test]
@@ -1131,7 +1131,10 @@ fn explicit_force_can_publish_a_rollback() {
             },
         )
         .unwrap();
-    assert_eq!(encrypted.verify().unwrap().refs["refs/heads/main"], first);
+    assert_eq!(
+        encrypted.verify_ciphertext().unwrap().refs["refs/heads/main"],
+        first
+    );
 
     encrypted
         .fetch_into(&GitRepository::open(&destination).unwrap(), "encrypted")
@@ -1167,7 +1170,7 @@ fn detects_tampered_pack_ciphertext() {
             },
         )
         .unwrap();
-    let manifest = encrypted.verify().unwrap();
+    let manifest = encrypted.verify_ciphertext().unwrap();
     let id = &manifest.new_packs[0].id;
     let path = remote_path.join("packs").join(&id[..2]).join(id);
     let mut bytes = fs::read(&path).unwrap();
@@ -1175,7 +1178,7 @@ fn detects_tampered_pack_ciphertext() {
     bytes[last] ^= 1;
     fs::write(path, bytes).unwrap();
 
-    assert!(encrypted.verify().is_err());
+    assert!(encrypted.verify_ciphertext().is_err());
 }
 
 #[test]
@@ -1962,7 +1965,7 @@ fn deletion_and_tag_publication_race_with_exactly_one_cas_winner() {
         )
         .unwrap();
     git(&source, &["tag", "race-tag", &main]);
-    let before = seed_repository.verify().unwrap();
+    let before = seed_repository.verify_ciphertext().unwrap();
 
     let storage = BarrierStorage {
         inner: FilesystemStorage::new(&remote),
@@ -2011,7 +2014,7 @@ fn deletion_and_tag_publication_race_with_exactly_one_cas_winner() {
             .contains("head changed concurrently")
     );
 
-    let after = seed_repository.verify().unwrap();
+    let after = seed_repository.verify_ciphertext().unwrap();
     assert_eq!(after.generation, before.generation + 1);
     let deletion_won = !after.refs.contains_key("refs/heads/doomed");
     let tag_push_won = after.refs.contains_key("refs/tags/race-tag");
@@ -2048,7 +2051,7 @@ fn rejects_unsupported_ref_namespaces_consistently() {
         )
         .unwrap_err();
     assert!(error.to_string().contains("unsupported ref namespace"));
-    assert_eq!(encrypted.verify().unwrap().generation, 0);
+    assert_eq!(encrypted.verify_ciphertext().unwrap().generation, 0);
 }
 
 fn git_e2ee(workdir: &Path, args: &[impl AsRef<std::ffi::OsStr>]) -> std::process::Output {
@@ -2208,7 +2211,7 @@ fn directory_format_mismatch_names_the_found_format() {
         .unwrap();
 
     fs::write(remote_path.join("FORMAT"), "git-remote-e2ee storage 7\n").unwrap();
-    let error = format!("{:#}", encrypted.verify().unwrap_err());
+    let error = format!("{:#}", encrypted.verify_ciphertext().unwrap_err());
     assert!(
         error.contains(&format!(
             "storage at {} uses format 7; this git-remote-e2ee reads format 6",
@@ -2219,7 +2222,7 @@ fn directory_format_mismatch_names_the_found_format() {
     assert!(encrypted.initialize("owner").is_err());
 
     fs::remove_file(remote_path.join("FORMAT")).unwrap();
-    let error = format!("{:#}", encrypted.verify().unwrap_err());
+    let error = format!("{:#}", encrypted.verify_ciphertext().unwrap_err());
     assert!(
         error.contains("uses format 5 or earlier; this git-remote-e2ee reads format 6"),
         "{error}"
@@ -2320,7 +2323,7 @@ fn push_batch_that_loses_the_compare_and_swap_publishes_none_of_its_refs() {
         "{publication_error:#}"
     );
 
-    let manifest = setup.verify().unwrap();
+    let manifest = setup.verify_ciphertext().unwrap();
     assert_eq!(manifest.generation, 3, "only the competitor published");
     assert_eq!(
         manifest.refs.keys().collect::<Vec<_>>(),

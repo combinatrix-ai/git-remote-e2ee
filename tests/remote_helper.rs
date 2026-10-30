@@ -290,7 +290,7 @@ fn native_git_dry_run_batch_does_not_mutate_remote() {
         &["push", "--dry-run", "private", "main", "feature", "v1"],
         true,
     );
-    let manifest = encrypted.verify().unwrap();
+    let manifest = encrypted.verify_ciphertext().unwrap();
     assert_eq!(manifest.generation, 0);
     assert!(manifest.refs.is_empty());
 }
@@ -734,7 +734,7 @@ fn native_git_push_of_many_refs_publishes_one_generation() {
         true,
     );
 
-    let manifest = helper.encrypted.verify().unwrap();
+    let manifest = helper.encrypted.verify_ciphertext().unwrap();
     assert_eq!(manifest.generation, 1);
     assert_eq!(manifest.total_pack_count, 1);
     assert_eq!(manifest.refs.len(), 5, "{:?}", manifest.refs);
@@ -768,7 +768,7 @@ fn helper_push_batch_reports_rejected_refs_and_publishes_the_rest_once() {
     commit_file(source, "note.md", b"first\n", "first");
     git(source, &["tag", "v1"], false);
     git(source, &["push", "-q", "private", "main", "v1"], true);
-    let parent = helper.encrypted.verify().unwrap();
+    let parent = helper.encrypted.verify_ciphertext().unwrap();
 
     git(
         source,
@@ -807,7 +807,7 @@ fn helper_push_batch_reports_rejected_refs_and_publishes_the_rest_once() {
          ok refs/heads/topic\n\n"
     );
 
-    let manifest = helper.encrypted.verify().unwrap();
+    let manifest = helper.encrypted.verify_ciphertext().unwrap();
     assert_eq!(manifest.generation, parent.generation + 1);
     let mut expected = parent.refs.clone();
     expected.insert(
@@ -835,13 +835,13 @@ fn native_git_force_push_packs_only_the_rewritten_commits() {
         commit_file(source, &format!("blob-{index}"), &blob, "history");
     }
     git(source, &["push", "-q", "private", "main"], true);
-    let history_pack = helper.encrypted.verify().unwrap().new_packs[0].plaintext_size;
+    let history_pack = helper.encrypted.verify_ciphertext().unwrap().new_packs[0].plaintext_size;
 
     git(source, &["reset", "-q", "--hard", "HEAD~1"], false);
     let forced = commit_file(source, "note.md", b"rewritten\n", "rewritten");
     git(source, &["push", "-q", "--force", "private", "main"], true);
 
-    let manifest = helper.encrypted.verify().unwrap();
+    let manifest = helper.encrypted.verify_ciphertext().unwrap();
     assert_eq!(manifest.generation, 2);
     let forced_pack = manifest.new_packs[0].plaintext_size;
     assert!(

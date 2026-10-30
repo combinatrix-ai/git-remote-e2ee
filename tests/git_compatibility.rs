@@ -179,7 +179,7 @@ fn upstream_style_push_refspecs_and_force_work() {
         key.clone(),
         support::state_dir(),
     );
-    let manifest = repository.verify().unwrap();
+    let manifest = repository.verify_ciphertext().unwrap();
     for reference in ["named", "renamed", "from-head"] {
         assert_eq!(manifest.refs[&format!("refs/heads/{reference}")], named);
     }
@@ -188,11 +188,14 @@ fn upstream_style_push_refspecs_and_force_work() {
     let rewritten = commit_file(&source, "rewritten", "replacement");
     let rejected = git_output(&source, &["push", "private", "named"], true);
     assert!(!rejected.status.success());
-    assert_eq!(repository.verify().unwrap().refs["refs/heads/named"], named);
+    assert_eq!(
+        repository.verify_ciphertext().unwrap().refs["refs/heads/named"],
+        named
+    );
 
     git(&source, &["push", "--force", "private", "named"], true);
     assert_eq!(
-        repository.verify().unwrap().refs["refs/heads/named"],
+        repository.verify_ciphertext().unwrap().refs["refs/heads/named"],
         rewritten
     );
 }
@@ -270,7 +273,7 @@ fn lightweight_annotated_and_followed_tags_round_trip_through_helper() {
 
     let repository =
         EncryptedRepository::new(FilesystemStorage::new(&storage), key, support::state_dir());
-    let manifest = repository.verify().unwrap();
+    let manifest = repository.verify_ciphertext().unwrap();
     assert_eq!(manifest.refs["refs/tags/v1.0"], first);
     assert_eq!(
         manifest.refs["refs/tags/v1.1"],
@@ -318,7 +321,7 @@ fn moving_an_existing_tag_requires_force() {
     git(&source, &["tag", "-f", "v1.0", &second], false);
     let repository =
         EncryptedRepository::new(FilesystemStorage::new(&storage), key, support::state_dir());
-    let before = repository.verify().unwrap();
+    let before = repository.verify_ciphertext().unwrap();
     let rejected = git_output(&source, &["push", "private", "v1.0"], true);
     assert!(!rejected.status.success());
     let message = format!(
@@ -327,12 +330,15 @@ fn moving_an_existing_tag_requires_force() {
         String::from_utf8_lossy(&rejected.stderr)
     );
     assert!(message.contains("already exists"), "{message}");
-    let after_rejection = repository.verify().unwrap();
+    let after_rejection = repository.verify_ciphertext().unwrap();
     assert_eq!(after_rejection.generation, before.generation);
     assert_eq!(after_rejection.refs["refs/tags/v1.0"], first);
 
     git(&source, &["push", "--force", "private", "v1.0"], true);
-    assert_eq!(repository.verify().unwrap().refs["refs/tags/v1.0"], second);
+    assert_eq!(
+        repository.verify_ciphertext().unwrap().refs["refs/tags/v1.0"],
+        second
+    );
 }
 
 #[test]
@@ -353,7 +359,7 @@ fn deletions_publish_without_packs_and_prune_on_returning_and_fresh_clones() {
 
     let repository =
         EncryptedRepository::new(FilesystemStorage::new(&storage), key, support::state_dir());
-    let before = repository.verify().unwrap();
+    let before = repository.verify_ciphertext().unwrap();
     let default_delete = git_output(&source, &["push", "--delete", "private", "main"], true);
     assert!(!default_delete.status.success());
     let default_error = format!(
@@ -365,10 +371,13 @@ fn deletions_publish_without_packs_and_prune_on_returning_and_fresh_clones() {
         default_error.contains("remote default branch"),
         "{default_error}"
     );
-    assert_eq!(repository.verify().unwrap().generation, before.generation);
+    assert_eq!(
+        repository.verify_ciphertext().unwrap().generation,
+        before.generation
+    );
 
     git(&source, &["push", "--delete", "private", "doomed"], true);
-    let after_branch_delete = repository.verify().unwrap();
+    let after_branch_delete = repository.verify_ciphertext().unwrap();
     assert!(!after_branch_delete.refs.contains_key("refs/heads/doomed"));
     assert_eq!(
         after_branch_delete.total_pack_count,
@@ -376,7 +385,7 @@ fn deletions_publish_without_packs_and_prune_on_returning_and_fresh_clones() {
     );
 
     git(&source, &["push", "private", ":refs/tags/v-delete"], true);
-    let after_tag_delete = repository.verify().unwrap();
+    let after_tag_delete = repository.verify_ciphertext().unwrap();
     assert!(!after_tag_delete.refs.contains_key("refs/tags/v-delete"));
     assert_eq!(after_tag_delete.total_pack_count, before.total_pack_count);
 
@@ -440,11 +449,11 @@ fn unsupported_upstream_operations_fail_without_publication() {
 
     let repository =
         EncryptedRepository::new(FilesystemStorage::new(&storage), key, support::state_dir());
-    let generation = repository.verify().unwrap().generation;
+    let generation = repository.verify_ciphertext().unwrap().generation;
 
     let delete = git_output(&source, &["push", "private", ":main"], true);
     assert!(!delete.status.success());
-    let after_delete = repository.verify().unwrap();
+    let after_delete = repository.verify_ciphertext().unwrap();
     assert_eq!(after_delete.generation, generation);
     assert_eq!(after_delete.refs["refs/heads/main"], head);
 
@@ -460,7 +469,7 @@ fn unsupported_upstream_operations_fail_without_publication() {
         String::from_utf8_lossy(&namespace.stderr)
     );
     assert!(message.contains("unsupported ref namespace"), "{message}");
-    let after_namespace = repository.verify().unwrap();
+    let after_namespace = repository.verify_ciphertext().unwrap();
     assert_eq!(after_namespace.generation, generation);
     assert!(!after_namespace.refs.contains_key("refs/notes/review"));
 }
@@ -544,7 +553,7 @@ fn stale_push_is_reported_as_an_ordinary_git_rejection() {
     let repository =
         EncryptedRepository::new(FilesystemStorage::new(&storage), key, support::state_dir());
     assert_eq!(
-        repository.verify().unwrap().refs["refs/heads/main"],
+        repository.verify_ciphertext().unwrap().refs["refs/heads/main"],
         published
     );
 }

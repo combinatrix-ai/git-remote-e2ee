@@ -731,28 +731,9 @@ impl<S: Storage> EncryptedRepository<S> {
                 continue;
             }
             for descriptor in &entry.manifest.new_packs {
-                let encrypted = self.storage.open_object(ObjectKind::Pack, &descriptor.id)?;
-                let pack_key = derive_subkey(
-                    &entry.generation_key,
-                    &entry.manifest.repository_root,
-                    descriptor.generation,
-                    SubkeyKind::Pack,
-                    descriptor.ordinal,
-                )?;
                 let mut importer = git::start_pack_import(repo)?;
                 let decrypt_timer = trace::Span::new("pack_decrypt_to_index_pack");
-                open_pack_stream(
-                    &pack_key,
-                    encrypted,
-                    &mut importer,
-                    &pack_aad(
-                        &entry.manifest.repository_root,
-                        descriptor.generation,
-                        descriptor.ordinal,
-                    ),
-                    descriptor.plaintext_size,
-                    &descriptor.id,
-                )?;
+                self.open_chain_pack(entry, descriptor, &mut importer)?;
                 drop(decrypt_timer);
                 importer.finish()?;
             }
@@ -760,35 +741,49 @@ impl<S: Storage> EncryptedRepository<S> {
         Ok(())
     }
 
-    /// Checks the whole manifest chain against the machine floor and opens
-    /// every pack.
-    pub fn verify(&self) -> Result<Manifest> {
+    /// Decrypts one pack of an authenticated chain entry into `plaintext`.
+    /// Success proves the ciphertext is the one the manifest names; only Git
+    /// can say whether the plaintext is a valid pack.
+    fn open_chain_pack(
+        &self,
+        entry: &OpenedState,
+        descriptor: &PackDescriptor,
+        plaintext: impl io::Write,
+    ) -> Result<()> {
+        let encrypted = self.storage.open_object(ObjectKind::Pack, &descriptor.id)?;
+        let pack_key = derive_subkey(
+            &entry.generation_key,
+            &entry.manifest.repository_root,
+            descriptor.generation,
+            SubkeyKind::Pack,
+            descriptor.ordinal,
+        )?;
+        open_pack_stream(
+            &pack_key,
+            encrypted,
+            plaintext,
+            &pack_aad(
+                &entry.manifest.repository_root,
+                descriptor.generation,
+                descriptor.ordinal,
+            ),
+            descriptor.plaintext_size,
+            &descriptor.id,
+        )?;
+        Ok(())
+    }
+
+    /// Checks the whole manifest chain against the machine floor and
+    /// authenticates every pack's ciphertext. It never hands plaintext to
+    /// Git, so it does not prove the packs are valid Git packs.
+    pub fn verify_ciphertext(&self) -> Result<Manifest> {
         let floor = self.lock_floor()?;
         let chain = self.pinned_chain(&floor)?;
         let current = chain.first().context("manifest chain is empty")?;
         let mut count = 0_u64;
         for entry in chain.iter().rev() {
-            for pack in &entry.manifest.new_packs {
-                let encrypted = self.storage.open_object(ObjectKind::Pack, &pack.id)?;
-                let pack_key = derive_subkey(
-                    &entry.generation_key,
-                    &entry.manifest.repository_root,
-                    pack.generation,
-                    SubkeyKind::Pack,
-                    pack.ordinal,
-                )?;
-                open_pack_stream(
-                    &pack_key,
-                    encrypted,
-                    io::sink(),
-                    &pack_aad(
-                        &entry.manifest.repository_root,
-                        pack.generation,
-                        pack.ordinal,
-                    ),
-                    pack.plaintext_size,
-                    &pack.id,
-                )?;
+            for descriptor in &entry.manifest.new_packs {
+                self.open_chain_pack(entry, descriptor, io::sink())?;
                 count += 1;
             }
         }
@@ -1321,27 +1316,8 @@ impl<S: Storage> EncryptedRepository<S> {
         let scratch = GitRepository::owned_git_dir(temporary.path());
         for entry in chain.iter().rev() {
             for descriptor in &entry.manifest.new_packs {
-                let encrypted = self.storage.open_object(ObjectKind::Pack, &descriptor.id)?;
-                let pack_key = derive_subkey(
-                    &entry.generation_key,
-                    &entry.manifest.repository_root,
-                    descriptor.generation,
-                    SubkeyKind::Pack,
-                    descriptor.ordinal,
-                )?;
                 let mut importer = git::start_pack_import(&scratch)?;
-                open_pack_stream(
-                    &pack_key,
-                    encrypted,
-                    &mut importer,
-                    &pack_aad(
-                        &entry.manifest.repository_root,
-                        descriptor.generation,
-                        descriptor.ordinal,
-                    ),
-                    descriptor.plaintext_size,
-                    &descriptor.id,
-                )?;
+                self.open_chain_pack(entry, descriptor, &mut importer)?;
                 importer.finish()?;
             }
         }
