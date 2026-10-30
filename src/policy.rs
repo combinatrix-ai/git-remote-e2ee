@@ -5,14 +5,14 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 
+use crate::FORMAT_VERSION;
 use crate::crypto::{
     KeyFile, PublicDevice, object_id, repository_root_for_device, validate_public_device,
     verify_domain,
 };
 use crate::error::Unsupported;
 
-pub const POLICY_FORMAT_VERSION: u32 = 6;
-const POLICY_SIGNATURE_DOMAIN: &[u8] = b"git-remote-e2ee policy v6\0";
+const POLICY_SIGNATURE_DOMAIN: &[u8] = domain!("policy");
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -101,7 +101,7 @@ impl PolicyState {
     pub fn genesis(key: &KeyFile, owner_label: &str) -> Result<(Self, Vec<u8>)> {
         let public = key.public_device()?;
         let body = PolicyBody {
-            format_version: POLICY_FORMAT_VERSION,
+            format_version: FORMAT_VERSION,
             repository_root: key.repository_root.clone(),
             generation: 0,
             previous: None,
@@ -123,7 +123,7 @@ impl PolicyState {
     ) -> Result<(Self, Vec<u8>)> {
         devices.sort_by(|a, b| a.public.device_id.cmp(&b.public.device_id));
         let body = PolicyBody {
-            format_version: POLICY_FORMAT_VERSION,
+            format_version: FORMAT_VERSION,
             repository_root: parent.body.repository_root.clone(),
             generation: parent
                 .body
@@ -175,7 +175,7 @@ impl PolicyState {
         let probe_body = BASE64.decode(probe.body).context("decode policy body")?;
         let version: BodyProbe =
             serde_json::from_slice(&probe_body).context("parse policy format version")?;
-        if version.format_version != u64::from(POLICY_FORMAT_VERSION) {
+        if version.format_version != u64::from(FORMAT_VERSION) {
             bail!(Unsupported(format!(
                 "unsupported policy format {}",
                 version.format_version
@@ -569,7 +569,7 @@ mod tests {
         let owner = KeyFile::generate();
         let (genesis, _) = PolicyState::genesis(&owner, "owner").unwrap();
         let mut body = serde_json::to_value(&genesis.body).unwrap();
-        body["format_version"] = serde_json::json!(POLICY_FORMAT_VERSION + 1);
+        body["format_version"] = serde_json::json!(FORMAT_VERSION + 1);
         body["admin_quorum"] = serde_json::json!({"threshold": 2});
         body.as_object_mut().unwrap().remove("admin_threshold");
         let future = serde_json::to_vec(&serde_json::json!({

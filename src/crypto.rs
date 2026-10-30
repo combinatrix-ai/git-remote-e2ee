@@ -27,11 +27,11 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use crate::error::Unsupported;
 use crate::trace;
 
-const SYMMETRIC_MAGIC: &[u8; 8] = b"E2EES05\0";
-const PACK_STREAM_MAGIC: &[u8; 8] = b"E2EEPK5\0";
-const HPKE_INFO: &[u8] = b"git-remote-e2ee generation key v5";
-const KEY_COMMITMENT_DOMAIN: &[u8] = b"git-remote-e2ee generation key commitment v5\0";
-const SUBKEY_SALT: &[u8] = b"git-remote-e2ee subkey derivation v5\0";
+const SYMMETRIC_MAGIC: &[u8] = concat!("E2EES0", format_version!(), "\0").as_bytes();
+const PACK_STREAM_MAGIC: &[u8] = concat!("E2EEPK", format_version!(), "\0").as_bytes();
+const HPKE_INFO: &[u8] = concat!("git-remote-e2ee generation key v", format_version!()).as_bytes();
+const KEY_COMMITMENT_DOMAIN: &[u8] = domain!("generation key commitment");
+const SUBKEY_SALT: &[u8] = domain!("subkey derivation");
 pub const HPKE_ENCAPSULATED_KEY_SIZE: usize = 32;
 pub const HPKE_CIPHERTEXT_SIZE: usize = 32 + 16;
 pub const PACK_STREAM_CHUNK_SIZE: usize = 1024 * 1024;
@@ -444,7 +444,7 @@ impl<W: Write> Write for DigestWriter<W> {
 }
 
 fn pack_stream_aad(base_aad: &[u8], header: &[u8]) -> Vec<u8> {
-    let mut aad = b"git-remote-e2ee pack stream v5\0".to_vec();
+    let mut aad = domain!("pack stream").to_vec();
     aad.extend_from_slice(&(base_aad.len() as u32).to_le_bytes());
     aad.extend_from_slice(base_aad);
     aad.extend_from_slice(&(header.len() as u32).to_le_bytes());
@@ -952,7 +952,7 @@ mod tests {
         );
 
         let mut legacy = ciphertext;
-        legacy[..PACK_STREAM_MAGIC.len()].copy_from_slice(b"E2EEPK4\0");
+        legacy[..PACK_STREAM_MAGIC.len()].copy_from_slice(b"E2EEPK5\0");
         assert!(open_test_pack(&key, &legacy, sealed.plaintext_size, &sealed.object_id).is_err());
     }
 

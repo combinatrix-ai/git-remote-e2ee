@@ -209,7 +209,7 @@ fn recovery_budget_exhaustion_inside_candidate_discovery_is_fatal() {
     let temporary = tempfile::tempdir().unwrap();
     let (key, storage, repo, floor, junk_id) = floor_with_malformed_head(temporary.path());
     let oversized = manifest_with_header(serde_json::json!({
-        "format_version": 5,
+        "format_version": git_remote_e2ee::FORMAT_VERSION,
         "repository_root": key.repository_root,
         "generation": 1,
         "previous": floor,
@@ -294,7 +294,7 @@ fn recover_refuses_a_head_with_a_future_manifest_schema() {
     let temporary = tempfile::tempdir().unwrap();
     let (key, storage, repo, floor, junk_id) = floor_with_malformed_head(temporary.path());
     let future = manifest_with_header(serde_json::json!({
-        "format_version": 6,
+        "format_version": git_remote_e2ee::FORMAT_VERSION + 1,
         "repository_root": key.repository_root,
         "generation": 1,
         "previous": floor,
