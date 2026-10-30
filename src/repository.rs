@@ -146,13 +146,12 @@ pub struct RecoveryOptions<'a> {
 #[serde(deny_unknown_fields)]
 struct CheckoutProgress {
     format_version: u32,
-    packs: Vec<String>,
     // The last generation whose pack deltas and advertised refs we imported and checked.
     imported_generation: Option<u64>,
     verified_refs: BTreeMap<String, String>,
 }
 
-const CHECKOUT_PROGRESS_FORMAT: u32 = 1;
+const CHECKOUT_PROGRESS_FORMAT: u32 = 2;
 
 /// A locked view of `.git/git-remote-e2ee/<root>/` in one checkout. Always
 /// acquired after the machine floor.
@@ -181,8 +180,6 @@ impl Checkout {
 
     fn write(&self, mut progress: CheckoutProgress) -> Result<()> {
         progress.format_version = CHECKOUT_PROGRESS_FORMAT;
-        progress.packs.sort();
-        progress.packs.dedup();
         write_json(&self.progress_path(), &progress)
     }
 }
@@ -698,25 +695,22 @@ impl<S: Storage> EncryptedRepository<S> {
         let current = chain.first().context("manifest chain is empty")?;
         git::validate_inner_refs(&current.manifest.refs)?;
         let progress = checkout.read()?;
-        let mut imported: HashSet<String> = progress.packs.into_iter().collect();
-        self.import_chain_packs(repo, &chain, progress.imported_generation, &mut imported)?;
+        self.import_chain_packs(repo, &chain, progress.imported_generation)?;
         let connectivity_timer = trace::Span::new("inner_ref_connectivity_check");
         if git::ensure_refs_connected_since(repo, &current.manifest.refs, &progress.verified_refs)
             .is_err()
         {
-            // Imported pack IDs are cache state, not proof that their objects
+            // Recorded progress is cache state, not proof that its objects
             // are still local: deleting a remote-tracking ref and pruning
             // removes them. Re-import the whole authenticated chain and check
             // the full graph; recorded progress is unchanged until that passes.
-            imported.clear();
-            self.import_chain_packs(repo, &chain, None, &mut imported)?;
+            self.import_chain_packs(repo, &chain, None)?;
             git::ensure_refs_connected_since(repo, &current.manifest.refs, &BTreeMap::new())?;
         }
         drop(connectivity_timer);
         floor.advance(ContinuityFloor::at(&current.id, &current.manifest))?;
         checkout.write(CheckoutProgress {
             format_version: CHECKOUT_PROGRESS_FORMAT,
-            packs: imported.into_iter().collect(),
             imported_generation: Some(current.manifest.generation),
             verified_refs: current.manifest.refs.clone(),
         })?;
@@ -724,25 +718,19 @@ impl<S: Storage> EncryptedRepository<S> {
     }
 
     /// Imports, oldest first, the packs of every chain entry newer than
-    /// `after_generation`, recording each pack ID in `imported`.
+    /// `after_generation`. Chain authentication already rejects a pack ID
+    /// that repeats anywhere in the chain.
     fn import_chain_packs(
         &self,
         repo: &GitRepository,
         chain: &[OpenedState],
         after_generation: Option<u64>,
-        imported: &mut HashSet<String>,
     ) -> Result<()> {
         for entry in chain.iter().rev() {
             if after_generation.is_some_and(|generation| entry.manifest.generation <= generation) {
                 continue;
             }
             for descriptor in &entry.manifest.new_packs {
-                if imported.contains(&descriptor.id) {
-                    bail!(
-                        "manifest delta reuses previously imported pack {}",
-                        descriptor.id
-                    )
-                }
                 let encrypted = self.storage.open_object(ObjectKind::Pack, &descriptor.id)?;
                 let pack_key = derive_subkey(
                     &entry.generation_key,
@@ -767,7 +755,6 @@ impl<S: Storage> EncryptedRepository<S> {
                 )?;
                 drop(decrypt_timer);
                 importer.finish()?;
-                imported.insert(descriptor.id.clone());
             }
         }
         Ok(())

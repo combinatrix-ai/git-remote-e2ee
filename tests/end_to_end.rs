@@ -15,8 +15,8 @@ use anyhow::Result;
 use base64::Engine;
 use git_remote_e2ee::crypto::{KeyFile, object_id, random_key};
 use git_remote_e2ee::manifest::{
-    Manifest, ManifestAuthorization, open_manifest, peek_manifest_header, seal_manifest,
-    unwrap_generation_key, verify_manifest, wrap_predecessor_key,
+    Manifest, ManifestAuthorization, PackDescriptor, open_manifest, peek_manifest_header,
+    seal_manifest, unwrap_generation_key, verify_manifest, wrap_predecessor_key,
 };
 use git_remote_e2ee::policy::{DeviceRoles, PolicyState};
 use git_remote_e2ee::repository::{
@@ -798,6 +798,101 @@ fn returning_client_rejects_signed_ref_advance_without_its_pack() {
     );
     assert_eq!(machine_floor(&destination)["generation"], 1);
     assert_eq!(progress(&destination)["imported_generation"], 1);
+}
+
+#[test]
+fn returning_client_rejects_a_signed_chain_that_repeats_a_pack() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let destination = temporary.path().join("destination");
+    let remote = temporary.path().join("remote");
+    initialize_git(&source);
+    initialize_git(&destination);
+    let key = KeyFile::generate();
+    let repository = EncryptedRepository::new(
+        FilesystemStorage::new(&remote),
+        key.clone(),
+        support::state_dir(),
+    );
+    repository.initialize("owner").unwrap();
+    commit(&source, "valid\n", "valid");
+    repository
+        .push_ref(
+            &GitRepository::open(&source).unwrap(),
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
+        .unwrap();
+    repository
+        .fetch_into(&GitRepository::open(&destination).unwrap(), "e2ee")
+        .unwrap();
+
+    let head = fs::read_to_string(remote.join("HEAD"))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let manifest_bytes = read_stored_object(&remote, "manifests", &head);
+    let header = peek_manifest_header(&manifest_bytes).unwrap();
+    let (policy, _) = PolicyState::genesis(&key, "owner").unwrap();
+    let current_key = unwrap_generation_key(&header, &key).unwrap();
+    let current = open_manifest(&manifest_bytes, &current_key)
+        .unwrap()
+        .manifest()
+        .clone();
+    let reused = current.new_packs.first().unwrap().clone();
+
+    let next_key = random_key();
+    let generation = current.generation + 1;
+    let malicious = Manifest {
+        format_version: current.format_version,
+        repository_root: current.repository_root.clone(),
+        generation,
+        previous: Some(head.clone()),
+        policy_id: policy.id.clone(),
+        policy_generation: policy.body.generation,
+        authorization: ManifestAuthorization::Writer,
+        total_pack_count: current.total_pack_count + 1,
+        refs: current.refs.clone(),
+        new_packs: vec![PackDescriptor {
+            generation,
+            ordinal: 0,
+            ..reused.clone()
+        }],
+        predecessor_key_wrap: Some(
+            wrap_predecessor_key(
+                &next_key,
+                &current_key,
+                &current.repository_root,
+                generation,
+                &head,
+            )
+            .unwrap(),
+        ),
+        introduced_policy: None,
+    };
+    let malicious_bytes = seal_manifest(
+        &key,
+        &policy,
+        &next_key,
+        ManifestAuthorization::Writer,
+        malicious,
+    )
+    .unwrap();
+    let malicious_id = object_id(&malicious_bytes);
+    write_stored_object(&remote, "manifests", &malicious_id, &malicious_bytes);
+    fs::write(remote.join("HEAD"), format!("{malicious_id}\n")).unwrap();
+
+    let error = repository
+        .fetch_into(&GitRepository::open(&destination).unwrap(), "e2ee")
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains(&format!("manifest chain repeats pack {}", reused.id)),
+        "unexpected error: {error:#}"
+    );
+    assert_eq!(machine_floor(&destination)["generation"], 1);
 }
 
 #[test]
