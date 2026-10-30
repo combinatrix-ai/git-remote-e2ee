@@ -1,5 +1,6 @@
 use git_remote_e2ee::gitcmd::GitRepository;
 mod support;
+use support::PushRef;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -18,10 +19,15 @@ use git_remote_e2ee::manifest::{
     unwrap_generation_key, verify_manifest, wrap_predecessor_key,
 };
 use git_remote_e2ee::policy::{DeviceRoles, PolicyState};
-use git_remote_e2ee::repository::{EncryptedRepository, RecoveryClass, RecoveryOptions, RefChange};
-use git_remote_e2ee::storage::{
-    FilesystemStorage, ObjectKind, ObjectStage, RecoveryCommit, RecoveryHistory, Storage,
+use git_remote_e2ee::repository::{
+    EncryptedRepository, PushMode, PushRejection, RecoveryClass, RecoveryOptions, RefChange,
+    RefOutcome, RefPush,
 };
+use git_remote_e2ee::storage::{
+    CasConflict, FilesystemStorage, ObjectKind, ObjectStage, RecoveryCommit, RecoveryHistory,
+    Storage,
+};
+use std::sync::Mutex;
 
 #[derive(Clone)]
 struct BarrierStorage {
@@ -29,6 +35,33 @@ struct BarrierStorage {
     armed: Arc<AtomicBool>,
     reads: Arc<AtomicUsize>,
     barrier: Arc<Barrier>,
+}
+
+/// Runs a competing publication just before this view's compare-and-swap.
+struct RacedStorage {
+    inner: FilesystemStorage,
+    before_swap: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl Storage for RacedStorage {
+    fn begin_object(&self, kind: ObjectKind) -> Result<Box<dyn ObjectStage>> {
+        self.inner.begin_object(kind)
+    }
+
+    fn open_object(&self, kind: ObjectKind, id: &str) -> Result<Box<dyn Read + Send>> {
+        self.inner.open_object(kind, id)
+    }
+
+    fn read_head(&self) -> Result<Option<String>> {
+        self.inner.read_head()
+    }
+
+    fn compare_and_swap_head(&self, expected: Option<&str>, next: &str) -> Result<()> {
+        if let Some(race) = self.before_swap.lock().unwrap().take() {
+            race();
+        }
+        self.inner.compare_and_swap_head(expected, next)
+    }
 }
 
 #[derive(Clone)]
@@ -415,7 +448,7 @@ fn shallow_push_is_rejected_before_publication_and_unshallow_recovers() {
     encrypted.initialize("owner").unwrap();
     let head_before = fs::read(storage.join("HEAD")).unwrap();
     let error = encrypted
-        .push(
+        .push_ref(
             &GitRepository::open(&shallow).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -429,7 +462,7 @@ fn shallow_push_is_rejected_before_publication_and_unshallow_recovers() {
     assert!(encrypted.verify().unwrap().refs.is_empty());
     git(&shallow, &["fetch", "--unshallow"]);
     encrypted
-        .push(
+        .push_ref(
             &GitRepository::open(&shallow).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -471,7 +504,7 @@ fn pushes_incrementally_and_fetches_into_another_repository() {
 
     let first = commit(&source, "first\n", "first");
     encrypted
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -486,7 +519,7 @@ fn pushes_incrementally_and_fetches_into_another_repository() {
 
     let second = commit(&source, "second\n", "second");
     encrypted
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -535,7 +568,7 @@ fn missing_pack_observation_does_not_advance_import_progress() {
     repository.initialize("owner").unwrap();
     commit(&source, "first\n", "first");
     repository
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -552,7 +585,7 @@ fn missing_pack_observation_does_not_advance_import_progress() {
 
     commit(&source, "second\n", "second");
     repository
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -604,7 +637,7 @@ fn successful_own_publication_advances_the_client_floor() {
     repository.initialize("owner").unwrap();
     commit(&source, "published\n", "published");
     let head = repository
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -637,7 +670,7 @@ fn returning_client_fetches_multiple_offline_generations_from_deltas() {
 
     commit(&source, "one\n", "one");
     repository
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -653,7 +686,7 @@ fn returning_client_fetches_multiple_offline_generations_from_deltas() {
     for value in ["two\n", "three\n", "four\n"] {
         commit(&source, value, value.trim());
         repository
-            .push(
+            .push_ref(
                 &GitRepository::open(&source).unwrap(),
                 "refs/heads/main",
                 RefChange::Update {
@@ -690,7 +723,7 @@ fn returning_client_rejects_signed_ref_advance_without_its_pack() {
     repository.initialize("owner").unwrap();
     commit(&source, "valid\n", "valid");
     repository
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -782,7 +815,7 @@ fn missing_verified_frontier_tip_forces_full_reverification() {
     repository.initialize("owner").unwrap();
     commit(&source, "valid\n", "valid");
     repository
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -857,7 +890,7 @@ fn local_publication_advances_verified_frontier_before_observation() {
 
     let first = commit(&source, "first\n", "first");
     repository
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -875,7 +908,7 @@ fn local_publication_advances_verified_frontier_before_observation() {
 
     let second = commit(&source, "second\n", "second");
     repository
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -916,7 +949,7 @@ fn rejects_non_fast_forward_update() {
     encrypted.initialize("owner").unwrap();
     let first = commit(&source, "first\n", "first");
     encrypted
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -927,7 +960,7 @@ fn rejects_non_fast_forward_update() {
         .unwrap();
     commit(&source, "second\n", "second");
     encrypted
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -940,7 +973,7 @@ fn rejects_non_fast_forward_update() {
     commit(&source, "diverged\n", "diverged");
 
     let error = encrypted
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -971,7 +1004,7 @@ fn explicit_force_can_publish_a_rollback() {
     encrypted.initialize("owner").unwrap();
     let first = commit(&source, "first\n", "first");
     encrypted
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -982,7 +1015,7 @@ fn explicit_force_can_publish_a_rollback() {
         .unwrap();
     commit(&source, "second\n", "second");
     encrypted
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -994,7 +1027,7 @@ fn explicit_force_can_publish_a_rollback() {
 
     git(&source, &["reset", "--hard", &first]);
     encrypted
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -1030,7 +1063,7 @@ fn detects_tampered_pack_ciphertext() {
     encrypted.initialize("owner").unwrap();
     commit(&source, "secret\n", "secret");
     encrypted
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -1080,7 +1113,7 @@ fn late_stream_authentication_failure_does_not_advance_refs_or_pins() {
     );
     encrypted.initialize("owner").unwrap();
     encrypted
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -1131,7 +1164,7 @@ fn rejects_storage_head_rollback_after_fetch_pins_history() {
     encrypted.initialize("owner").unwrap();
     commit(&source, "first\n", "first");
     let first_head = encrypted
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -1142,7 +1175,7 @@ fn rejects_storage_head_rollback_after_fetch_pins_history() {
         .unwrap();
     commit(&source, "second\n", "second");
     encrypted
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -1181,7 +1214,7 @@ fn rejects_same_generation_manifest_fork_after_fetch_pins_history() {
     encrypted.initialize("owner").unwrap();
     commit(&source, "first\n", "first");
     encrypted
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -1201,7 +1234,7 @@ fn rejects_same_generation_manifest_fork_after_fetch_pins_history() {
     );
     fork.initialize("owner").unwrap();
     let fork_head = fork
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -1237,7 +1270,7 @@ fn recover_replaces_reader_signed_junk_from_the_directory_floor() {
     repository.initialize("owner").unwrap();
     commit(&source, "recovery keeps this content\n", "base");
     repository
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -1497,7 +1530,7 @@ fn recover_refuses_unknown_formats_and_missing_floor_objects() {
     initialize_git(&source);
     commit(&source, "required floor object\n", "required");
     missing_repository
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -1580,7 +1613,7 @@ fn recover_never_overrides_authenticated_rollback() {
     repository.initialize("owner").unwrap();
     commit(&source, "one\n", "one");
     let first = repository
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -1591,7 +1624,7 @@ fn recover_never_overrides_authenticated_rollback() {
         .unwrap();
     commit(&source, "two\n", "two");
     repository
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -1730,7 +1763,7 @@ fn writer_can_add_branch_without_having_other_remote_branch_objects() {
     encrypted.initialize("owner").unwrap();
     let main = commit(&first_writer, "main\n", "main");
     encrypted
-        .push(
+        .push_ref(
             &GitRepository::open(&first_writer).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -1750,7 +1783,7 @@ fn writer_can_add_branch_without_having_other_remote_branch_objects() {
     git(&first_writer, &["switch", "-q", "-c", "feature"]);
     let feature = commit(&first_writer, "feature\n", "feature");
     encrypted
-        .push(
+        .push_ref(
             &GitRepository::open(&first_writer).unwrap(),
             "refs/heads/feature",
             RefChange::Update {
@@ -1762,7 +1795,7 @@ fn writer_can_add_branch_without_having_other_remote_branch_objects() {
 
     let other = commit(&second_writer, "other\n", "other");
     encrypted
-        .push(
+        .push_ref(
             &GitRepository::open(&second_writer).unwrap(),
             "refs/heads/other",
             RefChange::Update {
@@ -1813,7 +1846,7 @@ fn deletion_and_tag_publication_race_with_exactly_one_cas_winner() {
     seed_repository.initialize("owner").unwrap();
     let main = commit(&source, "main\n", "main");
     seed_repository
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -1824,7 +1857,7 @@ fn deletion_and_tag_publication_race_with_exactly_one_cas_winner() {
         .unwrap();
     git(&source, &["branch", "doomed", &main]);
     seed_repository
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/doomed",
             RefChange::Update {
@@ -1852,14 +1885,14 @@ fn deletion_and_tag_publication_race_with_exactly_one_cas_winner() {
     let deletion_repo = source.clone();
     let tag_repo = source.clone();
     let deletion = thread::spawn(move || {
-        deleter.push(
+        deleter.push_ref(
             &GitRepository::open(&deletion_repo).unwrap(),
             "refs/heads/doomed",
             RefChange::Delete,
         )
     });
     let tag_push = thread::spawn(move || {
-        tagger.push(
+        tagger.push_ref(
             &GitRepository::open(&tag_repo).unwrap(),
             "refs/tags/race-tag",
             RefChange::Update {
@@ -1910,7 +1943,7 @@ fn rejects_unsupported_ref_namespaces_consistently() {
     encrypted.initialize("owner").unwrap();
     commit(&source, "tagged\n", "tagged");
     let error = encrypted
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/notes/review",
             RefChange::Update {
@@ -2021,7 +2054,7 @@ fn directory_root_holds_exactly_the_v6_layout() {
     encrypted.initialize("owner").unwrap();
     commit(&source, "layout\n", "layout");
     encrypted
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -2069,7 +2102,7 @@ fn directory_format_mismatch_names_the_found_format() {
     encrypted.initialize("owner").unwrap();
     commit(&source, "format\n", "format");
     encrypted
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -2095,5 +2128,111 @@ fn directory_format_mismatch_names_the_found_format() {
     assert!(
         error.contains("uses format 5 or earlier; this git-remote-e2ee reads format 6"),
         "{error}"
+    );
+}
+
+#[test]
+fn push_batch_that_loses_the_compare_and_swap_publishes_none_of_its_refs() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let remote_path = temporary.path().join("remote");
+    initialize_git(&source);
+    let key = KeyFile::generate();
+    let setup = EncryptedRepository::new(
+        FilesystemStorage::new(&remote_path),
+        key.clone(),
+        support::state_dir(),
+    );
+    setup.initialize("owner").unwrap();
+    commit(&source, "first\n", "first");
+    git(&source, &["tag", "v1"]);
+    let update = |source| RefChange::Update {
+        source,
+        force: false,
+    };
+    let source_repo = GitRepository::open(&source).unwrap();
+    setup
+        .push_ref(&source_repo, "refs/heads/main", update("refs/heads/main"))
+        .unwrap();
+    setup
+        .push_ref(&source_repo, "refs/tags/v1", update("refs/tags/v1"))
+        .unwrap();
+    commit(&source, "second\n", "second");
+    git(&source, &["branch", "feature"]);
+    git(&source, &["tag", "-f", "v1"]);
+
+    let competitor_source = source.clone();
+    let competitor = EncryptedRepository::new(
+        FilesystemStorage::new(&remote_path),
+        key.clone(),
+        temporary.path().join("competing-machine"),
+    );
+    let raced = EncryptedRepository::new(
+        RacedStorage {
+            inner: FilesystemStorage::new(&remote_path),
+            before_swap: Mutex::new(Some(Box::new(move || {
+                competitor
+                    .push_ref(
+                        &GitRepository::open(&competitor_source).unwrap(),
+                        "refs/heads/competitor",
+                        RefChange::Update {
+                            source: "refs/heads/main",
+                            force: false,
+                        },
+                    )
+                    .unwrap();
+            }))),
+        },
+        key,
+        support::state_dir(),
+    );
+    let outcome = raced
+        .push(
+            &source_repo,
+            &[
+                RefPush {
+                    destination: "refs/heads/main",
+                    change: update("refs/heads/main"),
+                },
+                RefPush {
+                    destination: "refs/heads/feature",
+                    change: update("refs/heads/feature"),
+                },
+                RefPush {
+                    destination: "refs/tags/v1",
+                    change: update("refs/tags/v1"),
+                },
+            ],
+            PushMode::Publish,
+        )
+        .unwrap();
+
+    assert!(matches!(outcome.refs[0], RefOutcome::Accepted));
+    assert!(matches!(outcome.refs[1], RefOutcome::Accepted));
+    let RefOutcome::Rejected(tag_error) = &outcome.refs[2] else {
+        panic!("an existing tag moved without force")
+    };
+    assert!(
+        matches!(
+            tag_error.downcast_ref::<PushRejection>(),
+            Some(PushRejection::AlreadyExists(_))
+        ),
+        "{tag_error:#}"
+    );
+    let publication_error = outcome.publication.unwrap_err();
+    assert!(
+        publication_error.downcast_ref::<CasConflict>().is_some(),
+        "{publication_error:#}"
+    );
+
+    let manifest = setup.verify().unwrap();
+    assert_eq!(manifest.generation, 3, "only the competitor published");
+    assert_eq!(
+        manifest.refs.keys().collect::<Vec<_>>(),
+        ["refs/heads/competitor", "refs/heads/main", "refs/tags/v1"]
+    );
+    assert_eq!(
+        manifest.refs["refs/heads/main"], manifest.refs["refs/tags/v1"],
+        "main kept its pre-batch tip"
     );
 }

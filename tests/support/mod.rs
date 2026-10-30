@@ -7,6 +7,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use git_remote_e2ee::gitcmd::GitRepository;
+use git_remote_e2ee::repository::{EncryptedRepository, PushMode, RefChange, RefOutcome, RefPush};
+use git_remote_e2ee::storage::Storage;
+
 /// The `XDG_STATE_HOME` that Git commands running the helper must see.
 pub fn state_home() -> &'static Path {
     static HOME: OnceLock<PathBuf> = OnceLock::new();
@@ -31,4 +35,37 @@ pub fn floor_path(repository_root: &str) -> PathBuf {
 
 pub fn read_floor(repository_root: &str) -> serde_json::Value {
     serde_json::from_slice(&std::fs::read(floor_path(repository_root)).unwrap()).unwrap()
+}
+
+pub trait PushRef {
+    /// Publishes one ref change as its own push batch and returns the head
+    /// after it, failing with the ref's rejection or the publication error.
+    fn push_ref(
+        &self,
+        repo: &GitRepository,
+        destination: &str,
+        change: RefChange<'_>,
+    ) -> anyhow::Result<String>;
+}
+
+impl<S: Storage> PushRef for EncryptedRepository<S> {
+    fn push_ref(
+        &self,
+        repo: &GitRepository,
+        destination: &str,
+        change: RefChange<'_>,
+    ) -> anyhow::Result<String> {
+        let mut outcome = self.push(
+            repo,
+            &[RefPush {
+                destination,
+                change,
+            }],
+            PushMode::Publish,
+        )?;
+        match outcome.refs.pop().expect("one outcome per ref") {
+            RefOutcome::Rejected(error) => Err(error),
+            RefOutcome::Accepted => outcome.publication,
+        }
+    }
 }

@@ -1,5 +1,6 @@
 use git_remote_e2ee::gitcmd::GitRepository;
 mod support;
+use support::PushRef;
 
 use std::collections::BTreeMap;
 use std::env;
@@ -422,7 +423,7 @@ fn carrier_git_allows_exactly_one_concurrent_writer() {
     let barrier_a = barrier.clone();
     let first = thread::spawn(move || {
         barrier_a.wait();
-        repository_a.push(
+        repository_a.push_ref(
             &GitRepository::open(&source_a).unwrap(),
             "refs/heads/writer-a",
             RefChange::Update {
@@ -434,7 +435,7 @@ fn carrier_git_allows_exactly_one_concurrent_writer() {
     let barrier_b = barrier.clone();
     let second = thread::spawn(move || {
         barrier_b.wait();
-        repository_b.push(
+        repository_b.push_ref(
             &GitRepository::open(&source_b).unwrap(),
             "refs/heads/writer-b",
             RefChange::Update {
@@ -512,7 +513,7 @@ fn stale_carrier_views_on_one_machine_refresh_instead_of_reporting_rollback() {
     let stale_push_main = open();
     let stale_push_new = open();
     open()
-        .push(
+        .push_ref(
             &GitRepository::open(&source_a).unwrap(),
             "refs/heads/main",
             update,
@@ -526,7 +527,7 @@ fn stale_carrier_views_on_one_machine_refresh_instead_of_reporting_rollback() {
     assert_eq!(manifest.generation, 1);
 
     let error = stale_push_main
-        .push(
+        .push_ref(
             &GitRepository::open(&source_b).unwrap(),
             "refs/heads/main",
             update,
@@ -539,7 +540,7 @@ fn stale_carrier_views_on_one_machine_refresh_instead_of_reporting_rollback() {
     assert!(rejected_as_fetch_first, "{error:#}");
 
     stale_push_new
-        .push(
+        .push_ref(
             &GitRepository::open(&source_b).unwrap(),
             "refs/heads/writer-b",
             update,
@@ -916,7 +917,7 @@ fn carrier_git_detects_tampered_ciphertext_chunk() {
         key.clone(),
         support::state_dir(),
     )
-    .push(
+    .push_ref(
         &GitRepository::open(&source).unwrap(),
         "refs/heads/main",
         RefChange::Update {
@@ -1015,7 +1016,7 @@ fn carrier_recovery_chooses_legitimate_descendant_and_restores_deleted_ciphertex
     .unwrap();
     let pushed_object = git(&source, &["rev-parse", "HEAD"], false);
     repository
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -1246,7 +1247,7 @@ fn carrier_recovery_offers_hidden_legitimate_content_descendant() {
 
     let pushed_object = git(&source, &["rev-parse", "HEAD"], false);
     repository
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -1411,7 +1412,7 @@ fn carrier_recovery_refuses_history_with_a_merge_hiding_a_legitimate_state() {
         .fetch_into(&GitRepository::open(&returning).unwrap(), "private")
         .unwrap();
     repository
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -2128,7 +2129,7 @@ fn stale_compare_and_swap_conflicts_even_when_the_remote_head_is_garbage() {
 }
 
 #[test]
-fn failed_ref_in_a_helper_push_batch_is_not_published_by_the_next_ref() {
+fn storage_failure_in_a_helper_push_batch_publishes_none_of_its_refs() {
     let temporary = tempfile::tempdir().unwrap();
     let _cache = isolated_cache(&temporary);
     let carrier = temporary.path().join("carrier.git");
@@ -2164,13 +2165,9 @@ fn failed_ref_in_a_helper_push_batch_is_not_published_by_the_next_ref() {
             .unwrap_or_else(|| panic!("no status for {reference}: {stdout}"))
             .to_owned()
     };
-    let (failed, published) = if status("refs/heads/a").starts_with('!') {
-        ("refs/heads/a", "refs/heads/b")
-    } else {
-        ("refs/heads/b", "refs/heads/a")
-    };
-    assert!(status(failed).starts_with('!'), "{stdout}");
-    assert!(!status(published).starts_with('!'), "{stdout}");
+    for reference in ["refs/heads/a", "refs/heads/b"] {
+        assert!(status(reference).starts_with('!'), "{stdout}");
+    }
 
     let manifest = EncryptedRepository::new(
         GitStorage::open(carrier.to_str().unwrap()).unwrap(),
@@ -2179,11 +2176,11 @@ fn failed_ref_in_a_helper_push_batch_is_not_published_by_the_next_ref() {
     )
     .verify()
     .unwrap();
-    let names: Vec<_> = manifest.refs.keys().map(String::as_str).collect();
-    assert!(names.contains(&published), "{names:?}");
-    assert!(
-        !names.contains(&failed),
-        "the failed ref was published by the next one: {names:?}"
+    assert_eq!(manifest.generation, 1);
+    assert_eq!(
+        manifest.refs.keys().collect::<Vec<_>>(),
+        ["refs/heads/main"],
+        "a failed batch publishes none of its refs"
     );
 
     assert!(
@@ -2214,7 +2211,7 @@ fn carrier_recovery_classifies_missing_head_manifest_as_unavailable() {
         support::state_dir(),
     );
     repository
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -2235,7 +2232,7 @@ fn carrier_recovery_classifies_missing_head_manifest_as_unavailable() {
         support::state_dir(),
     );
     repository
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -2306,7 +2303,7 @@ fn carrier_recovery_refuses_to_skip_a_historical_head_with_missing_objects() {
         support::state_dir(),
     );
     repository
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -2394,7 +2391,7 @@ fn carrier_history_reads_skip_corrupt_copies_for_an_older_valid_one() {
         support::state_dir(),
     );
     repository
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -2471,7 +2468,7 @@ fn carrier_historical_restore_charges_rejected_copies_against_its_byte_budget() 
         support::state_dir(),
     );
     repository
-        .push(
+        .push_ref(
             &GitRepository::open(&source).unwrap(),
             "refs/heads/main",
             RefChange::Update {
@@ -2551,7 +2548,7 @@ fn recover_junk_head_after_later_writer_push(recover_as_owner: bool) {
         )
         .unwrap();
     open(&writer)
-        .push(
+        .push_ref(
             &GitRepository::open(&writer_checkout).unwrap(),
             "refs/heads/main",
             RefChange::Update {

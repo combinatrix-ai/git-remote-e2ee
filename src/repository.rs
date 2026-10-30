@@ -209,6 +209,37 @@ pub enum RefChange<'a> {
     Delete,
 }
 
+/// One `push` line of a remote-helper batch.
+#[derive(Clone, Copy, Debug)]
+pub struct RefPush<'a> {
+    pub destination: &'a str,
+    pub change: RefChange<'a>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PushMode {
+    Publish,
+    /// Runs every check without publishing (`git push --dry-run`).
+    DryRun,
+}
+
+#[derive(Debug)]
+pub enum RefOutcome {
+    /// Passed preflight; its result is the batch's publication result.
+    Accepted,
+    Rejected(anyhow::Error),
+}
+
+#[derive(Debug)]
+pub struct PushOutcome {
+    /// One outcome per requested change, in request order.
+    pub refs: Vec<RefOutcome>,
+    /// The head manifest ID after the batch: the published successor, or the
+    /// current head when nothing needed publishing. Its error fails every
+    /// accepted ref.
+    pub publication: Result<String>,
+}
+
 struct RecoveryBudget {
     crypto_operations: u64,
     bytes_read: u64,
@@ -457,33 +488,79 @@ impl<S: Storage> EncryptedRepository<S> {
         Ok(())
     }
 
-    /// Publishes one ref change as the next generation and returns the
-    /// manifest ID that holds it.
+    /// Preflights every change of one helper push batch against the same
+    /// pinned head and publishes the accepted ones as at most one successor
+    /// generation with at most one pack. An `Err` means no change was checked
+    /// (for example, a read-only device), so it applies to every ref.
     pub fn push(
         &self,
         repo: &GitRepository,
-        destination_ref: &str,
-        change: RefChange<'_>,
-    ) -> Result<String> {
+        pushes: &[RefPush<'_>],
+        mode: PushMode,
+    ) -> Result<PushOutcome> {
         let floor = self.lock_floor()?;
+        let current = self
+            .pinned_chain(&floor)?
+            .into_iter()
+            .next()
+            .context("manifest chain is empty")?;
+        let device_id = self.key.device_id()?;
+        if !current.policy.is_active_writer(&device_id) {
+            if current.policy.is_active_reader(&device_id) {
+                bail!(ReadOnlyDevice)
+            }
+            bail!("device is not an active writer")
+        }
+        git::validate_inner_refs(&current.manifest.refs)?;
+
         let mut objects = git::Objects::new(repo);
-        let (current, next_object, non_fast_forward) =
-            self.preflight_ref_change(repo, &mut objects, &floor, destination_ref, change)?;
-        if next_object
-            .as_ref()
-            .is_some_and(|next| current.manifest.refs.get(destination_ref) == Some(next))
-        {
-            floor.advance(ContinuityFloor::at(&current.id, &current.manifest))?;
-            return Ok(current.id);
-        }
-
+        let mut destinations = BTreeSet::new();
         let mut next_refs = current.manifest.refs.clone();
-        if let Some(next_object) = &next_object {
-            next_refs.insert(destination_ref.to_owned(), next_object.clone());
-        } else {
-            next_refs.remove(destination_ref);
+        let mut pack_refs = BTreeMap::new();
+        let mut refs = Vec::with_capacity(pushes.len());
+        for push in pushes {
+            let destination = push.destination;
+            let preflight = if destinations.insert(destination) {
+                preflight_ref_change(repo, &mut objects, &current.manifest.refs, push)
+            } else {
+                Err(anyhow::anyhow!(
+                    "{destination} appears more than once in one push"
+                ))
+            };
+            refs.push(match preflight {
+                Ok(Some(next_object)) => {
+                    if current.manifest.refs.get(destination) != Some(&next_object) {
+                        pack_refs.insert(destination.to_owned(), next_object.clone());
+                    }
+                    next_refs.insert(destination.to_owned(), next_object);
+                    RefOutcome::Accepted
+                }
+                Ok(None) => {
+                    next_refs.remove(destination);
+                    RefOutcome::Accepted
+                }
+                Err(error) => RefOutcome::Rejected(error),
+            });
         }
 
+        let publication = if mode == PushMode::DryRun || next_refs == current.manifest.refs {
+            floor.advance(ContinuityFloor::at(&current.id, &current.manifest))?;
+            Ok(current.id.clone())
+        } else {
+            self.publish_refs(repo, &mut objects, &floor, &current, next_refs, &pack_refs)
+        };
+        Ok(PushOutcome { refs, publication })
+    }
+
+    fn publish_refs(
+        &self,
+        repo: &GitRepository,
+        objects: &mut git::Objects<'_>,
+        floor: &FloorGuard,
+        current: &OpenedState,
+        next_refs: BTreeMap<String, String>,
+        pack_refs: &BTreeMap<String, String>,
+    ) -> Result<String> {
         let next_key = random_key();
         let generation = current
             .manifest
@@ -492,16 +569,15 @@ impl<S: Storage> EncryptedRepository<S> {
             .context("manifest generation overflow")?;
         let mut new_packs = Vec::new();
         let mut total_pack_count = current.manifest.total_pack_count;
-        if let Some(next_object) = next_object {
+        if !pack_refs.is_empty() {
+            // Every reader that accepted the parent holds the complete graphs
+            // of its refs, so even a forced update need not resend them.
             let mut exclusions = BTreeMap::new();
-            if !non_fast_forward {
-                for (reference, object) in &current.manifest.refs {
-                    if objects.exists(object)? {
-                        exclusions.insert(reference.clone(), object.clone());
-                    }
+            for (reference, object) in &current.manifest.refs {
+                if objects.exists(object)? {
+                    exclusions.insert(reference.clone(), object.clone());
                 }
             }
-            let pack_refs = BTreeMap::from([(destination_ref.to_owned(), next_object)]);
             let ordinal = 0;
             let pack_key = derive_subkey(
                 &next_key,
@@ -511,7 +587,7 @@ impl<S: Storage> EncryptedRepository<S> {
                 ordinal,
             )?;
             let pack_timer = trace::Span::new("inner_pack_encrypt_and_store");
-            let mut pack_source = git::start_incremental_pack(repo, &pack_refs, &exclusions)?;
+            let mut pack_source = git::start_incremental_pack(repo, pack_refs, &exclusions)?;
             let mut pack_stage = self.storage.begin_object(ObjectKind::Pack)?;
             let sealed = seal_pack_stream(
                 &pack_key,
@@ -554,7 +630,7 @@ impl<S: Storage> EncryptedRepository<S> {
             introduced_policy: None,
         };
         let next_id = self.commit_manifest(
-            Some(&current),
+            Some(current),
             &current.policy,
             None,
             &next_key,
@@ -568,86 +644,10 @@ impl<S: Storage> EncryptedRepository<S> {
             // The completed local pack walk covers new reachability only beyond
             // refs already verified by this checkout. Shallow and promisor repos
             // can omit history, so they must not advance this frontier.
-            progress.verified_refs = next.refs.clone();
+            progress.verified_refs = next.refs;
             checkout.write(progress)?;
         }
         Ok(next_id)
-    }
-
-    /// Runs every check `push` would, without publishing (`git push --dry-run`).
-    pub fn check_push(
-        &self,
-        repo: &GitRepository,
-        destination_ref: &str,
-        change: RefChange<'_>,
-    ) -> Result<()> {
-        let floor = self.lock_floor()?;
-        let (current, _, _) = self.preflight_ref_change(
-            repo,
-            &mut git::Objects::new(repo),
-            &floor,
-            destination_ref,
-            change,
-        )?;
-        floor.advance(ContinuityFloor::at(&current.id, &current.manifest))
-    }
-
-    fn preflight_ref_change(
-        &self,
-        repo: &GitRepository,
-        objects: &mut git::Objects<'_>,
-        floor: &FloorGuard,
-        destination_ref: &str,
-        change: RefChange<'_>,
-    ) -> Result<(OpenedState, Option<String>, bool)> {
-        let ref_kind = git::validate_inner_ref(destination_ref)?;
-        let chain = self.pinned_chain(floor)?;
-        let current = chain.first().context("manifest chain is empty")?.clone();
-        let device_id = self.key.device_id()?;
-        if !current.policy.is_active_writer(&device_id) {
-            if current.policy.is_active_reader(&device_id) {
-                bail!(ReadOnlyDevice)
-            }
-            bail!("device is not an active writer")
-        }
-        git::validate_inner_refs(&current.manifest.refs)?;
-        let old_object = current.manifest.refs.get(destination_ref);
-        let RefChange::Update { source, force } = change else {
-            if old_object.is_none() {
-                bail!("remote ref {destination_ref} does not exist")
-            }
-            if destination_ref == "refs/heads/main" {
-                bail!(
-                    "cannot delete refs/heads/main because it is advertised as the remote default branch"
-                )
-            }
-            return Ok((current, None, false));
-        };
-
-        let next_object = git::resolve_ref(repo, source)?;
-        if old_object == Some(&next_object) {
-            return Ok((current, Some(next_object), false));
-        }
-        if ref_kind == git::InnerRefKind::Branch {
-            git::ensure_branch_target(objects, destination_ref, &next_object)?;
-        }
-        if ref_kind == git::InnerRefKind::Tag && old_object.is_some() && !force {
-            return Err(PushRejection::AlreadyExists(destination_ref.to_owned()).into());
-        }
-        let non_fast_forward = if ref_kind == git::InnerRefKind::Branch
-            && let Some(old_object) = old_object
-        {
-            if !objects.exists(old_object)? {
-                return Err(PushRejection::FetchFirst(destination_ref.to_owned()).into());
-            }
-            !git::is_ancestor(repo, old_object, &next_object)?
-        } else {
-            false
-        };
-        if non_fast_forward && !force {
-            return Err(PushRejection::NonFastForward(destination_ref.to_owned()).into());
-        }
-        Ok((current, Some(next_object), non_fast_forward))
     }
 
     /// Imports the current generation and points `refs/remotes/<remote_name>/*`
@@ -1637,6 +1637,52 @@ impl<S: Storage> EncryptedRepository<S> {
         }
         Ok(id)
     }
+}
+
+/// Checks one ref change against the parent's refs and returns the object the
+/// destination will point at, or `None` for a deletion.
+fn preflight_ref_change(
+    repo: &GitRepository,
+    objects: &mut git::Objects<'_>,
+    parent_refs: &BTreeMap<String, String>,
+    push: &RefPush<'_>,
+) -> Result<Option<String>> {
+    let destination_ref = push.destination;
+    let ref_kind = git::validate_inner_ref(destination_ref)?;
+    let old_object = parent_refs.get(destination_ref);
+    let RefChange::Update { source, force } = push.change else {
+        if old_object.is_none() {
+            bail!("remote ref {destination_ref} does not exist")
+        }
+        if destination_ref == "refs/heads/main" {
+            bail!(
+                "cannot delete refs/heads/main because it is advertised as the remote default branch"
+            )
+        }
+        return Ok(None);
+    };
+
+    let next_object = git::resolve_ref(repo, source)?;
+    if old_object == Some(&next_object) {
+        return Ok(Some(next_object));
+    }
+    if ref_kind == git::InnerRefKind::Branch {
+        git::ensure_branch_target(objects, destination_ref, &next_object)?;
+    }
+    if ref_kind == git::InnerRefKind::Tag && old_object.is_some() && !force {
+        return Err(PushRejection::AlreadyExists(destination_ref.to_owned()).into());
+    }
+    if ref_kind == git::InnerRefKind::Branch
+        && let Some(old_object) = old_object
+    {
+        if !objects.exists(old_object)? {
+            return Err(PushRejection::FetchFirst(destination_ref.to_owned()).into());
+        }
+        if !force && !git::is_ancestor(repo, old_object, &next_object)? {
+            return Err(PushRejection::NonFastForward(destination_ref.to_owned()).into());
+        }
+    }
+    Ok(Some(next_object))
 }
 
 fn transition_manifest(

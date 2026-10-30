@@ -362,7 +362,8 @@ genesis policy, contains empty refs and no packs, and has no predecessor link.
 1. Fetch and validate the current manifest/policy chain to the local pin or
    genesis.
 2. Enforce Git fast-forward rules locally unless force was explicit.
-3. Create only the incremental Git pack needed for the update.
+3. Create only the incremental Git pack needed for the accepted updates,
+   excluding objects reachable from the parent's ref tips held locally.
 4. Sample `K_t`, derive the pack, body, and sealed-header subkeys, and encrypt
    the new data.
 5. Encrypt the previous generation key under the predecessor-link subkey.
@@ -371,6 +372,18 @@ genesis policy, contains empty refs and no packs, and has no predecessor link.
    and put the corresponding audit entries in the sealed header.
 7. Upload the immutable pack and manifest.
 8. Compare-and-swap `HEAD` from the observed parent ID to the new manifest ID.
+
+One push batch publishes at most one generation with a single pack delta.
+Every ref change in the batch is checked against the same parent; a rejected
+change is reported for its own ref and does not block the others, and the
+accepted changes share one successor manifest. A batch whose accepted changes
+leave the refs unchanged publishes nothing. If publication fails, every
+accepted change fails with it and no part of the batch is published.
+
+The writer MUST verify the complete local object graph of every ref it adds or
+changes, so that its pack makes those refs complete for a reader holding the
+parent's graphs. Refs carried over unchanged inherit the parent's state; the
+writer need not fetch them first, and readers verify them on fetch (§9).
 
 ### 8.2 Add a device
 
@@ -404,10 +417,12 @@ rewritten.
 The remote helper advertises refs in `refs/heads/*` and `refs/tags/*`. All other
 namespaces MUST be rejected before publication. Branch refs MUST resolve to
 commits and retain the fast-forward check unless the writer explicitly forces
-the update. Lightweight and annotated tags MAY point to any Git object; their
-complete object graphs, including annotated tag objects, MUST be included in
-the encrypted pack and verified by receiving clients. An existing tag MUST
-remain unchanged unless the update is forced.
+the update. Lightweight and annotated tags MAY point to any Git object. The
+writer MUST verify the complete object graph, including annotated tag objects,
+of every ref it adds or changes; the encrypted pack MUST carry every object of
+that graph not reachable from the parent's ref tips, and receiving clients
+verify the result. An existing tag MUST remain unchanged unless the update is
+forced.
 
 Deleting an existing branch or tag publishes a signed writer manifest with the
 complete ref map minus that ref. A deletion introduces no pack and does not
@@ -428,9 +443,11 @@ state, not an authorization source.
 
 After importing the required deltas, the client MUST verify that every current
 ref resolves to a complete local Git object graph before moving remote-tracking
-refs, pinning the new head, or publishing a successor. A signed ref advance
-whose required pack delta is absent is invalid even when every cryptographic
-check succeeds.
+refs or pinning the new head. A signed ref advance whose required pack delta is
+absent is invalid even when every cryptographic check succeeds, and a fetch
+that finds an incomplete graph fails. A writer publishing a successor verifies
+only the refs it adds or changes (§8.1); refs it carries over unchanged keep
+the parent's state and are verified by readers on fetch.
 
 Each machine (per OS user) keeps one continuity floor per repository root:
 repository root, manifest ID and generation, and policy generation. Every
@@ -536,8 +553,11 @@ operation. A successful recovery advances the floor only after its own CAS
 succeeds. Recovery MUST NOT run from remote-helper `list` or `list for-push`,
 and an ordinary `git push` MUST NOT trigger it.
 
-Force pushes append a normal pack delta and new ref state. Older packs remain
-in historical manifests and may become unreachable in the inner Git graph.
+Force pushes append a normal pack delta and new ref state. Like any other
+push, the delta excludes objects reachable from the parent's ref tips held
+locally, which every reader that accepted the parent already holds, so a force
+push uploads only the rewritten objects. Older packs remain in historical
+manifests and may become unreachable in the inner Git graph.
 
 ## 10. Concurrency
 
