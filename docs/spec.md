@@ -2,8 +2,8 @@
 
 > [!WARNING]
 > This document specifies the experimental v6 format implemented by the current
-> prototype. It does not read v5 or earlier repositories. There is no
-> automatic migration; keep an independent plaintext copy and every device key.
+> prototype. It does not read v5 or earlier repositories (section 14.3). Keep
+> an independent plaintext copy and every device key.
 
 ## 1. Requirements
 
@@ -654,17 +654,66 @@ work is linear in manifest generations until checkpoint compaction exists.
 - Writers can author destructive Git history; force remains explicit.
 - Global rollback/equivocation detection requires an external anchor.
 
-## 14. Migration and future work
+## 14. Format evolution and migration
 
-v6 is intentionally wire-incompatible with v5 and earlier and does not read
-them; it ships no migration. Moving a repository requires a trusted client able
-to decrypt the older repository and republish under a new v6 repository
-boundary. The local key file remains format 3 because its stable
-repository/device identity material did not change; the storage layout,
-manifest, policy, signature, KDF, HPKE, and AEAD domains all carry format 6 and
-therefore fail closed across format versions.
+### 14.1 Guarantees that hold across formats
 
-Planned extensions:
+Every later format MUST keep the following, so that a client of one format
+stops cleanly on storage of another and a repository can move forward without
+new device keys:
+
+- `FORMAT` stays a small regular file at the storage root (the directory, or
+  the root of the carrier branch) containing `git-remote-e2ee storage <N>\n`.
+  A client reads it before anything else and stops with the section 5 message
+  when `N` is not its own format. It never writes into storage of another
+  format.
+- Manifests and policies keep `format_version` readable before the rest of the
+  schema, and a client reports an unknown version as unsupported, never as
+  malformed or invalid (section 9, explicit recovery).
+- Every domain-separation string and ciphertext magic carries the format
+  number, so material of one format never authenticates or decrypts as
+  another.
+- The key file format and the derivation of the repository root and device
+  IDs from public keys do not change with the storage format. A format that
+  must change them is a separate key migration and MUST say so.
+
+### 14.2 Moving a repository from v6 to a later format
+
+A later format that replaces v6 SHOULD migrate in place as follows:
+
+1. Any active v6 administrator runs the migration from a checkout whose local
+   refs equal the current v6 refs and whose object graph is complete
+   (section 9). It reads the current v6 head through the machine floor as a
+   normal v6 operation.
+2. The new format's first manifest keeps the v6 repository root and names the
+   last v6 manifest ID and generation as its predecessor, signed by the
+   migrating administrator. Its generation continues from that one, so every
+   machine floor keeps moving forward across the change and a rollback to v6
+   state is still rejected.
+3. Its policy carries the v6 policy's active devices with their roles and
+   labels; revoked devices are not carried. Existing device keys keep working.
+4. The repository content is re-encrypted under the new format from the
+   checkout as one generation.
+5. Publication is one compare-and-swap from the observed v6 storage state that
+   also replaces `FORMAT`. A v6 client racing it loses the compare-and-swap,
+   and on retry reads the new `FORMAT` and stops.
+
+The new format's client reads v6 only as far as this needs (the authenticated
+manifest and policy chain, not v6 packs), and only for the release that
+introduces it.
+
+### 14.3 Earlier formats
+
+v6 does not read v5 or earlier repositories and ships no migration. A format 4
+carrier keeps its storage under `e2ee/` on branch `git-remote-e2ee`; a v6
+client that finds that branch beside an absent selected branch, or that layout
+on the selected branch, reports format 4 storage and refuses to initialize
+beside it. Moving such a repository means stopping every client, publishing the
+plaintext history from a trusted checkout into a new v6 storage, re-adding the
+devices, and deleting the format 4 branch. Device key files are format 3 in
+both and can be reused when the original owner key creates the v6 genesis.
+
+### 14.4 Planned extensions
 
 1. checkpoint/compaction and garbage collection with explicit authority;
 2. M-of-N administrator authorization and recovery;
