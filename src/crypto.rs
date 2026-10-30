@@ -243,14 +243,6 @@ pub fn verify_domain(
         .context("signature verification failed")
 }
 
-pub fn wrap_generation_key(
-    public_key: &str,
-    generation_key: &[u8; 32],
-    aad: &[u8],
-) -> Result<(Vec<u8>, Vec<u8>)> {
-    wrap_generation_key_with_seed(public_key, generation_key, aad, &random_seed())
-}
-
 pub fn random_seed() -> [u8; 32] {
     let mut seed = [0_u8; 32];
     OsRng.fill_bytes(&mut seed);
@@ -758,8 +750,13 @@ mod tests {
         let second = KeyFile::generate_for_repository(first.repository_root.clone()).unwrap();
         let generation_key = random_key();
         let public = first.public_device().unwrap();
-        let (enc, ciphertext) =
-            wrap_generation_key(&public.wrapping_public_key, &generation_key, b"manifest").unwrap();
+        let (enc, ciphertext) = wrap_generation_key_with_seed(
+            &public.wrapping_public_key,
+            &generation_key,
+            b"manifest",
+            &random_seed(),
+        )
+        .unwrap();
         assert_eq!(
             first
                 .unwrap_generation_key(&enc, &ciphertext, b"manifest")
