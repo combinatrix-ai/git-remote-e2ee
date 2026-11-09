@@ -179,13 +179,20 @@ fn floor_with_malformed_head(
     (key, storage, repo, floor, junk_id)
 }
 
+/// An envelope in the field order `seal_manifest` writes, around `header`.
 fn manifest_with_header(header: serde_json::Value) -> Vec<u8> {
-    serde_json::to_vec(&serde_json::json!({
-        "header": base64::engine::general_purpose::STANDARD
+    #[derive(serde::Serialize)]
+    struct Envelope {
+        header: String,
+        sealed_header_ciphertext: String,
+        body_ciphertext: String,
+    }
+    serde_json::to_vec(&Envelope {
+        header: base64::engine::general_purpose::STANDARD
             .encode(serde_json::to_vec(&header).unwrap()),
-        "sealed_header_ciphertext": "",
-        "body_ciphertext": ""
-    }))
+        sealed_header_ciphertext: String::new(),
+        body_ciphertext: String::new(),
+    })
     .unwrap()
 }
 
@@ -706,6 +713,118 @@ fn returning_client_fetches_multiple_offline_generations_from_deltas() {
     );
 }
 
+/// Publishes, as the owner, a validly signed successor whose only change is
+/// the text `refs/heads/main` points at. No pack accompanies it.
+fn publish_signed_main_target(remote: &Path, key: &KeyFile, main_target: &str) {
+    let head = fs::read_to_string(remote.join("HEAD"))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let manifest_bytes = read_stored_object(remote, "manifests", &head);
+    let header = peek_manifest_header(&manifest_bytes).unwrap();
+    let (policy, _) = PolicyState::genesis(key, "owner").unwrap();
+    policy.validate_genesis(&key.repository_root).unwrap();
+    let current_key = unwrap_generation_key(&header, key).unwrap();
+    let current = open_manifest(&manifest_bytes, &current_key).unwrap();
+    verify_manifest(&current, &policy, None, &current_key).unwrap();
+    let current = current.manifest().clone();
+
+    let next_key = random_key();
+    let generation = current.generation + 1;
+    let mut refs = current.refs.clone();
+    refs.insert("refs/heads/main".to_owned(), main_target.to_owned());
+    let malicious = Manifest {
+        format_version: current.format_version,
+        repository_root: current.repository_root.clone(),
+        generation,
+        previous: Some(head.clone()),
+        policy_id: policy.id.clone(),
+        policy_generation: policy.body.generation,
+        authorization: ManifestAuthorization::Writer,
+        total_pack_count: current.total_pack_count,
+        refs,
+        new_packs: Vec::new(),
+        predecessor_key_wrap: Some(
+            wrap_predecessor_key(
+                &next_key,
+                &current_key,
+                &current.repository_root,
+                generation,
+                &head,
+            )
+            .unwrap(),
+        ),
+        introduced_policy: None,
+    };
+    let malicious_bytes = seal_manifest(
+        key,
+        &policy,
+        &next_key,
+        ManifestAuthorization::Writer,
+        malicious,
+    )
+    .unwrap();
+    let malicious_id = object_id(&malicious_bytes);
+    write_stored_object(remote, "manifests", &malicious_id, &malicious_bytes);
+    fs::write(remote.join("HEAD"), format!("{malicious_id}\n")).unwrap();
+}
+
+#[test]
+fn a_signed_ref_that_is_not_an_object_id_is_rejected_before_git_resolves_it() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let destination = temporary.path().join("destination");
+    let remote = temporary.path().join("remote");
+    initialize_git(&source);
+    initialize_git(&destination);
+    let key = KeyFile::generate();
+    let repository = EncryptedRepository::new(
+        FilesystemStorage::new(&remote),
+        key.clone(),
+        support::state_dir(),
+    );
+    repository.initialize("owner").unwrap();
+    let published = commit(&source, "valid\n", "valid");
+    repository
+        .push_ref(
+            &GitRepository::open(&source).unwrap(),
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
+        .unwrap();
+    let destination_repo = GitRepository::open(&destination).unwrap();
+    repository.fetch_into(&destination_repo, "e2ee").unwrap();
+    commit(&destination, "never pushed\n", "private");
+    git(&destination, &["branch", "private"]);
+
+    // A revision expression names whatever it resolves to in each reader's
+    // own repository, here a commit the reader never published.
+    publish_signed_main_target(&remote, &key, "refs/heads/private");
+
+    let error = format!(
+        "{:#}",
+        repository
+            .fetch_into(&destination_repo, "e2ee")
+            .unwrap_err()
+    );
+    assert!(error.contains("not a Git object ID"), "{error}");
+    assert_eq!(
+        git(&destination, &["rev-parse", "refs/remotes/e2ee/main"]),
+        published
+    );
+    assert_eq!(machine_floor(&destination)["generation"], 1);
+
+    // The head is proven invalid, so a writer can replace it.
+    let report = publish_recovery(&repository, &destination).unwrap();
+    assert_eq!(report.classification, RecoveryClass::Invalid);
+    assert!(report.published_manifest.is_some(), "{report:?}");
+    let recovered = repository.fetch_into(&destination_repo, "e2ee").unwrap();
+    assert_eq!(recovered.refs["refs/heads/main"], published);
+}
+
 #[test]
 fn returning_client_rejects_signed_ref_advance_without_its_pack() {
     let temporary = tempfile::tempdir().unwrap();
@@ -736,57 +855,7 @@ fn returning_client_rejects_signed_ref_advance_without_its_pack() {
         .fetch_into(&GitRepository::open(&destination).unwrap(), "e2ee")
         .unwrap();
 
-    let head = fs::read_to_string(remote.join("HEAD"))
-        .unwrap()
-        .trim()
-        .to_owned();
-    let manifest_bytes = read_stored_object(&remote, "manifests", &head);
-    let header = peek_manifest_header(&manifest_bytes).unwrap();
-    let (policy, _) = PolicyState::genesis(&key, "owner").unwrap();
-    policy.validate_genesis(&key.repository_root).unwrap();
-    let current_key = unwrap_generation_key(&header, &key).unwrap();
-    let current = open_manifest(&manifest_bytes, &current_key).unwrap();
-    verify_manifest(&current, &policy, None, &current_key).unwrap();
-    let current = current.manifest().clone();
-
-    let next_key = random_key();
-    let generation = current.generation + 1;
-    let mut refs = current.refs.clone();
-    refs.insert("refs/heads/main".to_owned(), "1".repeat(40));
-    let malicious = Manifest {
-        format_version: current.format_version,
-        repository_root: current.repository_root.clone(),
-        generation,
-        previous: Some(head.clone()),
-        policy_id: policy.id.clone(),
-        policy_generation: policy.body.generation,
-        authorization: ManifestAuthorization::Writer,
-        total_pack_count: current.total_pack_count,
-        refs,
-        new_packs: Vec::new(),
-        predecessor_key_wrap: Some(
-            wrap_predecessor_key(
-                &next_key,
-                &current_key,
-                &current.repository_root,
-                generation,
-                &head,
-            )
-            .unwrap(),
-        ),
-        introduced_policy: None,
-    };
-    let malicious_bytes = seal_manifest(
-        &key,
-        &policy,
-        &next_key,
-        ManifestAuthorization::Writer,
-        malicious,
-    )
-    .unwrap();
-    let malicious_id = object_id(&malicious_bytes);
-    write_stored_object(&remote, "manifests", &malicious_id, &malicious_bytes);
-    fs::write(remote.join("HEAD"), format!("{malicious_id}\n")).unwrap();
+    publish_signed_main_target(&remote, &key, &"1".repeat(40));
 
     let error = repository
         .fetch_into(&GitRepository::open(&destination).unwrap(), "e2ee")

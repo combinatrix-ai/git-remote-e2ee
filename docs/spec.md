@@ -430,6 +430,12 @@ that graph not reachable from the parent's ref tips, and receiving clients
 verify the result. An existing tag MUST remain unchanged unless the update is
 forced.
 
+Every ref in a manifest MUST have a name `git check-ref-format` accepts and a
+target that is a full lowercase hexadecimal object ID (40 or 64 digits). Chain
+authentication rejects a manifest that breaks either rule as invalid, before
+any ref reaches Git: Git would resolve other target text as a revision
+expression in each reader's own repository.
+
 Deleting an existing branch or tag publishes a signed writer manifest with the
 complete ref map minus that ref. A deletion introduces no pack and does not
 increase the cumulative pack count. The helper advertises `refs/heads/main` as

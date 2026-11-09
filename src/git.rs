@@ -72,12 +72,24 @@ pub fn validate_inner_ref(reference: &str) -> Result<InnerRefKind> {
     Ok(kind)
 }
 
-/// Checks every ref name of a manifest once, when an operation accepts it.
+/// Checks every ref of a manifest once, when an operation accepts it. A
+/// target must be a full object ID: Git would resolve any other text as a
+/// revision expression against the local repository.
 pub fn validate_inner_refs(refs: &BTreeMap<String, String>) -> Result<()> {
-    for reference in refs.keys() {
+    for (reference, object) in refs {
         validate_inner_ref(reference)?;
+        if !is_object_id(object) {
+            bail!("ref {reference} points at {object:?}, which is not a Git object ID")
+        }
     }
     Ok(())
+}
+
+fn is_object_id(object: &str) -> bool {
+    matches!(object.len(), 40 | 64)
+        && object
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 pub fn ensure_branch_target(
