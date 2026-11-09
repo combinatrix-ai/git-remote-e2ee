@@ -30,7 +30,7 @@ An `e2ee::` URL is followed by the storage address:
 
 | URL | Storage |
 |---|---|
-| `e2ee::https://host/you/repo.git`, `e2ee::git@host:you/repo.git`, `e2ee::ssh://…`, `e2ee::file://…`, `e2ee::/srv/repo.git` | A Git repository used as carrier. Anything `git push` accepts. |
+| `e2ee::https://host/you/repo.git`, `e2ee::git@host:you/repo.git`, `e2ee::ssh://…`, `e2ee::file://…`, `e2ee::/srv/repo.git` | A Git repository used as carrier. Anything `git push` accepts, except a remote that starts with `-`, which Git would read as an option. |
 | `e2ee::dir:/srv/encrypted/example` | A directory (filesystem backend). |
 
 A relative path is resolved against the directory the command runs in, and the

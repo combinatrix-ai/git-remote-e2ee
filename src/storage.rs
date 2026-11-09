@@ -1970,6 +1970,11 @@ fn parse_carrier_location(location: &str) -> Result<(String, String)> {
     if remote.is_empty() {
         bail!("empty carrier Git remote")
     }
+    // Git would read such a remote as an option: `--upload-pack=<command>`
+    // runs the command.
+    if remote.starts_with('-') {
+        bail!("carrier Git remote {remote:?} must not start with '-'")
+    }
     if branch.is_empty() {
         bail!("empty carrier branch in {location:?}")
     }
