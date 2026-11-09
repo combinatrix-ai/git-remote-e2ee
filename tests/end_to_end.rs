@@ -826,6 +826,59 @@ fn a_signed_ref_that_is_not_an_object_id_is_rejected_before_git_resolves_it() {
 }
 
 #[test]
+fn storage_cannot_rename_a_signed_head_by_re_encoding_it() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let destination = temporary.path().join("destination");
+    let remote = temporary.path().join("remote");
+    initialize_git(&source);
+    initialize_git(&destination);
+    let key = KeyFile::generate();
+    let writer = EncryptedRepository::new(
+        FilesystemStorage::new(&remote),
+        key.clone(),
+        support::state_dir(),
+    );
+    writer.initialize("owner").unwrap();
+    commit(&source, "one\n", "one");
+    let source_repo = GitRepository::open(&source).unwrap();
+    let update = RefChange::Update {
+        source: "refs/heads/main",
+        force: false,
+    };
+    let signed_head = writer
+        .push_ref(&source_repo, "refs/heads/main", update)
+        .unwrap();
+
+    // Storage needs no key to re-encode the envelope around the signed parts.
+    let signed = read_stored_object(&remote, "manifests", &signed_head);
+    let envelope: serde_json::Value = serde_json::from_slice(&signed).unwrap();
+    let re_encoded = serde_json::to_vec_pretty(&envelope).unwrap();
+    let renamed_head = object_id(&re_encoded);
+    assert_ne!(renamed_head, signed_head);
+    write_stored_object(&remote, "manifests", &renamed_head, &re_encoded);
+    fs::write(remote.join("HEAD"), format!("{renamed_head}\n")).unwrap();
+
+    let other_machine = temporary.path().join("other-machine-state");
+    let reader = EncryptedRepository::new(FilesystemStorage::new(&remote), key, &other_machine);
+    let destination_repo = GitRepository::open(&destination).unwrap();
+    let error = format!(
+        "{:#}",
+        reader.fetch_into(&destination_repo, "e2ee").unwrap_err()
+    );
+    assert!(error.contains("not canonically encoded"), "{error}");
+
+    // The reader pinned nothing, so it still follows the head the writer signed.
+    fs::write(remote.join("HEAD"), format!("{signed_head}\n")).unwrap();
+    commit(&source, "two\n", "two");
+    writer
+        .push_ref(&source_repo, "refs/heads/main", update)
+        .unwrap();
+    let fetched = reader.fetch_into(&destination_repo, "e2ee").unwrap();
+    assert_eq!(fetched.generation, 2);
+}
+
+#[test]
 fn returning_client_rejects_signed_ref_advance_without_its_pack() {
     let temporary = tempfile::tempdir().unwrap();
     let source = temporary.path().join("source");

@@ -170,6 +170,14 @@ checks `FORMAT` first: no `HEAD` and no `FORMAT` means uninitialized; a
 git-remote-e2ee reads format 6`. `FORMAT` is unauthenticated and only selects
 that message; authenticity comes from the signed manifests.
 
+A manifest object MUST be the exact byte encoding its writer produced: one
+JSON object with the members `header`, `sealed_header_ciphertext`, and
+`body_ciphertext` in that order and no insignificant whitespace. Readers MUST
+reject any other encoding. The signature covers what those members carry, not
+the object's bytes, so a second accepted encoding would let storage present
+one signed state under a second manifest ID, and a client that pinned that ID
+would see the writers' own chain as a fork.
+
 Private device keys and decrypted generation keys are never stored remotely or
 in client continuity pins. A policy is included in the encrypted body of the
 manifest that introduces it; there are no separate `policies/` objects.
@@ -657,6 +665,11 @@ work is linear in manifest generations until checkpoint compaction exists.
   device public keys or IDs, roles, signer identity, or membership changes,
   although size patterns may reveal a membership transition.
 - Storage can delete, freeze, or deny service.
+- A reader holds the key that seals a manifest's sealed header, so a reader
+  with storage write access can re-encrypt it and present one signed state
+  under a second manifest ID. A client that pins that ID later sees the
+  writers' chain as a fork. Closing this needs a manifest ID that does not
+  depend on the sealed-header ciphertext, which is a format change.
 - Writers can author destructive Git history; force remains explicit.
 - Global rollback/equivocation detection requires an external anchor.
 
