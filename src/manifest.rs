@@ -9,8 +9,9 @@ use sha2::{Digest, Sha256};
 use crate::FORMAT_VERSION;
 use crate::crypto::{
     HPKE_CIPHERTEXT_SIZE, HPKE_ENCAPSULATED_KEY_SIZE, KeyFile, SecretKey, SubkeyKind, commit_key,
-    derive_subkey, dummy_generation_envelope, open_with_key, random_seed, seal_with_key,
-    verify_domain, verify_key_commitment, wrap_generation_key_with_seed,
+    derive_subkey, dummy_generation_envelope, open_deterministic, open_with_key, random_seed,
+    seal_deterministic, seal_with_key, verify_domain, verify_key_commitment,
+    wrap_generation_key_with_seed,
 };
 use crate::error::{ForeignRepository, NotActiveReader, Unsupported};
 use crate::policy::PolicyState;
@@ -313,14 +314,9 @@ pub fn seal_manifest(
         signature: BASE64.encode(key.sign_domain(MANIFEST_SIGNATURE_DOMAIN, &signed_bytes)?),
     };
     let sealed_bytes = serde_json::to_vec(&sealed)?;
-    let sealed_key = derive_subkey(
-        generation_key,
-        &header.repository_root,
-        header.generation,
-        SubkeyKind::SealedHeader,
-        0,
-    )?;
-    let sealed_header_ciphertext = seal_with_key(&sealed_key, &sealed_bytes, &exact_header)?;
+    let (sealed_key, nonce_key) = sealed_header_keys(generation_key, &header)?;
+    let sealed_header_ciphertext =
+        seal_deterministic(&sealed_key, &nonce_key, &sealed_bytes, &exact_header)?;
     Ok(serde_json::to_vec(&ManifestEnvelope {
         header: BASE64.encode(exact_header),
         sealed_header_ciphertext: BASE64.encode(sealed_header_ciphertext),
@@ -447,17 +443,19 @@ pub fn open_manifest(encrypted: &[u8], generation_key: &[u8; 32]) -> Result<Open
         bail!("manifest body digest mismatch")
     }
 
-    let sealed_key = derive_subkey(
-        generation_key,
-        &header.repository_root,
-        header.generation,
-        SubkeyKind::SealedHeader,
-        0,
-    )?;
-    let sealed_bytes = open_with_key(&sealed_key, &sealed_header_ciphertext, &exact_header)
-        .context("open sealed manifest header")?;
+    let (sealed_key, nonce_key) = sealed_header_keys(generation_key, &header)?;
+    let sealed_bytes = open_deterministic(
+        &sealed_key,
+        &nonce_key,
+        &sealed_header_ciphertext,
+        &exact_header,
+    )
+    .context("open sealed manifest header")?;
     let sealed: SealedHeaderEnvelope =
         serde_json::from_slice(&sealed_bytes).context("parse sealed manifest header")?;
+    if serde_json::to_vec(&sealed)? != sealed_bytes {
+        bail!("sealed manifest header is not canonically encoded")
+    }
     let exact_sealed_content = BASE64
         .decode(sealed.content)
         .context("decode sealed manifest content")?;
@@ -523,6 +521,29 @@ pub fn open_manifest(encrypted: &[u8], generation_key: &[u8; 32]) -> Result<Open
         exact_sealed_content,
         signature,
     })
+}
+
+/// The sealed header's encryption key and the key its nonce is derived
+/// with. Every reader holds both, so the ciphertext must be a function of
+/// its plaintext: otherwise a reader could re-encrypt the sealed header and
+/// give one signed state a second manifest ID.
+fn sealed_header_keys(
+    generation_key: &[u8; 32],
+    header: &ManifestHeader,
+) -> Result<(SecretKey, SecretKey)> {
+    let derive = |kind| {
+        derive_subkey(
+            generation_key,
+            &header.repository_root,
+            header.generation,
+            kind,
+            0,
+        )
+    };
+    Ok((
+        derive(SubkeyKind::SealedHeader)?,
+        derive(SubkeyKind::SealedHeaderNonce)?,
+    ))
 }
 
 pub fn verify_manifest(
@@ -1019,14 +1040,7 @@ mod tests {
         let mut header_bytes = BASE64.decode(&envelope.header).unwrap();
         let mut header: ManifestHeader = serde_json::from_slice(&header_bytes).unwrap();
         let sealed_ciphertext = BASE64.decode(&envelope.sealed_header_ciphertext).unwrap();
-        let sealed_key = derive_subkey(
-            generation_key,
-            &header.repository_root,
-            header.generation,
-            SubkeyKind::SealedHeader,
-            0,
-        )
-        .unwrap();
+        let (sealed_key, _) = sealed_header_keys(generation_key, &header).unwrap();
         let sealed_bytes = open_with_key(&sealed_key, &sealed_ciphertext, &header_bytes).unwrap();
         let mut sealed: SealedHeaderEnvelope = serde_json::from_slice(&sealed_bytes).unwrap();
         let mut exact_content = BASE64.decode(&sealed.content).unwrap();
@@ -1043,10 +1057,55 @@ mod tests {
         );
         let sealed_bytes = serde_json::to_vec(&sealed).unwrap();
         envelope.header = BASE64.encode(&header_bytes);
-        envelope.sealed_header_ciphertext =
-            BASE64.encode(seal_with_key(&sealed_key, &sealed_bytes, &header_bytes).unwrap());
+        let (sealed_key, nonce_key) = sealed_header_keys(generation_key, &header).unwrap();
+        envelope.sealed_header_ciphertext = BASE64.encode(
+            seal_deterministic(&sealed_key, &nonce_key, &sealed_bytes, &header_bytes).unwrap(),
+        );
         envelope.body_ciphertext = BASE64.encode(body_ciphertext);
         serde_json::to_vec(&envelope).unwrap()
+    }
+
+    #[test]
+    fn a_reader_cannot_give_a_signed_manifest_a_second_id() {
+        let owner = KeyFile::generate();
+        let (policy, _) = PolicyState::genesis(&owner, "owner").unwrap();
+        let generation_key = random_key();
+        let signed = writer_manifest(&owner, &policy, &generation_key);
+        let mut envelope: ManifestEnvelope = serde_json::from_slice(&signed).unwrap();
+        let header_bytes = BASE64.decode(&envelope.header).unwrap();
+        let header: ManifestHeader = serde_json::from_slice(&header_bytes).unwrap();
+        let (sealed_key, _) = sealed_header_keys(&generation_key, &header).unwrap();
+        let sealed_bytes = open_with_key(
+            &sealed_key,
+            &BASE64.decode(&envelope.sealed_header_ciphertext).unwrap(),
+            &header_bytes,
+        )
+        .unwrap();
+
+        // Same signed content, re-encrypted under a fresh nonce.
+        envelope.sealed_header_ciphertext =
+            BASE64.encode(seal_with_key(&sealed_key, &sealed_bytes, &header_bytes).unwrap());
+        let re_encrypted = serde_json::to_vec(&envelope).unwrap();
+        assert_ne!(re_encrypted, signed);
+        let error = format!(
+            "{:#}",
+            open_manifest(&re_encrypted, &generation_key).unwrap_err()
+        );
+        assert!(error.contains("derived nonce"), "{error}");
+
+        // Same signed content inside a re-encoded sealed envelope.
+        let sealed: serde_json::Value = serde_json::from_slice(&sealed_bytes).unwrap();
+        let re_encoded = serde_json::to_vec_pretty(&sealed).unwrap();
+        let (sealed_key, nonce_key) = sealed_header_keys(&generation_key, &header).unwrap();
+        envelope.sealed_header_ciphertext = BASE64.encode(
+            seal_deterministic(&sealed_key, &nonce_key, &re_encoded, &header_bytes).unwrap(),
+        );
+        let error = open_manifest(&serde_json::to_vec(&envelope).unwrap(), &generation_key)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not canonically encoded"), "{error}");
+
+        open_manifest(&signed, &generation_key).unwrap();
     }
 
     fn writer_manifest(

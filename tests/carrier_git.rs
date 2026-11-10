@@ -1784,7 +1784,7 @@ fn edit_carrier(carrier: &Path, workdir: &Path, edit: impl FnOnce(&Path)) {
 }
 
 #[test]
-fn carrier_root_holds_exactly_the_v6_layout() {
+fn carrier_root_holds_exactly_the_v7_layout() {
     let temporary = tempfile::tempdir().unwrap();
     let _cache = isolated_cache(&temporary);
     let carrier = temporary.path().join("carrier.git");
@@ -1821,7 +1821,7 @@ fn carrier_root_holds_exactly_the_v6_layout() {
         )
         .stdout
     };
-    assert_eq!(blob("FORMAT"), b"git-remote-e2ee storage 6\n");
+    assert_eq!(blob("FORMAT"), b"git-remote-e2ee storage 7\n");
     assert_eq!(blob(".gitattributes"), b"* -delta\n");
     let readme = String::from_utf8(blob("README.md")).unwrap();
     assert!(readme.starts_with("# Encrypted Git repository\n\nThis branch holds"));
@@ -1854,12 +1854,12 @@ fn carrier_format_mismatch_names_the_found_format() {
     };
 
     edit_carrier(&carrier, &workdir, |root| {
-        fs::write(root.join("FORMAT"), "git-remote-e2ee storage 7\n").unwrap();
+        fs::write(root.join("FORMAT"), "git-remote-e2ee storage 8\n").unwrap();
     });
     let error = read_error();
     assert!(
         error.contains(&format!(
-            "storage at {} uses format 7; this git-remote-e2ee reads format 6",
+            "storage at {} uses format 8; this git-remote-e2ee reads format 7",
             carrier.display()
         )),
         "{error}"
@@ -1870,7 +1870,7 @@ fn carrier_format_mismatch_names_the_found_format() {
     });
     let error = read_error();
     assert!(
-        error.contains("uses format 5 or earlier; this git-remote-e2ee reads format 6"),
+        error.contains("uses format 5 or earlier; this git-remote-e2ee reads format 7"),
         "{error}"
     );
 }

@@ -32,6 +32,7 @@ const PACK_STREAM_MAGIC: &[u8] = concat!("E2EEPK", format_version!(), "\0").as_b
 const HPKE_INFO: &[u8] = concat!("git-remote-e2ee generation key v", format_version!()).as_bytes();
 const KEY_COMMITMENT_DOMAIN: &[u8] = domain!("generation key commitment");
 const SUBKEY_SALT: &[u8] = domain!("subkey derivation");
+const SYNTHETIC_NONCE_SALT: &[u8] = domain!("synthetic nonce");
 pub const HPKE_ENCAPSULATED_KEY_SIZE: usize = 32;
 pub const HPKE_CIPHERTEXT_SIZE: usize = 32 + 16;
 pub const PACK_STREAM_CHUNK_SIZE: usize = 1024 * 1024;
@@ -52,6 +53,7 @@ pub enum SubkeyKind {
     Pack = 2,
     PredecessorLink = 3,
     SealedHeader = 4,
+    SealedHeaderNonce = 5,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,7 +122,22 @@ impl KeyFile {
     }
 
     pub fn read(path: &Path) -> Result<Self> {
-        let bytes = fs::read(path).with_context(|| format!("read key file {}", path.display()))?;
+        let mut file =
+            fs::File::open(path).with_context(|| format!("read key file {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = file.metadata()?.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                bail!(
+                    "key file {} is accessible to other users (mode {mode:o}); run chmod 600 on it",
+                    path.display()
+                )
+            }
+        }
+        let mut bytes = Zeroizing::new(Vec::new());
+        file.read_to_end(&mut bytes)
+            .with_context(|| format!("read key file {}", path.display()))?;
         let key: Self = serde_json::from_slice(&bytes).context("parse key file")?;
         if key.format_version != 3 {
             bail!(Unsupported(format!(
@@ -336,9 +353,64 @@ pub fn derive_subkey(
 }
 
 pub fn seal_with_key(key: &[u8; 32], plaintext: &[u8], associated_data: &[u8]) -> Result<Vec<u8>> {
-    let cipher = XChaCha20Poly1305::new(key.into());
     let mut nonce = [0_u8; 24];
     OsRng.fill_bytes(&mut nonce);
+    seal_with_nonce(key, &nonce, plaintext, associated_data)
+}
+
+/// Seals with a nonce derived from `nonce_key`, the associated data, and the
+/// plaintext, so one input has exactly one ciphertext. `nonce_key` must be
+/// used for nothing else, and `key` must not seal with random nonces.
+pub fn seal_deterministic(
+    key: &[u8; 32],
+    nonce_key: &[u8; 32],
+    plaintext: &[u8],
+    associated_data: &[u8],
+) -> Result<Vec<u8>> {
+    let nonce = synthetic_nonce(nonce_key, plaintext, associated_data)?;
+    seal_with_nonce(key, &nonce, plaintext, associated_data)
+}
+
+/// Opens an envelope and requires it to be the one `seal_deterministic`
+/// produces for its plaintext.
+pub fn open_deterministic(
+    key: &[u8; 32],
+    nonce_key: &[u8; 32],
+    envelope: &[u8],
+    associated_data: &[u8],
+) -> Result<Vec<u8>> {
+    let plaintext = open_with_key(key, envelope, associated_data)?;
+    let expected = synthetic_nonce(nonce_key, &plaintext, associated_data)?;
+    let nonce = &envelope[SYMMETRIC_MAGIC.len()..SYMMETRIC_MAGIC.len() + 24];
+    if !bool::from(expected.ct_eq(nonce)) {
+        bail!("encrypted object does not use its derived nonce")
+    }
+    Ok(plaintext)
+}
+
+fn synthetic_nonce(
+    nonce_key: &[u8; 32],
+    plaintext: &[u8],
+    associated_data: &[u8],
+) -> Result<[u8; 24]> {
+    let mut hasher = Sha256::new();
+    hasher.update((associated_data.len() as u64).to_le_bytes());
+    hasher.update(associated_data);
+    hasher.update(plaintext);
+    let hkdf = Hkdf::<Sha256>::new(Some(SYNTHETIC_NONCE_SALT), nonce_key);
+    let mut nonce = [0_u8; 24];
+    hkdf.expand(&hasher.finalize(), &mut nonce)
+        .map_err(|_| anyhow::anyhow!("HKDF nonce derivation failed"))?;
+    Ok(nonce)
+}
+
+fn seal_with_nonce(
+    key: &[u8; 32],
+    nonce: &[u8; 24],
+    plaintext: &[u8],
+    associated_data: &[u8],
+) -> Result<Vec<u8>> {
+    let cipher = XChaCha20Poly1305::new(key.into());
     let nonce: &XNonce = nonce
         .as_slice()
         .try_into()
@@ -585,6 +657,11 @@ pub fn open_pack_stream(
     ));
     let mut remaining = plaintext_size;
     let mut ciphertext_count = PACK_STREAM_HEADER_SIZE as u64;
+    // Every segment authenticates under the pack key, which each reader
+    // holds. Only the ID check ties the stream to the manifest, so the final
+    // segment, which carries the pack trailer Git needs to accept the pack,
+    // is released after that check.
+    let mut held_final = Vec::new();
     for segment in 0..segments {
         let plain_len = remaining.min(PACK_STREAM_CHUNK_SIZE as u64) as usize;
         let cipher_len = plain_len + PACK_STREAM_TAG_SIZE;
@@ -610,8 +687,12 @@ pub fn open_pack_stream(
         if chunk.len() != plain_len {
             bail!("pack stream segment length mismatch")
         }
-        plaintext.write_all(&chunk)?;
         remaining -= plain_len as u64;
+        if segment + 1 == segments {
+            held_final = chunk;
+        } else {
+            plaintext.write_all(&chunk)?;
+        }
     }
     let mut trailing = [0_u8; 1];
     loop {
@@ -629,6 +710,7 @@ pub fn open_pack_stream(
     if actual_id != expected_id {
         bail!("pack ciphertext hash mismatch for {expected_id}")
     }
+    plaintext.write_all(&held_final)?;
     plaintext.flush()?;
     Ok(ciphertext_count)
 }
@@ -742,6 +824,34 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(open_with_key(&key, &first, b"pack").unwrap(), b"same");
         assert!(open_with_key(&key, &second, b"manifest").is_err());
+    }
+
+    #[test]
+    fn deterministic_sealing_has_one_ciphertext_per_input() {
+        let key = random_key();
+        let nonce_key = random_key();
+        let sealed = seal_deterministic(&key, &nonce_key, b"same", b"context").unwrap();
+        assert_eq!(
+            sealed,
+            seal_deterministic(&key, &nonce_key, b"same", b"context").unwrap()
+        );
+        assert_ne!(
+            sealed,
+            seal_deterministic(&key, &nonce_key, b"other", b"context").unwrap()
+        );
+        assert_eq!(
+            open_deterministic(&key, &nonce_key, &sealed, b"context").unwrap(),
+            b"same"
+        );
+
+        // A key holder can re-encrypt under a nonce of its choosing.
+        let re_encrypted = seal_with_key(&key, b"same", b"context").unwrap();
+        assert_eq!(
+            open_with_key(&key, &re_encrypted, b"context").unwrap(),
+            b"same"
+        );
+        let error = open_deterministic(&key, &nonce_key, &re_encrypted, b"context").unwrap_err();
+        assert!(error.to_string().contains("derived nonce"), "{error}");
     }
 
     #[test]
@@ -887,7 +997,11 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("pack ciphertext hash mismatch"));
-        assert_eq!(authenticated_plaintext, plaintext);
+        assert_eq!(
+            authenticated_plaintext,
+            plaintext[..PACK_STREAM_CHUNK_SIZE],
+            "the final segment must be withheld until the ID matches"
+        );
     }
 
     #[test]

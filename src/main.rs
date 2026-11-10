@@ -386,7 +386,16 @@ fn default_key_path(repository_root: &str) -> Result<PathBuf> {
         .join(".config"),
     };
     let directory = config_home.join("git-e2ee/keys");
-    std::fs::create_dir_all(&directory)
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    // File names here are repository roots; keep the listing private too.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(&directory)
         .with_context(|| format!("create {}", directory.display()))?;
     Ok(directory.join(format!("{repository_root}.json")))
 }

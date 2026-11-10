@@ -1,6 +1,6 @@
 # Design
 
-This document summarizes the implemented v6 architecture. [`spec.md`](spec.md)
+This document summarizes the implemented v7 architecture. [`spec.md`](spec.md)
 defines the protocol invariants and security claims in detail.
 
 ## Goal
@@ -480,7 +480,7 @@ encrypted, though size patterns can still suggest a transition.
 
 ### Costs and limits
 
-- Format break: v6 does not read v5 or earlier repositories and ships no
+- Format break: v7 does not read v6 or earlier repositories and ships no
   migration, which is acceptable for a prototype.
 - For four or more active readers, padding adds fewer than 2x envelope metadata;
   one to three readers use the four-entry minimum.

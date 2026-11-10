@@ -2261,7 +2261,7 @@ fn relative_dotdot_storage_follows_the_filesystem() {
 }
 
 #[test]
-fn directory_root_holds_exactly_the_v6_layout() {
+fn directory_root_holds_exactly_the_v7_layout() {
     let temporary = tempfile::tempdir().unwrap();
     let source = temporary.path().join("source");
     let remote_path = temporary.path().join("remote");
@@ -2294,7 +2294,7 @@ fn directory_root_holds_exactly_the_v6_layout() {
     assert_eq!(names, ["FORMAT", "HEAD", "README.md", "manifests", "packs"]);
     assert_eq!(
         fs::read(remote_path.join("FORMAT")).unwrap(),
-        b"git-remote-e2ee storage 6\n"
+        b"git-remote-e2ee storage 7\n"
     );
     let readme = fs::read_to_string(remote_path.join("README.md")).unwrap();
     assert!(readme.starts_with("# Encrypted Git repository\n\nThis directory holds"));
@@ -2332,11 +2332,11 @@ fn directory_format_mismatch_names_the_found_format() {
         )
         .unwrap();
 
-    fs::write(remote_path.join("FORMAT"), "git-remote-e2ee storage 7\n").unwrap();
+    fs::write(remote_path.join("FORMAT"), "git-remote-e2ee storage 8\n").unwrap();
     let error = format!("{:#}", encrypted.verify_ciphertext().unwrap_err());
     assert!(
         error.contains(&format!(
-            "storage at {} uses format 7; this git-remote-e2ee reads format 6",
+            "storage at {} uses format 8; this git-remote-e2ee reads format 7",
             remote_path.display()
         )),
         "{error}"
@@ -2346,7 +2346,7 @@ fn directory_format_mismatch_names_the_found_format() {
     fs::remove_file(remote_path.join("FORMAT")).unwrap();
     let error = format!("{:#}", encrypted.verify_ciphertext().unwrap_err());
     assert!(
-        error.contains("uses format 5 or earlier; this git-remote-e2ee reads format 6"),
+        error.contains("uses format 5 or earlier; this git-remote-e2ee reads format 7"),
         "{error}"
     );
 }
