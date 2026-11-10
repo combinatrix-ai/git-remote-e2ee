@@ -585,6 +585,11 @@ pub fn open_pack_stream(
     ));
     let mut remaining = plaintext_size;
     let mut ciphertext_count = PACK_STREAM_HEADER_SIZE as u64;
+    // Every segment authenticates under the pack key, which each reader
+    // holds. Only the ID check ties the stream to the manifest, so the final
+    // segment, which carries the pack trailer Git needs to accept the pack,
+    // is released after that check.
+    let mut held_final = Vec::new();
     for segment in 0..segments {
         let plain_len = remaining.min(PACK_STREAM_CHUNK_SIZE as u64) as usize;
         let cipher_len = plain_len + PACK_STREAM_TAG_SIZE;
@@ -610,8 +615,12 @@ pub fn open_pack_stream(
         if chunk.len() != plain_len {
             bail!("pack stream segment length mismatch")
         }
-        plaintext.write_all(&chunk)?;
         remaining -= plain_len as u64;
+        if segment + 1 == segments {
+            held_final = chunk;
+        } else {
+            plaintext.write_all(&chunk)?;
+        }
     }
     let mut trailing = [0_u8; 1];
     loop {
@@ -629,6 +638,7 @@ pub fn open_pack_stream(
     if actual_id != expected_id {
         bail!("pack ciphertext hash mismatch for {expected_id}")
     }
+    plaintext.write_all(&held_final)?;
     plaintext.flush()?;
     Ok(ciphertext_count)
 }
@@ -887,7 +897,11 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("pack ciphertext hash mismatch"));
-        assert_eq!(authenticated_plaintext, plaintext);
+        assert_eq!(
+            authenticated_plaintext,
+            plaintext[..PACK_STREAM_CHUNK_SIZE],
+            "the final segment must be withheld until the ID matches"
+        );
     }
 
     #[test]
