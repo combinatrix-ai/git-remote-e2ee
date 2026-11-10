@@ -289,3 +289,39 @@ fn a_storage_url_that_git_would_read_as_an_option_runs_nothing() {
     }
     assert!(!marker.exists(), "the storage URL ran a command");
 }
+
+#[cfg(unix)]
+#[test]
+fn a_key_file_other_users_can_read_is_refused_and_new_keys_are_private() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sandbox = Sandbox::new();
+    success(&sandbox.e2ee(sandbox.path(), &["keygen"]));
+    let key = sandbox.keys().pop().unwrap();
+    let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&key), 0o600);
+    assert_eq!(mode(key.parent().unwrap()), 0o700);
+
+    let public = sandbox.path().join("device.json");
+    let export = |sandbox: &Sandbox| {
+        sandbox.e2ee(
+            sandbox.path(),
+            &[
+                "device-export",
+                "--key",
+                key.to_str().unwrap(),
+                "--output",
+                public.to_str().unwrap(),
+            ],
+        )
+    };
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
+    let output = export(&sandbox);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("chmod 600"), "{stderr}");
+    assert!(!public.exists());
+
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+    success(&export(&sandbox));
+}

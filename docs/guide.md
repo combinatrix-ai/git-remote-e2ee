@@ -42,7 +42,9 @@ helper saves the absolute form in the remote's configuration.
 `$XDG_CONFIG_HOME/git-e2ee/keys/<repository-root>.json`. The first key created for a
 repository is its administrator. The key path is stored only in local Git
 configuration. The key file is never written to the encrypted remote and must
-never be committed.
+never be committed. It is created with mode 0600 in a 0700 directory, and on
+Unix every command refuses a key file that other users can access; run
+`chmod 600` on a key you copied from elsewhere.
 
 Each machine keeps one continuity floor per repository root at
 `$XDG_STATE_HOME/git-e2ee/<repository-root>/continuity.json` (by default under

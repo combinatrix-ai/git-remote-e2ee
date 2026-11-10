@@ -120,7 +120,22 @@ impl KeyFile {
     }
 
     pub fn read(path: &Path) -> Result<Self> {
-        let bytes = fs::read(path).with_context(|| format!("read key file {}", path.display()))?;
+        let mut file =
+            fs::File::open(path).with_context(|| format!("read key file {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = file.metadata()?.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                bail!(
+                    "key file {} is accessible to other users (mode {mode:o}); run chmod 600 on it",
+                    path.display()
+                )
+            }
+        }
+        let mut bytes = Zeroizing::new(Vec::new());
+        file.read_to_end(&mut bytes)
+            .with_context(|| format!("read key file {}", path.display()))?;
         let key: Self = serde_json::from_slice(&bytes).context("parse key file")?;
         if key.format_version != 3 {
             bail!(Unsupported(format!(
