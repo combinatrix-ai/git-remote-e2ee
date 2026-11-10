@@ -75,7 +75,8 @@ Every format marker carries the one format number, 6. The domain strings are
 `sign_domain` signs `domain || SHA-256(exact_bytes)` with Ed25519. Symmetric
 XChaCha20-Poly1305 envelopes are encoded as
 `E2EES06\0 || nonce_24 || ciphertext`. Subkey kind values are
-`manifest-body=1`, `pack=2`, `predecessor-link=3`, and `sealed-header=4`.
+`manifest-body=1`, `pack=2`, `predecessor-link=3`, `sealed-header=4`, and
+`sealed-header-nonce=5`.
 
 Every successful publisher samples `K_t` independently from the operating
 system CSPRNG. Repository content, commit IDs, previous keys, timestamps, or a
@@ -92,10 +93,26 @@ HKDF-SHA-256(
 )
 ```
 
-The defined kinds are `manifest-body`, `pack`, `predecessor-link`, and
-`sealed-header`. A key is used for one logical message only. Manifest,
-predecessor-link, and sealed-header envelopes each carry a fresh random 24-byte
-nonce. Pack streams carry a fresh random 19-byte nonce prefix; the STREAM
+The defined kinds are `manifest-body`, `pack`, `predecessor-link`,
+`sealed-header`, and `sealed-header-nonce`. A key is used for one logical
+message only. Manifest-body and predecessor-link envelopes each carry a fresh
+random 24-byte nonce. The sealed-header envelope carries a derived one:
+
+```text
+HKDF-SHA-256(
+  input_key = sealed-header-nonce subkey,
+  salt = "git-remote-e2ee synthetic nonce v6\0",
+  info = SHA-256(aad_length_u64_le || aad || plaintext)
+)[0..24]
+```
+
+Readers MUST recompute this nonce after decryption and reject a sealed header
+that carries any other, and MUST reject a sealed-header plaintext that is not
+the canonical JSON encoding of its `content` and `signature` members. Every
+reader holds the sealed-header subkey, and the signature travels inside the
+sealed header, so it cannot cover the ciphertext. With a free nonce a reader
+could re-encrypt the sealed header and give one signed state a second
+manifest ID. Pack streams carry a fresh random 19-byte nonce prefix; the STREAM
 counter and final-segment marker complete the nonce. Associated data binds the
 object's domain string, repository root, generation, object kind, ordinal or parent manifest
 ID as applicable, and the complete pack-stream header. Sealed-header AAD is the
@@ -266,7 +283,8 @@ older keys come from predecessor links. If no envelope opens to a key matching
 `C_t`, the client MUST report that it is not an active reader of the current
 generation, which may mean revoked, never added, or a malformed envelope.
 
-The sealed header is encrypted under a `K_t`-derived `sealed-header` subkey.
+The sealed header is encrypted under a `K_t`-derived `sealed-header` subkey
+with the derived nonce of section 3.
 Its content contains policy ID and generation, signer device ID, transition
 type, cumulative pack count, and one audit entry per envelope. The entry is
 either `(recipient device ID, 32-byte encapsulation seed)` or a dummy marker.
@@ -665,11 +683,9 @@ work is linear in manifest generations until checkpoint compaction exists.
   device public keys or IDs, roles, signer identity, or membership changes,
   although size patterns may reveal a membership transition.
 - Storage can delete, freeze, or deny service.
-- A reader holds the key that seals a manifest's sealed header, so a reader
-  with storage write access can re-encrypt it and present one signed state
-  under a second manifest ID. A client that pins that ID later sees the
-  writers' chain as a fork. Closing this needs a manifest ID that does not
-  depend on the sealed-header ciphertext, which is a format change.
+- One signed state has one manifest ID for storage and for readers. Its
+  signer can still sign the same state again and obtain a second ID, which is
+  one of the forks an authorized writer can always author.
 - Writers can author destructive Git history; force remains explicit.
 - Global rollback/equivocation detection requires an external anchor.
 
