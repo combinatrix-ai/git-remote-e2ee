@@ -95,7 +95,7 @@ The carrier holds only this outer structure:
 ```text
 refs/heads/main
 ├── README.md        plaintext notice: encrypted repository, do not edit
-├── FORMAT           "git-remote-e2ee storage 6"
+├── FORMAT           "git-remote-e2ee storage 7"
 ├── .gitattributes   "* -delta"
 ├── HEAD
 ├── packs/aa/<opaque-id>/00000000

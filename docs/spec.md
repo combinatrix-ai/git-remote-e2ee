@@ -1,8 +1,8 @@
 # Protocol specification
 
 > [!WARNING]
-> This document specifies the experimental v6 format implemented by the current
-> prototype. It does not read v5 or earlier repositories (section 14.3). Keep
+> This document specifies the experimental v7 format implemented by the current
+> prototype. It does not read v6 or earlier repositories (section 14.3). Keep
 > an independent plaintext copy and every device key.
 
 ## 1. Requirements
@@ -55,7 +55,7 @@ prevent an authorized reader from exporting plaintext.
 
 ## 3. Cryptographic construction
 
-The v6 format uses:
+The v7 format uses:
 
 - Ed25519 signatures;
 - X25519/HKDF-SHA-256/ChaCha20-Poly1305 HPKE Base mode;
@@ -65,16 +65,16 @@ The v6 format uses:
 - SHA-256 for content IDs and generation-key commitments.
 
 Every format marker carries the one format number, 6. The domain strings are
-`git-remote-e2ee subkey derivation v6\0`,
-`git-remote-e2ee generation key commitment v6\0`,
-`git-remote-e2ee manifest v6\0`, `git-remote-e2ee policy v6\0`,
-`git-remote-e2ee generation envelope v6\0`,
-`git-remote-e2ee manifest body v6\0`,
-`git-remote-e2ee predecessor link v6\0`, `git-remote-e2ee pack v6\0`, and
-`git-remote-e2ee pack stream v6\0`.
+`git-remote-e2ee subkey derivation v7\0`,
+`git-remote-e2ee generation key commitment v7\0`,
+`git-remote-e2ee manifest v7\0`, `git-remote-e2ee policy v7\0`,
+`git-remote-e2ee generation envelope v7\0`,
+`git-remote-e2ee manifest body v7\0`,
+`git-remote-e2ee predecessor link v7\0`, `git-remote-e2ee pack v7\0`, and
+`git-remote-e2ee pack stream v7\0`.
 `sign_domain` signs `domain || SHA-256(exact_bytes)` with Ed25519. Symmetric
 XChaCha20-Poly1305 envelopes are encoded as
-`E2EES06\0 || nonce_24 || ciphertext`. Subkey kind values are
+`E2EES07\0 || nonce_24 || ciphertext`. Subkey kind values are
 `manifest-body=1`, `pack=2`, `predecessor-link=3`, `sealed-header=4`, and
 `sealed-header-nonce=5`.
 
@@ -88,7 +88,7 @@ The publisher derives distinct subkeys using an injective, fixed-width context:
 ```text
 HKDF-SHA-256(
   input_key = K_t,
-  salt = "git-remote-e2ee subkey derivation v6\0",
+  salt = "git-remote-e2ee subkey derivation v7\0",
   info = repository_root || generation_u64_le || kind_u8 || ordinal_u64_le
 )
 ```
@@ -101,7 +101,7 @@ random 24-byte nonce. The sealed-header envelope carries a derived one:
 ```text
 HKDF-SHA-256(
   input_key = sealed-header-nonce subkey,
-  salt = "git-remote-e2ee synthetic nonce v6\0",
+  salt = "git-remote-e2ee synthetic nonce v7\0",
   info = SHA-256(aad_length_u64_le || aad || plaintext)
 )[0..24]
 ```
@@ -121,11 +121,11 @@ exact plaintext header bytes.
 The signed manifest header contains the full, untruncated commitment:
 
 ```text
-C_t = SHA-256("git-remote-e2ee generation key commitment v6\0" || K_t)
+C_t = SHA-256("git-remote-e2ee generation key commitment v7\0" || K_t)
 ```
 
 Generation envelopes use HPKE Base mode with info
-`git-remote-e2ee generation key v6`. Their AAD binds the repository root,
+`git-remote-e2ee generation key v7`. Their AAD binds the repository root,
 format version, generation, `C_t`, and recipient device ID. The recipient ID
 and AAD are not transmitted. AAD encoding is the envelope domain string,
 then a little-endian `u32` length and bytes for repository root, format version
@@ -174,7 +174,7 @@ stored bytes:
 packs/<hash>         encrypted incremental Git packs
 manifests/<hash>     plaintext discovery header plus encrypted sealed header and body
 HEAD                 opaque newest-manifest ID
-FORMAT               "git-remote-e2ee storage 6\n", the storage layout version
+FORMAT               "git-remote-e2ee storage 7\n", the storage layout version
 README.md            plaintext notice, written once at initialization
 ```
 
@@ -184,7 +184,7 @@ that creates the genesis `HEAD`. Every operation that reads storage state
 checks `FORMAT` first: no `HEAD` and no `FORMAT` means uninitialized; a
 `HEAD` without `FORMAT`, or any other `FORMAT` content, fails with
 `storage at <location> uses format <found or "5 or earlier">; this
-git-remote-e2ee reads format 6`. `FORMAT` is unauthenticated and only selects
+git-remote-e2ee reads format 7`. `FORMAT` is unauthenticated and only selects
 that message; authenticity comes from the signed manifests.
 
 A manifest object MUST be the exact byte encoding its writer produced: one
@@ -337,7 +337,7 @@ historical descriptors, avoiding quadratic cumulative-inventory metadata.
 Each pack is encoded as:
 
 ```text
-"E2EEPK6\0" || chunk_size_u32_le || nonce_prefix_19 || segments...
+"E2EEPK7\0" || chunk_size_u32_le || nonce_prefix_19 || segments...
 ```
 
 `chunk_size` MUST equal 1,048,576 bytes. Every non-final plaintext segment is
@@ -712,41 +712,43 @@ new device keys:
   IDs from public keys do not change with the storage format. A format that
   must change them is a separate key migration and MUST say so.
 
-### 14.2 Moving a repository from v6 to a later format
+### 14.2 Moving a repository from v7 to a later format
 
-A later format that replaces v6 SHOULD migrate in place as follows:
+A later format that replaces v7 SHOULD migrate in place as follows:
 
-1. Any active v6 administrator runs the migration from a checkout whose local
-   refs equal the current v6 refs and whose object graph is complete
-   (section 9). It reads the current v6 head through the machine floor as a
-   normal v6 operation.
-2. The new format's first manifest keeps the v6 repository root and names the
-   last v6 manifest ID and generation as its predecessor, signed by the
+1. Any active v7 administrator runs the migration from a checkout whose local
+   refs equal the current v7 refs and whose object graph is complete
+   (section 9). It reads the current v7 head through the machine floor as a
+   normal v7 operation.
+2. The new format's first manifest keeps the v7 repository root and names the
+   last v7 manifest ID and generation as its predecessor, signed by the
    migrating administrator. Its generation continues from that one, so every
-   machine floor keeps moving forward across the change and a rollback to v6
+   machine floor keeps moving forward across the change and a rollback to v7
    state is still rejected.
-3. Its policy carries the v6 policy's active devices with their roles and
+3. Its policy carries the v7 policy's active devices with their roles and
    labels; revoked devices are not carried. Existing device keys keep working.
 4. The repository content is re-encrypted under the new format from the
    checkout as one generation.
-5. Publication is one compare-and-swap from the observed v6 storage state that
-   also replaces `FORMAT`. A v6 client racing it loses the compare-and-swap,
+5. Publication is one compare-and-swap from the observed v7 storage state that
+   also replaces `FORMAT`. A v7 client racing it loses the compare-and-swap,
    and on retry reads the new `FORMAT` and stops.
 
-The new format's client reads v6 only as far as this needs (the authenticated
-manifest and policy chain, not v6 packs), and only for the release that
+The new format's client reads v7 only as far as this needs (the authenticated
+manifest and policy chain, not v7 packs), and only for the release that
 introduces it.
 
 ### 14.3 Earlier formats
 
-v6 does not read v5 or earlier repositories and ships no migration. A format 4
-carrier keeps its storage under `e2ee/` on branch `git-remote-e2ee`; a v6
+v7 does not read v6 or earlier repositories and ships no migration. Format 6
+was a development format that differs from v7 only in sealing the sealed
+header under a random nonce; a v6 client stops on v7 storage at `FORMAT`. A format 4
+carrier keeps its storage under `e2ee/` on branch `git-remote-e2ee`; a v7
 client that finds that branch beside an absent selected branch, or that layout
 on the selected branch, reports format 4 storage and refuses to initialize
 beside it. Moving such a repository means stopping every client, publishing the
-plaintext history from a trusted checkout into a new v6 storage, re-adding the
+plaintext history from a trusted checkout into a new v7 storage, re-adding the
 devices, and deleting the format 4 branch. Device key files are format 3 in
-both and can be reused when the original owner key creates the v6 genesis.
+both and can be reused when the original owner key creates the v7 genesis.
 
 ### 14.4 Planned extensions
 

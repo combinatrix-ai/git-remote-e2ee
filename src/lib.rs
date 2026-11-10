@@ -2,7 +2,7 @@
 /// magics, and every domain-separation string carry it.
 macro_rules! format_version {
     () => {
-        "6"
+        "7"
     };
 }
 
