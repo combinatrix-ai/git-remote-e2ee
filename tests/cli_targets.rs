@@ -266,3 +266,26 @@ fn init_refused_by_an_occupied_carrier_branch_removes_its_key() {
     assert!(stderr.contains("already exists"), "{stderr}");
     assert!(sandbox.keys().is_empty(), "{stderr}");
 }
+
+#[test]
+fn a_storage_url_that_git_would_read_as_an_option_runs_nothing() {
+    let sandbox = Sandbox::new();
+    let key = sandbox.path().join("key.json");
+    success(&sandbox.e2ee(
+        sandbox.path(),
+        &["keygen", "--output", key.to_str().unwrap()],
+    ));
+    let marker = sandbox.path().join("executed");
+    let url = format!("e2ee::--upload-pack=touch {};", marker.display());
+
+    for arguments in [
+        vec!["verify", url.as_str(), "--key", key.to_str().unwrap()],
+        vec!["init", url.as_str(), "--key", key.to_str().unwrap()],
+    ] {
+        let output = sandbox.e2ee(sandbox.path(), &arguments);
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("must not start with '-'"), "{stderr}");
+    }
+    assert!(!marker.exists(), "the storage URL ran a command");
+}

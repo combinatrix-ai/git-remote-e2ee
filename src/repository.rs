@@ -508,7 +508,6 @@ impl<S: Storage> EncryptedRepository<S> {
             }
             bail!("device is not an active writer")
         }
-        git::validate_inner_refs(&current.manifest.refs)?;
 
         let mut objects = git::Objects::new(repo);
         let mut destinations = BTreeSet::new();
@@ -668,7 +667,6 @@ impl<S: Storage> EncryptedRepository<S> {
         let checkout = self.open_checkout(repo)?;
         let chain = self.pinned_chain(&floor)?;
         let current = chain.first().context("manifest chain is empty")?;
-        git::validate_inner_refs(&current.manifest.refs)?;
         floor.advance(ContinuityFloor::at(&current.id, &current.manifest))?;
         // Git skips the helper's fetch command when every advertised object is
         // already local, for example after a membership change, a deletion, or
@@ -693,7 +691,6 @@ impl<S: Storage> EncryptedRepository<S> {
         let checkout = self.open_checkout(repo)?;
         let chain = self.pinned_chain(&floor)?;
         let current = chain.first().context("manifest chain is empty")?;
-        git::validate_inner_refs(&current.manifest.refs)?;
         let progress = checkout.read()?;
         self.import_chain_packs(repo, &chain, progress.imported_generation)?;
         let connectivity_timer = trace::Span::new("inner_ref_connectivity_check");
@@ -1326,7 +1323,6 @@ impl<S: Storage> EncryptedRepository<S> {
             .context("selected recovery chain is empty")?
             .manifest
             .refs;
-        git::validate_inner_refs(refs)?;
         git::ensure_refs_connected_since(&scratch, refs, &BTreeMap::new())
     }
 
@@ -1427,7 +1423,8 @@ impl<S: Storage> EncryptedRepository<S> {
         self.verify_opened_chain(unverified).map_err(proven_invalid)
     }
 
-    /// Authenticates opened manifests oldest first against their policies.
+    /// Authenticates opened manifests oldest first against their policies and
+    /// checks that their refs are ones Git can take literally.
     /// Every failure here is a property of authenticated bytes.
     fn verify_opened_chain(
         &self,
@@ -1437,6 +1434,7 @@ impl<S: Storage> EncryptedRepository<S> {
         let mut seen_pack_ids = HashSet::new();
         for (index, (id, opened, generation_key)) in unverified.into_iter().rev().enumerate() {
             let manifest = &opened.manifest;
+            git::validate_inner_refs(&manifest.refs)?;
             for pack in &manifest.new_packs {
                 if !seen_pack_ids.insert(pack.id.clone()) {
                     bail!("manifest chain repeats pack {}", pack.id)

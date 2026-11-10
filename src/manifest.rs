@@ -355,6 +355,20 @@ fn require_supported_format(encrypted: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Parses a manifest object and requires the encoding `seal_manifest` writes.
+/// A manifest's ID is the hash of these bytes, and the signature covers only
+/// what the envelope carries, so any second encoding would give storage a
+/// second ID for one signed state.
+fn parse_envelope(encrypted: &[u8]) -> Result<ManifestEnvelope> {
+    require_supported_format(encrypted)?;
+    let envelope: ManifestEnvelope =
+        serde_json::from_slice(encrypted).context("parse manifest envelope")?;
+    if serde_json::to_vec(&envelope)? != encrypted {
+        bail!("manifest envelope is not canonically encoded")
+    }
+    Ok(envelope)
+}
+
 /// Checks the transition discriminator before the full sealed-header schema.
 fn require_supported_authorization(exact_sealed_content: &[u8]) -> Result<()> {
     #[derive(Deserialize)]
@@ -376,9 +390,7 @@ fn require_supported_authorization(exact_sealed_content: &[u8]) -> Result<()> {
 }
 
 pub fn peek_manifest_header(encrypted: &[u8]) -> Result<ManifestHeader> {
-    require_supported_format(encrypted)?;
-    let envelope: ManifestEnvelope =
-        serde_json::from_slice(encrypted).context("parse manifest envelope")?;
+    let envelope = parse_envelope(encrypted)?;
     let exact_header = BASE64
         .decode(envelope.header)
         .context("decode manifest header")?;
@@ -417,9 +429,7 @@ pub fn unwrap_generation_key(header: &ManifestHeader, key: &KeyFile) -> Result<S
 }
 
 pub fn open_manifest(encrypted: &[u8], generation_key: &[u8; 32]) -> Result<OpenedManifest> {
-    require_supported_format(encrypted)?;
-    let envelope: ManifestEnvelope =
-        serde_json::from_slice(encrypted).context("parse manifest envelope")?;
+    let envelope = parse_envelope(encrypted)?;
     let exact_header = BASE64
         .decode(envelope.header)
         .context("decode manifest header")?;
