@@ -247,23 +247,23 @@ impl RecoveryBudget {
         self.bytes_read = self
             .bytes_read
             .checked_add(byte_count as u64)
-            .context("recovery byte budget overflow")?;
+            .context("manifest chain byte budget overflow")?;
         if self.bytes_read > MAX_RECOVERY_BYTES {
             bail!(BudgetExhausted(
-                "recovery manifest byte budget exhausted".to_owned()
+                "manifest chain byte budget exhausted".to_owned()
             ))
         }
         let operations = (header.generation_key_envelopes.len() as u64)
             .checked_mul(2)
             .and_then(|value| value.checked_add(1))
-            .context("recovery crypto budget overflow")?;
+            .context("manifest chain crypto budget overflow")?;
         self.crypto_operations = self
             .crypto_operations
             .checked_add(operations)
-            .context("recovery crypto budget overflow")?;
+            .context("manifest chain crypto budget overflow")?;
         if self.crypto_operations > MAX_RECOVERY_CRYPTO_OPERATIONS {
             bail!(BudgetExhausted(
-                "recovery cryptographic-operation budget exhausted".to_owned()
+                "manifest chain cryptographic-operation budget exhausted".to_owned()
             ))
         }
         Ok(())
@@ -1371,7 +1371,15 @@ impl<S: Storage> EncryptedRepository<S> {
             .storage
             .read_head()?
             .context("encrypted repository is not initialized")?;
-        self.chain_from(&head, &mut |id| self.read_manifest_material(id), None)
+        let mut budget = RecoveryBudget {
+            crypto_operations: 0,
+            bytes_read: 0,
+        };
+        self.chain_from(
+            &head,
+            &mut |id| self.read_manifest_material(id),
+            Some(&mut budget),
+        )
     }
 
     fn chain_from<F>(

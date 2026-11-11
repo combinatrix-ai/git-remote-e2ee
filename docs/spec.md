@@ -476,6 +476,12 @@ A fresh clone traverses manifest and key links from `HEAD` to genesis,
 validates each hop, collects pack deltas, decrypts packs with their creation
 generation keys, and imports them oldest-first.
 
+Every normal read, including listing, fetch, push, and verification, applies a
+fixed cumulative budget before retaining or decrypting each predecessor. This
+version limits traversal to 64 MiB of encrypted manifest data and 1,000,000
+estimated cryptographic operations. An over-limit chain is rejected without
+advancing the machine continuity floor.
+
 A returning client traverses from `HEAD` to its pinned manifest, validates each
 new hop, and imports only the deltas of generations newer than its recorded
 import progress. Import progress is local cache state, not an authorization

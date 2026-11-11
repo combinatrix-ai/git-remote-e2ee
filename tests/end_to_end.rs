@@ -993,6 +993,98 @@ fn signed_unreachable_ref_is_rejected_after_pinning_its_manifest() {
 }
 
 #[test]
+fn ordinary_manifest_reads_bound_unauthorized_chain_work() {
+    let temporary = tempfile::tempdir().unwrap();
+    let owner = KeyFile::generate();
+    let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
+    let storage = FilesystemStorage::new(temporary.path().join("remote"));
+    let writer = EncryptedRepository::new(
+        storage.clone(),
+        owner.clone(),
+        temporary.path().join("writer-state"),
+    );
+    writer.initialize("owner").unwrap();
+    writer
+        .add_device(
+            reader.public_device().unwrap(),
+            "reader",
+            DeviceRoles::reader(),
+        )
+        .unwrap();
+    let (mut previous, base) = writer.current_manifest().unwrap();
+    let sealed_base = storage.get_object(ObjectKind::Manifest, &previous).unwrap();
+    let mut previous_key =
+        unwrap_generation_key(&peek_manifest_header(&sealed_base).unwrap(), &reader).unwrap();
+    let opened_base = open_manifest(&sealed_base, &previous_key).unwrap();
+    let policy =
+        PolicyState::parse(opened_base.manifest().introduced_policy.as_deref().unwrap()).unwrap();
+
+    let observer_state = temporary.path().join("observer-state");
+    let observer = EncryptedRepository::new(storage.clone(), owner.clone(), &observer_state);
+    assert_eq!(observer.current_manifest().unwrap().0, previous);
+    let floor_path = observer_state
+        .join(&owner.repository_root)
+        .join("continuity.json");
+    let original_floor = fs::read(&floor_path).unwrap();
+
+    for generation in (base.generation + 1)..=(base.generation + 5) {
+        let key = random_key();
+        let manifest = Manifest {
+            format_version: base.format_version,
+            repository_root: base.repository_root.clone(),
+            generation,
+            previous: Some(previous.clone()),
+            policy_id: base.policy_id.clone(),
+            policy_generation: base.policy_generation,
+            authorization: ManifestAuthorization::Writer,
+            total_pack_count: base.total_pack_count,
+            refs: BTreeMap::from([("refs/heads/main".to_owned(), "x".repeat(11 * 1024 * 1024))]),
+            new_packs: Vec::new(),
+            predecessor_key_wrap: Some(
+                wrap_predecessor_key(
+                    &key,
+                    &previous_key,
+                    &owner.repository_root,
+                    generation,
+                    &previous,
+                )
+                .unwrap(),
+            ),
+            introduced_policy: None,
+        };
+        let sealed = seal_manifest(
+            &reader,
+            &policy,
+            &key,
+            ManifestAuthorization::Writer,
+            manifest,
+        )
+        .unwrap();
+        assert!(sealed.len() < 16 * 1024 * 1024);
+        let next = object_id(&sealed);
+        storage
+            .put_object_if_absent(ObjectKind::Manifest, &next, &sealed)
+            .unwrap();
+        storage
+            .compare_and_swap_head(Some(&previous), &next)
+            .unwrap();
+        previous = next;
+        previous_key = key;
+    }
+
+    let error = observer.current_manifest().unwrap_err();
+    assert!(
+        format!("{error:#}").contains("manifest chain byte budget exhausted"),
+        "ordinary manifest read did not stop at the chain budget"
+    );
+    assert_eq!(
+        storage.read_head().unwrap().as_deref(),
+        Some(previous.as_str())
+    );
+    assert_eq!(fs::read(floor_path).unwrap(), original_floor);
+}
+
+#[test]
 fn returning_client_rejects_a_signed_chain_that_repeats_a_pack() {
     let temporary = tempfile::tempdir().unwrap();
     let source = temporary.path().join("source");

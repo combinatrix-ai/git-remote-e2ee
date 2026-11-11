@@ -321,6 +321,9 @@ your local remote-tracking refs.
 - A new or deleted local carrier cache downloads the complete carrier branch.
   Later operations reuse its objects and fetch only new carrier objects.
   `GIT_REMOTE_E2EE_CACHE_DIR` overrides the cache parent directory.
+- Normal manifest traversal stops after 64 MiB of encrypted manifest data or
+  1,000,000 estimated cryptographic operations. A repository with a longer
+  legitimate history cannot be opened by this version.
 - Recovery discovery has fixed limits of 2,048 carrier commits, 256 distinct
   heads, 64 MiB of manifest data, and 1,000,000 estimated cryptographic
   operations. It fails closed if any limit is exhausted.
