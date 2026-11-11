@@ -26,6 +26,7 @@ use crate::manifest::{
 use crate::policy::{DeviceRecord, DeviceRoles, PolicyState};
 use crate::storage::{HeadObservation, ObjectKind, Storage, StorageOccupied, StoredHead};
 use crate::trace;
+use crate::url::redact_diagnostic;
 
 const MAX_RECOVERY_OUTER_COMMITS: usize = 2048;
 const MAX_RECOVERY_CANDIDATES: usize = 256;
@@ -131,6 +132,15 @@ pub struct RecoveryReport {
     pub warning: Option<String>,
     pub blocked_reason: Option<String>,
     pub published_manifest: Option<String>,
+}
+
+impl RecoveryReport {
+    fn redacted(mut self) -> Self {
+        self.reason = redact_diagnostic(&self.reason);
+        self.warning = self.warning.map(|text| redact_diagnostic(&text));
+        self.blocked_reason = self.blocked_reason.map(|text| redact_diagnostic(&text));
+        self
+    }
 }
 
 pub struct RecoveryOptions<'a> {
@@ -792,6 +802,15 @@ impl<S: Storage> EncryptedRepository<S> {
     }
 
     pub fn recover(
+        &self,
+        repo: &GitRepository,
+        options: RecoveryOptions<'_>,
+    ) -> Result<RecoveryReport> {
+        self.recover_inner(repo, options)
+            .map(RecoveryReport::redacted)
+    }
+
+    fn recover_inner(
         &self,
         repo: &GitRepository,
         options: RecoveryOptions<'_>,
@@ -1782,7 +1801,7 @@ fn record_rejected_head(
     };
     log.format_version = 1;
     log.entries.retain(|entry| entry.head_id != head_id);
-    let reason: String = reason.chars().take(512).collect();
+    let reason: String = redact_diagnostic(reason).chars().take(512).collect();
     log.entries.push(RejectedHeadEvidence {
         head_id: head_id.to_owned(),
         classification,

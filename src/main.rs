@@ -12,7 +12,9 @@ use git_remote_e2ee::repository::{
     EncryptedRepository, InitializeError, RecoveryOptions, RecoveryReport,
 };
 use git_remote_e2ee::storage::{FilesystemStorage, GitStorage};
-use git_remote_e2ee::url::StorageUrl;
+use git_remote_e2ee::url::{
+    StorageUrl, redact_carrier_address, redact_diagnostic, redact_diagnostic_with_args,
+};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -149,7 +151,10 @@ impl Target {
                 let key = git_config(repository, &format!("remote.{target}.e2ee-key"), true)?;
                 (url, key.map(PathBuf::from))
             }
-            (Some(url), _) => bail!("Git remote {target} is not an e2ee:: remote ({url})"),
+            (Some(url), _) => bail!(
+                "Git remote {target} is not an e2ee:: remote ({})",
+                redact_carrier_address(&url)
+            ),
             (None, _) if target.starts_with("e2ee::") || target.contains(['/', ':']) => {
                 (target.to_owned(), None)
             }
@@ -157,9 +162,12 @@ impl Target {
                 "no Git remote named {target}; give a storage URL such as e2ee::https://host/you/repo.git"
             ),
         };
-        let key = key
-            .or(configured_key)
-            .with_context(|| format!("no key configured for {target}; pass --key <path>"))?;
+        let key = key.or(configured_key).with_context(|| {
+            format!(
+                "no key configured for {}; pass --key <path>",
+                redact_carrier_address(target)
+            )
+        })?;
         Ok(Self {
             storage: StorageUrl::parse(&url)?,
             key,
@@ -197,7 +205,14 @@ macro_rules! with_repository {
     }};
 }
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("Error: {}", redact_diagnostic(&format!("{error:?}")));
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Keygen {
@@ -289,7 +304,7 @@ fn main() -> Result<()> {
             if let Some(local) = &local {
                 run_git(
                     local,
-                    &["remote", "add", &name, &target.storage.to_string()],
+                    &["remote", "add", &name, &target.storage.to_config_string()],
                 )?;
                 run_git(
                     local,
@@ -445,17 +460,23 @@ fn git_config(repository: &GitRepository, key: &str, path: bool) -> Result<Optio
 fn run_git(repository: &GitRepository, args: &[&str]) -> Result<()> {
     let output = repository.git().args(args).output()?;
     if !output.status.success() {
+        if args.starts_with(&["remote", "add"]) {
+            bail!("git remote add failed ({})", output.status)
+        }
         bail!(
             "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
+            args.iter()
+                .map(|arg| redact_carrier_address(arg))
+                .collect::<Vec<_>>()
+                .join(" "),
+            redact_diagnostic_with_args(String::from_utf8_lossy(&output.stderr).trim(), args)
         )
     }
     Ok(())
 }
 
 fn print_recovery_report(report: &RecoveryReport) {
-    println!("{}", format_recovery_report(report));
+    println!("{}", redact_diagnostic(&format_recovery_report(report)));
 }
 
 fn format_recovery_report(report: &RecoveryReport) -> String {

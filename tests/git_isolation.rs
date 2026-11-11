@@ -328,6 +328,58 @@ fn an_unreachable_carrier_does_not_trigger_a_cache_check() {
 }
 
 #[test]
+fn carrier_url_credentials_are_hidden_in_cli_errors() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repository("notes");
+    let url = "e2ee::https://alice:secret@host/repo.git?access_token=token#bad branch";
+    let output = sandbox.e2ee(&repo, &["init", url]).output().unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.contains("https://host/[redacted]"), "{error}");
+    assert!(!error.contains("secret"));
+    assert!(!error.contains("token"));
+
+    let configured = "https://alice:secret@host/repo.git?access_token=token";
+    sandbox.git(&repo, &["remote", "add", "plain", configured]);
+    assert_eq!(
+        sandbox.git(&repo, &["config", "--get", "remote.plain.url"]),
+        configured
+    );
+    let output = sandbox.e2ee(&repo, &["verify", "plain"]).output().unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.contains("https://host/[redacted]"), "{error}");
+    assert!(!error.contains("secret"));
+    assert!(!error.contains("token"));
+}
+
+#[test]
+fn scp_carrier_failure_does_not_repeat_a_private_path_from_git() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repository("notes");
+    let remote = "alice@host:private-token/repo.git";
+    let ssh = "sh -c 'git upload-pack private-token/repo.git' --";
+    let raw = sandbox
+        .command("git", &repo)
+        .args(["ls-remote", remote])
+        .env("GIT_SSH_COMMAND", ssh)
+        .output()
+        .unwrap();
+    assert!(!raw.status.success());
+    assert!(String::from_utf8_lossy(&raw.stderr).contains("private-token"));
+
+    let output = sandbox
+        .e2ee(&repo, &["init", "e2ee::alice@host:private-token/repo.git"])
+        .env("GIT_SSH_COMMAND", ssh)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.contains("git fetch carrier branch failed"), "{error}");
+    assert!(!error.contains("private-token"), "{error}");
+}
+
+#[test]
 fn carrier_transport_rejects_an_injected_local_rewrite_even_with_file_allowed() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -375,7 +427,7 @@ fn carrier_transport_rejects_an_injected_local_rewrite_even_with_file_allowed() 
         .output()
         .unwrap();
     assert!(!attempted.status.success());
-    assert!(String::from_utf8_lossy(&attempted.stderr).contains("file"));
+    assert!(String::from_utf8_lossy(&attempted.stderr).contains("git fetch carrier branch failed"));
     let tip = sandbox.git(&carrier, &["rev-parse", "refs/heads/main"]);
     let history = sandbox.git(&carrier, &["rev-list", "--count", &tip]);
     assert_eq!(

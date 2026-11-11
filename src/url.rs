@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum StorageUrl {
     Directory(PathBuf),
     Git(String),
@@ -15,6 +15,15 @@ pub enum StorageUrl {
 }
 
 impl StorageUrl {
+    /// The exact URL stored in Git configuration and passed to Git.
+    pub fn to_config_string(&self) -> String {
+        match self {
+            Self::Directory(path) => format!("e2ee::dir:{}", path.display()),
+            Self::Git(remote) => format!("e2ee::{remote}"),
+            Self::TrustedLocalGit(remote) => format!("e2ee::trusted-local:{remote}"),
+        }
+    }
+
     /// Relative local paths are resolved against the current directory, so
     /// the result can be stored in Git config and used from anywhere.
     pub fn parse(url: &str) -> Result<Self> {
@@ -100,15 +109,89 @@ impl fmt::Display for StorageUrl {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Directory(path) => write!(formatter, "e2ee::dir:{}", path.display()),
-            Self::Git(remote) => write!(formatter, "e2ee::{remote}"),
+            Self::Git(remote) => write!(formatter, "e2ee::{}", redact_carrier_address(remote)),
             Self::TrustedLocalGit(remote) => write!(formatter, "e2ee::trusted-local:{remote}"),
         }
     }
 }
 
+impl fmt::Debug for StorageUrl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("StorageUrl")
+            .field(&self.to_string())
+            .finish()
+    }
+}
+
+pub fn redact_carrier_address(address: &str) -> String {
+    if let Some(scheme) = address.find("://") {
+        let authority_start = scheme + 3;
+        let authority_end = address[authority_start..]
+            .find(['/', '?', '#'])
+            .map_or(address.len(), |offset| authority_start + offset);
+        let authority = &address[authority_start..authority_end];
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        let suffix = if authority_end < address.len() {
+            "/[redacted]"
+        } else {
+            ""
+        };
+        return format!("{}{host}{suffix}", &address[..authority_start]);
+    }
+    if let Some((host, _)) = address.split_once(':') {
+        let host = host.rsplit_once('@').map_or(host, |(_, host)| host);
+        return format!("{host}:[redacted]");
+    }
+    address.to_owned()
+}
+
+/// Removes credential-bearing parts of scheme URLs from diagnostic text.
+pub fn redact_diagnostic(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut copied = 0;
+    let mut search = 0;
+    while let Some(offset) = input[search..].find("://") {
+        let scheme_end = search + offset;
+        let mut start = scheme_end;
+        while start > search
+            && matches!(input.as_bytes()[start - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'+' | b'-' | b'.')
+        {
+            start -= 1;
+        }
+        if start == scheme_end || !input.as_bytes()[start].is_ascii_alphabetic() {
+            search = scheme_end + 3;
+            continue;
+        }
+        let end = input[scheme_end + 3..]
+            .char_indices()
+            .find(|(_, character)| character.is_whitespace())
+            .map_or(input.len(), |(offset, _)| scheme_end + 3 + offset);
+        output.push_str(&input[copied..start]);
+        output.push_str(&redact_carrier_address(&input[start..end]));
+        copied = end;
+        search = end;
+    }
+    output.push_str(&input[copied..]);
+    output
+}
+
+pub fn redact_diagnostic_with_args(input: &str, args: &[&str]) -> String {
+    let mut safe = input.to_owned();
+    for arg in args {
+        let redacted = redact_carrier_address(arg);
+        if !arg.is_empty() && redacted != *arg {
+            safe = safe.replace(arg, &redacted);
+        }
+    }
+    redact_diagnostic(&safe)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::StorageUrl;
+    use super::{StorageUrl, redact_diagnostic, redact_diagnostic_with_args};
 
     #[test]
     fn remote_git_urls_pass_through_and_dir_prefix_selects_a_directory() {
@@ -119,7 +202,9 @@ mod tests {
         ] {
             let parsed = StorageUrl::parse(&format!("e2ee::{remote}")).unwrap();
             assert_eq!(parsed, StorageUrl::Git(remote.to_owned()));
-            assert_eq!(parsed.to_string(), format!("e2ee::{remote}"));
+            assert_eq!(parsed.to_config_string(), format!("e2ee::{remote}"));
+            assert!(!parsed.to_string().contains('@'));
+            assert!(!parsed.to_string().contains("notes.git"));
             assert_eq!(StorageUrl::parse(remote).unwrap(), parsed);
         }
         assert_eq!(
@@ -129,7 +214,7 @@ mod tests {
     }
 
     #[test]
-    fn carrier_branch_fragments_round_trip_unchanged() {
+    fn carrier_branch_fragments_remain_in_config() {
         for url in [
             "e2ee::https://host/x.git#vault",
             "e2ee::git@github.com:you/notes.git#team/vault",
@@ -139,7 +224,8 @@ mod tests {
                 parsed,
                 StorageUrl::Git(url.strip_prefix("e2ee::").unwrap().to_owned())
             );
-            assert_eq!(parsed.to_string(), url);
+            assert_eq!(parsed.to_config_string(), url);
+            assert!(!parsed.to_string().contains("notes.git"));
         }
     }
 
@@ -190,5 +276,34 @@ mod tests {
             assert!(StorageUrl::parse(&format!("e2ee::{remote}")).is_err());
         }
         assert!(StorageUrl::parse("e2ee::ssh://[::1]/repo.git").is_ok());
+    }
+
+    #[test]
+    fn carrier_url_diagnostics_hide_userinfo_and_query_but_keep_raw_config() {
+        let raw = "e2ee::https://alice:secret@host/repo.git?access_token=token#vault";
+        let parsed = StorageUrl::parse(raw).unwrap();
+        assert_eq!(parsed.to_config_string(), raw);
+        assert_eq!(parsed.to_string(), "e2ee::https://host/[redacted]");
+        assert!(!format!("{parsed:?}").contains("secret"));
+        assert!(!format!("{parsed:?}").contains("token"));
+        assert_eq!(
+            redact_diagnostic(
+                "git failed for 'https://alice:secret@host/repo.git?access_token=token'"
+            ),
+            "git failed for 'https://host/[redacted]"
+        );
+        assert_eq!(
+            redact_diagnostic("https://alice:secret@host/repo.git?token='hidden'"),
+            "https://host/[redacted]"
+        );
+        let scp = StorageUrl::parse("e2ee::alice@host:private-token/repo.git").unwrap();
+        assert_eq!(scp.to_string(), "e2ee::host:[redacted]");
+        assert_eq!(
+            redact_diagnostic_with_args(
+                "fatal: unable to access 'host:private-token'",
+                &["host:private-token"]
+            ),
+            "fatal: unable to access 'host:[redacted]'"
+        );
     }
 }

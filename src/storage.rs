@@ -18,6 +18,7 @@ use crate::error::{BudgetExhausted, ObjectUnavailable, Unsupported};
 use crate::gitcmd::{self, GitRepository};
 use crate::refname;
 use crate::trace;
+use crate::url::{redact_carrier_address, redact_diagnostic, redact_diagnostic_with_args};
 
 #[derive(Debug, Error)]
 #[error("head changed concurrently (expected {expected:?}, actual {actual:?})")]
@@ -287,7 +288,9 @@ fn check_storage_format(location: &str, format: Option<&[u8]>, head_present: boo
         }
     };
     bail!(
-        "storage at {location} uses format {found}; this git-remote-e2ee reads format {}",
+        "storage at {} uses format {}; this git-remote-e2ee reads format {}",
+        redact_carrier_address(location),
+        redact_diagnostic(&found),
         crate::FORMAT_VERSION
     )
 }
@@ -1059,7 +1062,7 @@ impl GitStorage {
                 bail!(Unsupported(format!(
                     "branch {} of {} holds format 4 storage; this git-remote-e2ee reads format {}",
                     self.branch,
-                    self.remote,
+                    redact_carrier_address(&self.remote),
                     crate::FORMAT_VERSION
                 )))
             }
@@ -1067,7 +1070,7 @@ impl GitStorage {
                 bail!(Unsupported(format!(
                     "{remote} has no storage on branch {branch}, but its branch {FORMAT_4_BRANCH} holds format 4 storage; this git-remote-e2ee reads format {}. Migrate that storage to format {0} and delete the branch before using this remote",
                     crate::FORMAT_VERSION,
-                    remote = self.remote,
+                    remote = redact_carrier_address(&self.remote),
                     branch = self.branch,
                 )))
             }
@@ -1090,15 +1093,10 @@ impl GitStorage {
     /// content (for example a hosting provider's initial README).
     fn refuse_foreign_branch(&self, base_commit: &Option<String>) -> Result<()> {
         if base_commit.is_some() {
-            let prefix = if self.trusted_local {
-                "e2ee::trusted-local:"
-            } else {
-                "e2ee::"
-            };
             return Err(StorageOccupied(format!(
-                "branch {branch} of {remote} already exists; use an empty repository or choose another branch with {prefix}{remote}#<branch>",
+                "branch {branch} of {remote} already exists; use an empty repository or append #<branch> to the configured carrier URL to choose another branch",
                 branch = self.branch,
-                remote = self.remote,
+                remote = redact_carrier_address(&self.remote),
             ))
             .into());
         }
@@ -1283,10 +1281,7 @@ impl GitStorage {
             .output()?;
         drop(push_timer);
         if !push.status.success() {
-            let push_error = anyhow::anyhow!(
-                "git push carrier branch failed: {}",
-                String::from_utf8_lossy(&push.stderr).trim()
-            );
+            let push_error = anyhow::anyhow!("git push carrier branch failed ({})", push.status);
             // Only an observed move of the remote tip is a lost race; a push
             // refused for any other reason leaves the tip at `base_commit`.
             let Ok(latest) = cache.refresh(&self.remote, &self.branch, self.trusted_local) else {
@@ -2009,13 +2004,22 @@ fn parse_carrier_location(location: &str) -> Result<(String, String)> {
     // Git would read such a remote as an option: `--upload-pack=<command>`
     // runs the command.
     if remote.starts_with('-') {
-        bail!("carrier Git remote {remote:?} must not start with '-'")
+        bail!(
+            "carrier Git remote {:?} must not start with '-'",
+            redact_carrier_address(remote)
+        )
     }
     if branch.is_empty() {
-        bail!("empty carrier branch in {location:?}")
+        bail!(
+            "empty carrier branch in {:?}",
+            redact_carrier_address(location)
+        )
     }
     if !refname::is_valid(&format!("refs/heads/{branch}")) || branch.starts_with('-') {
-        bail!("invalid carrier branch name {branch:?} in {location:?}")
+        bail!(
+            "invalid carrier branch name {branch:?} in {:?}",
+            redact_carrier_address(location)
+        )
     }
     Ok((remote.to_owned(), branch.to_owned()))
 }
@@ -2129,13 +2133,15 @@ fn fetch_carrier_branch(
         trusted_local,
     )
     .and_then(|output| {
-        ensure_git_success(&output, "git ls-remote carrier branch")?;
+        if !output.status.success() {
+            bail!("git ls-remote carrier branch failed ({})", output.status)
+        }
         Ok(output)
     })
     .map_err(|error| {
         FetchError::Remote(error.context(format!(
-            "git fetch carrier branch failed: {}",
-            String::from_utf8_lossy(&fetch.stderr).trim()
+            "git fetch carrier branch failed ({})",
+            fetch.status
         )))
     })?;
     if String::from_utf8_lossy(&ls_remote.stdout).trim().is_empty() {
@@ -2147,8 +2153,8 @@ fn fetch_carrier_branch(
         return Ok(None);
     }
     Err(FetchError::Local(anyhow::anyhow!(
-        "git fetch carrier branch failed: {}",
-        String::from_utf8_lossy(&fetch.stderr).trim()
+        "git fetch carrier branch failed ({})",
+        fetch.status
     )))
 }
 
@@ -2168,7 +2174,9 @@ fn remote_has_branch(
         ],
         trusted_local,
     )?;
-    ensure_git_success(&output, "git ls-remote carrier branches")?;
+    if !output.status.success() {
+        bail!("git ls-remote carrier branches failed ({})", output.status)
+    }
     Ok(!output.stdout.is_empty())
 }
 
@@ -2265,8 +2273,9 @@ fn cache_transport_output(
 fn ensure_git_success(output: &std::process::Output, action: &str) -> Result<()> {
     if !output.status.success() {
         bail!(
-            "{action} failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            "{} failed: {}",
+            redact_diagnostic(action),
+            redact_diagnostic(String::from_utf8_lossy(&output.stderr).trim())
         )
     }
     Ok(())
@@ -2278,10 +2287,16 @@ fn git_command(repo: &Path, args: &[&str]) -> Result<()> {
         .args(args)
         .output()?;
     if !output.status.success() {
+        if args.starts_with(&["remote", "add"]) {
+            bail!("git remote add carrier failed ({})", output.status)
+        }
         bail!(
             "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
+            args.iter()
+                .map(|arg| redact_carrier_address(arg))
+                .collect::<Vec<_>>()
+                .join(" "),
+            redact_diagnostic_with_args(String::from_utf8_lossy(&output.stderr).trim(), args)
         )
     }
     Ok(())
@@ -2304,8 +2319,11 @@ fn git_command_with_input(repo: &Path, args: &[&str], input: &[u8]) -> Result<()
     if !output.status.success() {
         bail!(
             "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
+            args.iter()
+                .map(|arg| redact_carrier_address(arg))
+                .collect::<Vec<_>>()
+                .join(" "),
+            redact_diagnostic_with_args(String::from_utf8_lossy(&output.stderr).trim(), args)
         )
     }
     Ok(())
@@ -2397,8 +2415,11 @@ fn git_command_with_object_directory_input(
     if !output.status.success() {
         bail!(
             "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
+            args.iter()
+                .map(|arg| redact_carrier_address(arg))
+                .collect::<Vec<_>>()
+                .join(" "),
+            redact_diagnostic_with_args(String::from_utf8_lossy(&output.stderr).trim(), args)
         )
     }
     Ok(())
@@ -2412,6 +2433,16 @@ mod tests {
 
     use super::*;
     use crate::crypto::object_id;
+
+    #[test]
+    fn invalid_scp_carrier_branch_does_not_echo_private_path() {
+        let error = GitStorage::open("alice@host:private-token/repo.git#bad branch")
+            .err()
+            .unwrap();
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("host:[redacted]"), "{diagnostic}");
+        assert!(!diagnostic.contains("private-token"));
+    }
 
     struct PartialWriteSink {
         published: Arc<AtomicBool>,

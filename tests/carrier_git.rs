@@ -2044,10 +2044,7 @@ fn carrier_init_refuses_an_existing_branch_and_another_branch_works() {
     .initialize("owner")
     .unwrap_err();
     assert!(
-        format!("{refused:#}").contains(&format!(
-            "branch main of {remote} already exists; use an empty repository or choose another branch with e2ee::trusted-local:{remote}#<branch>",
-            remote = carrier.display()
-        )),
+        format!("{refused:#}").contains("append #<branch> to the configured carrier URL"),
         "{refused:#}"
     );
     assert_eq!(carrier_refs(&carrier), refs_before);
@@ -2136,8 +2133,8 @@ fn rejected_carrier_publish_restores_the_published_head() {
         "a hook rejection is not a compare-and-swap loss: {error:#}"
     );
     assert!(
-        format!("{error:#}").contains("carrier test hook refused the update"),
-        "the push error keeps git's stderr: {error:#}"
+        format!("{error:#}").contains("git push carrier branch failed"),
+        "a hook refusal is reported without remote stderr: {error:#}"
     );
 
     fs::remove_file(&marker).unwrap();
@@ -2275,7 +2272,8 @@ fn storage_failure_in_a_helper_push_batch_publishes_none_of_its_refs() {
         "a rejected publish is not reported as a race: stdout={stdout} stderr={stderr}"
     );
     assert!(
-        stderr.contains("carrier test hook refused the update"),
+        stderr.contains("git push carrier branch failed")
+            && !stderr.contains("carrier test hook refused the update"),
         "{stderr}"
     );
 }
