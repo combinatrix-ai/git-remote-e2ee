@@ -28,11 +28,11 @@ fn run() -> Result<()> {
 
     let local = GitRepository::from_environment()?
         .context("the e2ee remote helper must run inside a Git repository")?;
+    let state_dir = default_state_dir()?;
     let key_path = configured_key_path(&local, &remote_name)?;
     let key = KeyFile::read(&key_path)?;
     let storage = StorageUrl::parse(&url)?;
     persist_absolute_url(&local, &remote_name, &url, &storage)?;
-    let state_dir = default_state_dir()?;
     match storage {
         StorageUrl::Directory(path) => run_protocol(
             EncryptedRepository::new(FilesystemStorage::new(path), key, state_dir),

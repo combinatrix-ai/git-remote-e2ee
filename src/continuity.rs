@@ -17,13 +17,19 @@ const FLOOR_FORMAT: u32 = 1;
 /// `$XDG_STATE_HOME/git-e2ee`, or `~/.local/state/git-e2ee`. Only binaries
 /// call this; the library takes its state directory explicitly.
 pub fn default_state_dir() -> Result<PathBuf> {
-    let state_home = match std::env::var_os("XDG_STATE_HOME") {
-        Some(path) if !path.is_empty() => PathBuf::from(path),
-        _ => PathBuf::from(
-            std::env::var_os("HOME").context("HOME is unset and XDG_STATE_HOME is unset")?,
-        )
-        .join(".local/state"),
+    let (source, state_home) = match std::env::var_os("XDG_STATE_HOME") {
+        Some(path) if !path.is_empty() => ("XDG_STATE_HOME", PathBuf::from(path)),
+        _ => (
+            "HOME",
+            PathBuf::from(
+                std::env::var_os("HOME").context("HOME is unset and XDG_STATE_HOME is unset")?,
+            )
+            .join(".local/state"),
+        ),
     };
+    if !state_home.is_absolute() {
+        bail!("{source} must be an absolute path")
+    }
     Ok(state_home.join("git-e2ee"))
 }
 
@@ -61,6 +67,9 @@ pub(crate) struct FloorGuard {
 
 impl FloorGuard {
     pub fn acquire(state_dir: &Path, repository_root: &str) -> Result<Self> {
+        if !state_dir.is_absolute() {
+            bail!("continuity state directory must be an absolute path")
+        }
         let directory = state_dir.join(repository_root);
         crate::persist::create_dir_all_durable(&directory)
             .with_context(|| format!("create {}", directory.display()))?;
@@ -177,6 +186,14 @@ mod tests {
     use super::{FloorGuard, testing_write_floor};
 
     const ROOT: &str = "concurrency-fixture";
+
+    #[test]
+    fn relative_state_directory_cannot_create_a_second_floor() {
+        let error = FloorGuard::acquire(Path::new("relative-state"), ROOT)
+            .err()
+            .expect("relative state directory must fail");
+        assert!(format!("{error:#}").contains("must be an absolute path"));
+    }
 
     #[test]
     fn concurrent_floor_process_writes_never_lower_or_corrupt_the_floor() {

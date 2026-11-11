@@ -48,7 +48,9 @@ Unix every command refuses a key file that other users can access; run
 
 Each machine keeps one continuity floor per repository root at
 `$XDG_STATE_HOME/git-e2ee/<repository-root>/continuity.json` (by default under
-`~/.local/state`). `git fetch`, `git push`, `init`, `device-add`,
+`~/.local/state`). `XDG_STATE_HOME` and the fallback `HOME` must be absolute
+paths so the floor cannot change with the working directory. `git fetch`,
+`git push`, `init`, `device-add`,
 `device-revoke`, `device-list`, `verify`, and `recover` all check the storage
 head against this floor and then advance it, so once anything on this machine
 has seen a state, storage cannot show an older one. For example, after

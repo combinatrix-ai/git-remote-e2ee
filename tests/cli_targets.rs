@@ -175,6 +175,62 @@ fn verify_takes_a_carrier_url_outside_a_repository() {
 }
 
 #[test]
+fn verify_rejects_relative_continuity_home() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repository("notes");
+    let url = format!("e2ee::dir:{}", sandbox.path().join("storage").display());
+    success(&sandbox.e2ee(&repo, &["init", &url]));
+    let key = sandbox.keys().pop().unwrap();
+    let key_arg = key.to_string_lossy().into_owned();
+
+    let relative_xdg = sandbox
+        .command(env!("CARGO_BIN_EXE_git-e2ee"), sandbox.path())
+        .env("XDG_STATE_HOME", "relative-state")
+        .args(["verify", &url, "--key", &key_arg])
+        .output()
+        .unwrap();
+    assert!(!relative_xdg.status.success());
+    assert!(
+        String::from_utf8_lossy(&relative_xdg.stderr)
+            .contains("XDG_STATE_HOME must be an absolute path")
+    );
+    assert!(!sandbox.path().join("relative-state").exists());
+
+    let helper = sandbox
+        .command("git", &repo)
+        .env("XDG_STATE_HOME", "relative-state")
+        .args(["ls-remote", "origin"])
+        .output()
+        .unwrap();
+    assert!(!helper.status.success());
+    assert!(
+        String::from_utf8_lossy(&helper.stderr).contains("XDG_STATE_HOME must be an absolute path")
+    );
+    assert!(!sandbox.path().join("relative-state").exists());
+
+    let relative_home = sandbox
+        .command(env!("CARGO_BIN_EXE_git-e2ee"), sandbox.path())
+        .env_remove("XDG_STATE_HOME")
+        .env("HOME", "relative-home")
+        .args(["verify", &url, "--key", &key_arg])
+        .output()
+        .unwrap();
+    assert!(!relative_home.status.success());
+    assert!(
+        String::from_utf8_lossy(&relative_home.stderr).contains("HOME must be an absolute path")
+    );
+    assert!(!sandbox.path().join("relative-home").exists());
+
+    let absolute_xdg = sandbox
+        .command(env!("CARGO_BIN_EXE_git-e2ee"), sandbox.path())
+        .env("HOME", "relative-home")
+        .args(["verify", &url, "--key", &key_arg])
+        .output()
+        .unwrap();
+    success(&absolute_xdg);
+}
+
+#[test]
 fn unknown_or_plain_remote_names_are_rejected() {
     let sandbox = Sandbox::new();
     let repo = sandbox.repository("notes");
