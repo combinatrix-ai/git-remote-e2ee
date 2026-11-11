@@ -2654,6 +2654,7 @@ fn carrier_history_reads_skip_corrupt_copies_for_an_older_valid_one() {
         Some(head_id.as_str())
     );
     assert_eq!(history.manifests[&head_id], manifest_bytes);
+    assert!(history.manifest_bytes_read > manifest_bytes.len() as u64);
 
     assert!(
         storage

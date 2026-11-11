@@ -408,6 +408,8 @@ parent. It works within
 budgets of 2,048 outer commits, 256 distinct heads, 64 MiB of manifest bytes,
 and 1,000,000 estimated cryptographic operations. It scans past replays of the
 floor so a legitimate descendant hidden behind a replay can still be offered.
+The byte budget includes rejected current and historical manifest copies and
+diagnostic reads, not only successfully authenticated candidates.
 An exhausted budget fails closed. A CAS loss is returned to the operator;
 there is no automatic retry with an old selection. This implements the
 restart-at-discovery requirement as a fresh command invocation, matching the

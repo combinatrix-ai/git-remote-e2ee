@@ -100,6 +100,7 @@ impl Storage for OverBudgetHistoryStorage {
                 })
                 .collect(),
             manifests: Default::default(),
+            manifest_bytes_read: 0,
         }))
     }
 }
@@ -146,6 +147,7 @@ impl Storage for FixedHistoryStorage {
                 })
                 .collect(),
             manifests: self.manifests.clone(),
+            manifest_bytes_read: self.manifests.values().map(Vec::len).sum::<usize>() as u64,
         }))
     }
 }

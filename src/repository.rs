@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -271,16 +271,20 @@ struct RecoveryBudget {
 }
 
 impl RecoveryBudget {
-    fn charge_manifest(&mut self, header: &ManifestHeader, byte_count: usize) -> Result<()> {
+    fn charge_bytes(&mut self, byte_count: u64) -> Result<()> {
         self.bytes_read = self
             .bytes_read
-            .checked_add(byte_count as u64)
+            .checked_add(byte_count)
             .context("manifest chain byte budget overflow")?;
         if self.bytes_read > MAX_RECOVERY_BYTES {
             bail!(BudgetExhausted(
                 "manifest chain byte budget exhausted".to_owned()
             ))
         }
+        Ok(())
+    }
+
+    fn charge_crypto(&mut self, header: &ManifestHeader) -> Result<()> {
         let operations = (header.generation_key_envelopes.len() as u64)
             .checked_mul(2)
             .and_then(|value| value.checked_add(1))
@@ -873,8 +877,8 @@ impl<S: Storage> EncryptedRepository<S> {
         let current_chain = match observation.head_id.as_deref() {
             Some(head) => self.chain_from(
                 head,
-                &mut |id| self.read_manifest_material(id),
-                Some(&mut budget),
+                &mut |id, budget| self.read_manifest_material(id, budget),
+                &mut budget,
             ),
             None => match &observation.head {
                 Some(head) => {
@@ -944,7 +948,13 @@ impl<S: Storage> EncryptedRepository<S> {
                 if class == RecoveryClass::Invalid
                     && let Some(head) = observation.head_id.as_deref()
                 {
-                    report.claimed_signer = self.claimed_signer_for_head(head).ok();
+                    report.claimed_signer = match self.claimed_signer_for_head(head, &mut budget) {
+                        Ok(signer) => Some(signer),
+                        Err(error) if error.is::<BudgetExhausted>() => {
+                            return Err(error).context("bounded recovery discovery failed");
+                        }
+                        Err(_) => None,
+                    };
                 }
             }
         }
@@ -1001,7 +1011,7 @@ impl<S: Storage> EncryptedRepository<S> {
         let floor_generation = pinned.generation;
         let history = self.storage.recovery_history(
             MAX_RECOVERY_OUTER_COMMITS,
-            MAX_RECOVERY_MANIFEST_BYTES,
+            MAX_RECOVERY_MANIFEST_BYTES.min(MAX_RECOVERY_BYTES - budget.bytes_read),
             MAX_RECOVERY_CANDIDATES,
         )?;
         let carrier_history = history.is_some();
@@ -1021,15 +1031,15 @@ impl<S: Storage> EncryptedRepository<S> {
                 "recovery manifest byte budget exhausted".to_owned()
             ))
         }
-        budget.bytes_read = budget
-            .bytes_read
-            .checked_add(historical_bytes)
-            .context("recovery manifest byte budget overflow")?;
-        if budget.bytes_read > MAX_RECOVERY_BYTES {
+        if history.manifest_bytes_read < historical_bytes {
+            bail!("recovery history underreported manifest bytes")
+        }
+        if history.manifest_bytes_read > MAX_RECOVERY_MANIFEST_BYTES {
             bail!(BudgetExhausted(
                 "recovery manifest byte budget exhausted".to_owned()
             ))
         }
+        budget.charge_bytes(history.manifest_bytes_read)?;
         if carrier_history
             && !history
                 .commits
@@ -1043,29 +1053,32 @@ impl<S: Storage> EncryptedRepository<S> {
             return Ok(report);
         }
 
-        let read_history_material = |id: &str| -> Result<(String, Vec<u8>, ManifestHeader)> {
-            match self.read_manifest_material(id) {
-                Ok(material) => Ok(material),
-                Err(current_error) => {
-                    let Some(bytes) = history.manifests.get(id) else {
-                        return Err(current_error.context(format!(
-                            "historical manifest {id} is not in carrier history"
-                        )));
-                    };
-                    if object_id(bytes) != id {
-                        return Err(proven_invalid(anyhow::anyhow!(
-                            "historical manifest {id} content ID mismatch"
-                        )));
+        let read_history_material =
+            |id: &str, budget: &mut RecoveryBudget| -> Result<(String, Vec<u8>, ManifestHeader)> {
+                match self.read_manifest_material(id, budget) {
+                    Ok(material) => Ok(material),
+                    Err(error) if error.is::<BudgetExhausted>() => Err(error),
+                    Err(current_error) => {
+                        let Some(bytes) = history.manifests.get(id) else {
+                            return Err(current_error.context(format!(
+                                "historical manifest {id} is not in carrier history"
+                            )));
+                        };
+                        budget.charge_bytes(bytes.len() as u64)?;
+                        if object_id(bytes) != id {
+                            return Err(proven_invalid(anyhow::anyhow!(
+                                "historical manifest {id} content ID mismatch"
+                            )));
+                        }
+                        let header = peek_manifest_header(bytes).map_err(proven_invalid)?;
+                        Ok((id.to_owned(), bytes.clone(), header))
                     }
-                    let header = peek_manifest_header(bytes).map_err(proven_invalid)?;
-                    Ok((id.to_owned(), bytes.clone(), header))
                 }
-            }
-        };
+            };
         let floor_chain = match self.chain_from(
             floor_id,
-            &mut |id| read_history_material(id),
-            Some(&mut budget),
+            &mut |id, budget| read_history_material(id, budget),
+            &mut budget,
         ) {
             Ok(chain) => chain,
             Err(error) if error.is::<BudgetExhausted>() => {
@@ -1140,8 +1153,8 @@ impl<S: Storage> EncryptedRepository<S> {
                 }
                 let candidate_chain = match self.chain_from(
                     candidate_id,
-                    &mut |id| read_history_material(id),
-                    Some(&mut budget),
+                    &mut |id, budget| read_history_material(id, budget),
+                    &mut budget,
                 ) {
                     Ok(chain) => chain,
                     Err(error) if error.is::<BudgetExhausted>() => {
@@ -1316,8 +1329,8 @@ impl<S: Storage> EncryptedRepository<S> {
         Ok(report)
     }
 
-    fn claimed_signer_for_head(&self, head: &str) -> Result<String> {
-        let (_, encrypted, header) = self.read_manifest_material(head)?;
+    fn claimed_signer_for_head(&self, head: &str, budget: &mut RecoveryBudget) -> Result<String> {
+        let (_, encrypted, header) = self.read_manifest_material(head, budget)?;
         let key = unwrap_generation_key(&header, &self.key)?;
         Ok(open_manifest(&encrypted, &key)?.claimed_signer_id)
     }
@@ -1416,8 +1429,8 @@ impl<S: Storage> EncryptedRepository<S> {
         };
         self.chain_from(
             &head,
-            &mut |id| self.read_manifest_material(id),
-            Some(&mut budget),
+            &mut |id, budget| self.read_manifest_material(id, budget),
+            &mut budget,
         )
     }
 
@@ -1425,15 +1438,13 @@ impl<S: Storage> EncryptedRepository<S> {
         &self,
         head: &str,
         read_material: &mut F,
-        mut budget: Option<&mut RecoveryBudget>,
+        budget: &mut RecoveryBudget,
     ) -> Result<Vec<OpenedState>>
     where
-        F: FnMut(&str) -> Result<(String, Vec<u8>, ManifestHeader)>,
+        F: FnMut(&str, &mut RecoveryBudget) -> Result<(String, Vec<u8>, ManifestHeader)>,
     {
-        let (mut id, mut encrypted, mut header) = read_material(head)?;
-        if let Some(budget) = budget.as_deref_mut() {
-            budget.charge_manifest(&header, encrypted.len())?;
-        }
+        let (mut id, mut encrypted, mut header) = read_material(head, budget)?;
+        budget.charge_crypto(&header)?;
         let mut generation_key = unwrap_generation_key(&header, &self.key)?;
         let mut opened = open_manifest(&encrypted, &generation_key).map_err(proven_invalid)?;
         let mut unverified = Vec::new();
@@ -1454,10 +1465,8 @@ impl<S: Storage> EncryptedRepository<S> {
                 unverified.push((id, opened, generation_key));
                 break;
             };
-            let (parent_id, parent_encrypted, parent_header) = read_material(&previous_id)?;
-            if let Some(budget) = budget.as_deref_mut() {
-                budget.charge_manifest(&parent_header, parent_encrypted.len())?;
-            }
+            let (parent_id, parent_encrypted, parent_header) = read_material(&previous_id, budget)?;
+            budget.charge_crypto(&parent_header)?;
             let parent_key =
                 unwrap_predecessor_key(&generation_key, &opened.manifest, &parent_header)
                     .map_err(proven_invalid)?;
@@ -1546,8 +1555,28 @@ impl<S: Storage> EncryptedRepository<S> {
         Ok(chain_oldest_first)
     }
 
-    fn read_manifest_material(&self, id: &str) -> Result<(String, Vec<u8>, ManifestHeader)> {
-        let bytes = self.storage.get_object(ObjectKind::Manifest, id)?;
+    fn read_manifest_material(
+        &self,
+        id: &str,
+        budget: &mut RecoveryBudget,
+    ) -> Result<(String, Vec<u8>, ManifestHeader)> {
+        let reader = self.storage.open_object(ObjectKind::Manifest, id)?;
+        let mut reader = reader.take(crate::storage::MAX_MANIFEST_BYTES + 1);
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let remaining = MAX_RECOVERY_BYTES - budget.bytes_read;
+            let limit = buffer.len().min(remaining.saturating_add(1) as usize);
+            let read = reader.read(&mut buffer[..limit])?;
+            if read == 0 {
+                break;
+            }
+            budget.charge_bytes(read as u64)?;
+            bytes.extend_from_slice(&buffer[..read]);
+        }
+        if bytes.len() as u64 > crate::storage::MAX_MANIFEST_BYTES {
+            bail!("buffered object exceeds size limit")
+        }
         if object_id(&bytes) != id {
             return Err(proven_invalid(anyhow::anyhow!(
                 "manifest ciphertext hash mismatch"
@@ -1839,12 +1868,139 @@ fn record_rejected_head(
 
 #[cfg(test)]
 mod tests {
-    use std::io;
+    use std::io::{self, Read};
 
     use super::{
-        ForeignRepository, InvalidState, MissingStorageHead, NotActiveReader, ObjectUnavailable,
-        RecoveryClass, RecoveryReport, Unsupported, classify_recovery_error,
+        EncryptedRepository, ForeignRepository, InvalidState, MAX_RECOVERY_BYTES,
+        MissingStorageHead, NotActiveReader, ObjectUnavailable, RecoveryBudget, RecoveryClass,
+        RecoveryReport, Unsupported, classify_recovery_error,
     };
+    use crate::crypto::KeyFile;
+    use crate::error::BudgetExhausted;
+    use crate::storage::{MAX_MANIFEST_BYTES, ObjectKind, ObjectStage, Storage};
+
+    struct ReadOnlyStorage {
+        reader: fn() -> Box<dyn Read + Send>,
+    }
+
+    impl Storage for ReadOnlyStorage {
+        fn begin_object(&self, _kind: ObjectKind) -> anyhow::Result<Box<dyn ObjectStage>> {
+            anyhow::bail!("unused in this test")
+        }
+
+        fn open_object(
+            &self,
+            _kind: ObjectKind,
+            _id: &str,
+        ) -> anyhow::Result<Box<dyn Read + Send>> {
+            Ok((self.reader)())
+        }
+
+        fn read_head(&self) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+
+        fn compare_and_swap_head(
+            &self,
+            _expected: Option<&str>,
+            _next: &str,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("unused in this test")
+        }
+    }
+
+    struct PartialThenError(bool);
+
+    impl Read for PartialThenError {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if self.0 {
+                return Err(io::Error::other("interrupted storage read"));
+            }
+            self.0 = true;
+            output[..4].copy_from_slice(b"junk");
+            Ok(4)
+        }
+    }
+
+    struct SmallReadOnly;
+
+    impl Read for SmallReadOnly {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            assert!(output.len() <= 4, "read past remaining byte budget");
+            output.fill(b'x');
+            Ok(output.len())
+        }
+    }
+
+    #[test]
+    fn failed_manifest_reads_charge_bytes_before_parsing_or_retry() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = EncryptedRepository::new(
+            ReadOnlyStorage {
+                reader: || Box::new(PartialThenError(false)),
+            },
+            KeyFile::generate(),
+            temporary.path(),
+        );
+        let mut budget = RecoveryBudget {
+            crypto_operations: 0,
+            bytes_read: 0,
+        };
+        let id = "0".repeat(64);
+        let error = repository
+            .read_manifest_material(&id, &mut budget)
+            .unwrap_err();
+        assert!(error.to_string().contains("interrupted storage read"));
+        assert_eq!(budget.bytes_read, 4);
+
+        budget.bytes_read = MAX_RECOVERY_BYTES - 3;
+        let error = repository
+            .read_manifest_material(&id, &mut budget)
+            .unwrap_err();
+        assert!(error.is::<BudgetExhausted>(), "{error:#}");
+    }
+
+    #[test]
+    fn oversized_manifest_read_charges_the_limit_byte() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = EncryptedRepository::new(
+            ReadOnlyStorage {
+                reader: || Box::new(io::repeat(b'x')),
+            },
+            KeyFile::generate(),
+            temporary.path(),
+        );
+        let mut budget = RecoveryBudget {
+            crypto_operations: 0,
+            bytes_read: 0,
+        };
+        let error = repository
+            .read_manifest_material(&"0".repeat(64), &mut budget)
+            .unwrap_err();
+        assert!(error.to_string().contains("size limit"), "{error:#}");
+        assert_eq!(budget.bytes_read, MAX_MANIFEST_BYTES + 1);
+    }
+
+    #[test]
+    fn manifest_reader_requests_only_remaining_budget_plus_probe() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = EncryptedRepository::new(
+            ReadOnlyStorage {
+                reader: || Box::new(SmallReadOnly),
+            },
+            KeyFile::generate(),
+            temporary.path(),
+        );
+        let mut budget = RecoveryBudget {
+            crypto_operations: 0,
+            bytes_read: MAX_RECOVERY_BYTES - 3,
+        };
+        let error = repository
+            .read_manifest_material(&"0".repeat(64), &mut budget)
+            .unwrap_err();
+        assert!(error.is::<BudgetExhausted>(), "{error:#}");
+        assert_eq!(budget.bytes_read, MAX_RECOVERY_BYTES + 1);
+    }
 
     #[test]
     fn recovery_report_escapes_unverified_fields_without_changing_structure() {

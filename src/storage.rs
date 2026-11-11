@@ -239,6 +239,7 @@ pub struct RecoveryCommit {
 pub struct RecoveryHistory {
     pub commits: Vec<RecoveryCommit>,
     pub manifests: std::collections::BTreeMap<String, Vec<u8>>,
+    pub manifest_bytes_read: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1204,6 +1205,7 @@ impl GitStorage {
         commit: &str,
         kind: ObjectKind,
         id: &str,
+        max_bytes: u64,
         mut sink: impl FnMut(usize, &[u8]) -> Result<()>,
     ) -> Result<bool> {
         let CarrierListing::Chunks(chunks) = self.chunk_entries_at(commit, kind, id)? else {
@@ -1212,14 +1214,24 @@ impl GitStorage {
         let mut reader = GitChunkReader::new(self.root(), chunks)?;
         let mut hasher = Sha256::new();
         let mut buffer = vec![0_u8; 64 * 1024];
+        let mut bytes_read = 0_u64;
         loop {
-            let read = match reader.read(&mut buffer) {
+            let limit = buffer
+                .len()
+                .min(max_bytes.saturating_sub(bytes_read).saturating_add(1) as usize);
+            let read = match reader.read(&mut buffer[..limit]) {
                 Ok(0) => break,
                 Ok(read) => read,
                 Err(error) if error.kind() == std::io::ErrorKind::InvalidData => return Ok(false),
                 Err(error) => return Err(error.into()),
             };
             sink(reader.chunk_index(), &buffer[..read])?;
+            bytes_read += read as u64;
+            if bytes_read > max_bytes {
+                bail!(BudgetExhausted(
+                    "carrier copy byte budget exhausted".to_owned()
+                ))
+            }
             hasher.update(&buffer[..read]);
         }
         Ok(hex::encode(hasher.finalize()) == id)
@@ -1552,8 +1564,12 @@ impl Storage for GitStorage {
                 }
                 for copy in self.copy_commits(&commits, ObjectKind::Manifest, id)? {
                     let mut bytes = Vec::new();
-                    let valid =
-                        self.read_copy_at(&copy, ObjectKind::Manifest, id, |_, chunk| {
+                    let valid = self.read_copy_at(
+                        &copy,
+                        ObjectKind::Manifest,
+                        id,
+                        max_manifest_bytes.saturating_sub(total_bytes),
+                        |_, chunk| {
                             total_bytes = total_bytes
                                 .checked_add(chunk.len() as u64)
                                 .context("carrier recovery manifest byte count overflow")?;
@@ -1564,7 +1580,8 @@ impl Storage for GitStorage {
                             }
                             bytes.extend_from_slice(chunk);
                             Ok(())
-                        })?;
+                        },
+                    )?;
                     if valid {
                         history.manifests.insert(id.clone(), bytes);
                         break;
@@ -1576,6 +1593,7 @@ impl Storage for GitStorage {
                 head_id,
             });
         }
+        history.manifest_bytes_read = total_bytes;
         Ok(Some(history))
     }
 
@@ -1600,26 +1618,32 @@ impl Storage for GitStorage {
             let object_dir = staging.path().join("object");
             fs::create_dir(&object_dir)?;
             let mut current: Option<(usize, File)> = None;
-            let valid = self.read_copy_at(&copy, kind, id, |index, piece| {
-                total_bytes = total_bytes
-                    .checked_add(piece.len() as u64)
-                    .context("carrier restore byte count overflow")?;
-                if total_bytes > max_bytes {
-                    bail!(BudgetExhausted(
-                        "carrier recovery restore byte budget exhausted".to_owned()
-                    ))
-                }
-                if current.as_ref().map(|(open, _)| *open) != Some(index) {
-                    if let Some((_, file)) = current.take() {
-                        file.sync_all()?;
+            let valid = self.read_copy_at(
+                &copy,
+                kind,
+                id,
+                max_bytes.saturating_sub(total_bytes),
+                |index, piece| {
+                    total_bytes = total_bytes
+                        .checked_add(piece.len() as u64)
+                        .context("carrier restore byte count overflow")?;
+                    if total_bytes > max_bytes {
+                        bail!(BudgetExhausted(
+                            "carrier recovery restore byte budget exhausted".to_owned()
+                        ))
                     }
-                    let file = File::create(object_dir.join(format!("{index:08}")))?;
-                    current = Some((index, file));
-                }
-                let (_, file) = current.as_mut().expect("chunk file opened above");
-                file.write_all(piece)?;
-                Ok(())
-            })?;
+                    if current.as_ref().map(|(open, _)| *open) != Some(index) {
+                        if let Some((_, file)) = current.take() {
+                            file.sync_all()?;
+                        }
+                        let file = File::create(object_dir.join(format!("{index:08}")))?;
+                        current = Some((index, file));
+                    }
+                    let (_, file) = current.as_mut().expect("chunk file opened above");
+                    file.write_all(piece)?;
+                    Ok(())
+                },
+            )?;
             if let Some((_, file)) = current.take() {
                 file.sync_all()?;
             }
@@ -2892,8 +2916,9 @@ mod tests {
             state: Mutex::new(GitStorageState { base_commit: None }),
         };
         let id = "ab".repeat(32);
-        let read =
-            |commit: &str| storage.read_copy_at(commit, ObjectKind::Manifest, &id, |_, _| Ok(()));
+        let read = |commit: &str| {
+            storage.read_copy_at(commit, ObjectKind::Manifest, &id, u64::MAX, |_, _| Ok(()))
+        };
 
         assert!(!read(&commit).unwrap(), "an absent copy is not an error");
         let unknown_commit = "1".repeat(40);
