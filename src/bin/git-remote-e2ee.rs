@@ -32,6 +32,18 @@ fn run() -> Result<()> {
     let key_path = configured_key_path(&local, &remote_name)?;
     let key = KeyFile::read(&key_path)?;
     let storage = StorageUrl::parse(&url)?;
+    if matches!(&storage, StorageUrl::TrustedLocalGit(_)) {
+        let passed = format!("e2ee::{}", url.strip_prefix("e2ee::").unwrap_or(&url));
+        let chosen = if remote_name.starts_with("e2ee::trusted-local:") {
+            remote_name.clone()
+        } else {
+            configured_local_value(&local, &format!("remote.{remote_name}.url"))?
+                .context("trusted-local carrier requires a configured remote URL")?
+        };
+        if chosen != passed {
+            bail!("trusted-local carrier URL was rewritten before reaching the helper")
+        }
+    }
     persist_absolute_url(&local, &remote_name, &url, &storage)?;
     match storage {
         StorageUrl::Directory(path) => run_protocol(
@@ -41,6 +53,11 @@ fn run() -> Result<()> {
         ),
         StorageUrl::Git(remote) => run_protocol(
             EncryptedRepository::new(GitStorage::open(&remote)?, key, state_dir),
+            &local,
+            remote_name,
+        ),
+        StorageUrl::TrustedLocalGit(remote) => run_protocol(
+            EncryptedRepository::new(GitStorage::open_trusted_local(&remote)?, key, state_dir),
             &local,
             remote_name,
         ),
@@ -306,6 +323,18 @@ fn set_local_config(local: &GitRepository, key: &str, value: &str) -> Result<()>
 
 fn configured_value(local: &GitRepository, key: &str) -> Result<Option<String>> {
     let output = local.git().args(["config", "--get", key]).output()?;
+    if output.status.success() {
+        Ok(Some(String::from_utf8(output.stdout)?.trim().to_owned()))
+    } else {
+        Ok(None)
+    }
+}
+
+fn configured_local_value(local: &GitRepository, key: &str) -> Result<Option<String>> {
+    let output = local
+        .git()
+        .args(["config", "--local", "--get", key])
+        .output()?;
     if output.status.success() {
         Ok(Some(String::from_utf8(output.stdout)?.trim().to_owned()))
     } else {

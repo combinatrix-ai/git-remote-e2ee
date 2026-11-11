@@ -448,7 +448,7 @@ run_round() {
   "$git_e2ee" keygen --output "$key_directory" >/dev/null 2>&1
   "$git_e2ee" keygen --output "$key_carrier" >/dev/null 2>&1
   gcrypt_url="gcrypt::file://$gcrypt_git#gcrypt-carrier"
-  e2ee_url="e2ee::file://$carrier_git"
+  e2ee_url="e2ee::trusted-local:$carrier_git"
 
   git -C "$source_work" remote add plain-local "file://$bare_local"
   git -C "$source_work" remote add gcrypt-directory "gcrypt::$gcrypt_dir"

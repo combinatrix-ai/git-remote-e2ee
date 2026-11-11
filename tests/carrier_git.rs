@@ -102,7 +102,7 @@ fn init_carrier(root: &Path, carrier: &Path, key: &KeyFile) {
         false,
     );
     EncryptedRepository::new(
-        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
         key.clone(),
         support::state_dir(),
     )
@@ -235,7 +235,7 @@ fn carrier_git_supports_native_push_and_clone_without_plaintext() {
     key.write_new(&key_path).unwrap();
     init_carrier(temporary.path(), &carrier, &key);
 
-    let url = format!("e2ee::{}", carrier.display());
+    let url = format!("e2ee::trusted-local:{}", carrier.display());
     git(&source, &["remote", "add", "private", &url], false);
     git(
         &source,
@@ -305,7 +305,7 @@ fn carrier_git_supports_tags_and_ref_deletion() {
     key.write_new(&key_path).unwrap();
     init_carrier(temporary.path(), &carrier, &key);
 
-    let url = format!("e2ee::{}", carrier.display());
+    let url = format!("e2ee::trusted-local:{}", carrier.display());
     git(&source, &["remote", "add", "private", &url], false);
     git(
         &source,
@@ -383,7 +383,7 @@ fn carrier_git_supports_tags_and_ref_deletion() {
         .success()
     );
     let manifest = EncryptedRepository::new(
-        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
         key,
         support::state_dir(),
     )
@@ -410,12 +410,12 @@ fn carrier_git_allows_exactly_one_concurrent_writer() {
     // the same outer commit and exercise receive-pack's ref lock/FF check. Each
     // writer is its own machine; one machine serializes on its floor lock.
     let repository_a = EncryptedRepository::new(
-        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
         key.clone(),
         temporary.path().join("machine-a"),
     );
     let repository_b = EncryptedRepository::new(
-        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
         key.clone(),
         temporary.path().join("machine-b"),
     );
@@ -457,7 +457,7 @@ fn carrier_git_allows_exactly_one_concurrent_writer() {
     );
 
     let fresh = EncryptedRepository::new(
-        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
         key,
         support::state_dir(),
     );
@@ -499,7 +499,7 @@ fn stale_carrier_views_on_one_machine_refresh_instead_of_reporting_rollback() {
     init_carrier(temporary.path(), &carrier, &key);
     let open = || {
         EncryptedRepository::new(
-            GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+            GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
             key.clone(),
             support::state_dir(),
         )
@@ -565,11 +565,11 @@ fn carrier_cache_fetches_only_new_objects() {
     let first = "1".repeat(64);
     let second = "2".repeat(64);
 
-    let initial = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let initial = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     initial.compare_and_swap_head(None, &first).unwrap();
     drop(initial);
 
-    let cached = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let cached = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     let cache_root = temporary.path().join("carrier-cache");
     let cache = cache_repo(&cache_root);
     let before_push = reachable_object_count(&cache);
@@ -583,12 +583,12 @@ fn carrier_cache_fetches_only_new_objects() {
     let after_push = reachable_object_count(&cache);
     assert_eq!(after_push, remote_after);
 
-    let updated = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let updated = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     assert_eq!(after_push - before_push, remote_after - remote_before);
     assert_eq!(after_push, remote_after);
     drop(updated);
 
-    let unchanged = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let unchanged = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     assert_eq!(reachable_object_count(&cache), after_push);
     drop(unchanged);
 }
@@ -598,7 +598,7 @@ fn carrier_cache_does_not_hide_remote_access_errors() {
     let temporary = tempfile::tempdir().unwrap();
     let _cache = isolated_cache(&temporary);
     let missing_remote = temporary.path().join("missing-carrier.git");
-    let error = match GitStorage::open(missing_remote.to_str().unwrap()) {
+    let error = match GitStorage::open_trusted_local(missing_remote.to_str().unwrap()) {
         Ok(_) => panic!("opening a missing carrier unexpectedly succeeded"),
         Err(error) => error,
     };
@@ -618,8 +618,8 @@ fn stale_carrier_cache_is_refreshed_before_compare_and_swap() {
         &["init", "--bare", "-q", carrier.to_str().unwrap()],
         false,
     );
-    let stale = GitStorage::open(carrier.to_str().unwrap()).unwrap();
-    let winner = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let stale = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
+    let winner = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     let winner_head = "3".repeat(64);
     let stale_head = "4".repeat(64);
 
@@ -651,11 +651,11 @@ fn deleted_and_corrupt_carrier_caches_are_rebuilt() {
         false,
     );
     let head = "5".repeat(64);
-    let storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let storage = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     storage.compare_and_swap_head(None, &head).unwrap();
     drop(storage);
 
-    let populated = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let populated = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     assert_eq!(
         populated.read_head().unwrap().as_deref(),
         Some(head.as_str())
@@ -665,7 +665,7 @@ fn deleted_and_corrupt_carrier_caches_are_rebuilt() {
     let cache = cache_repo(&cache_root);
 
     fs::remove_dir_all(&cache).unwrap();
-    let rebuilt = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let rebuilt = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     assert_eq!(rebuilt.read_head().unwrap().as_deref(), Some(head.as_str()));
     drop(rebuilt);
 
@@ -696,7 +696,7 @@ fn deleted_and_corrupt_carrier_caches_are_rebuilt() {
         fs::write(pack, b"corrupt cache pack").unwrap();
     }
 
-    let recovered = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let recovered = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     assert_eq!(
         recovered.read_head().unwrap().as_deref(),
         Some(head.as_str())
@@ -817,7 +817,7 @@ fn carrier_git_process_race_worker() {
     let ready = env::var("E2EE_TEST_RACE_READY").unwrap();
     let result = env::var("E2EE_TEST_RACE_RESULT").unwrap();
     let start = env::var("E2EE_TEST_RACE_START").unwrap();
-    let storage = GitStorage::open(&remote).unwrap();
+    let storage = GitStorage::open_trusted_local(&remote).unwrap();
     fs::write(ready, "ready").unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     while !Path::new(&start).exists() && Instant::now() < deadline {
@@ -857,7 +857,7 @@ fn native_fetch_rejects_outer_carrier_rollback() {
         ],
         false,
     );
-    let url = format!("e2ee::{}", carrier.display());
+    let url = format!("e2ee::trusted-local:{}", carrier.display());
     git(&source, &["remote", "add", "private", &url], false);
     git(
         &source,
@@ -913,7 +913,7 @@ fn carrier_git_detects_tampered_ciphertext_chunk() {
     let key = KeyFile::generate();
     init_carrier(temporary.path(), &carrier, &key);
     EncryptedRepository::new(
-        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
         key.clone(),
         support::state_dir(),
     )
@@ -955,7 +955,7 @@ fn carrier_git_detects_tampered_ciphertext_chunk() {
     git(&attacker, &["push", "-q", "origin", "main"], false);
 
     let fresh = EncryptedRepository::new(
-        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
         key,
         support::state_dir(),
     );
@@ -987,7 +987,7 @@ fn carrier_recovery_chooses_legitimate_descendant_and_restores_deleted_ciphertex
         false,
     );
     let repository = EncryptedRepository::new(
-        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
         owner.clone(),
         support::state_dir(),
     );
@@ -999,7 +999,7 @@ fn carrier_recovery_chooses_legitimate_descendant_and_restores_deleted_ciphertex
             DeviceRoles::reader(),
         )
         .unwrap();
-    let policy_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let policy_storage = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     let policy_encrypted = policy_storage
         .get_object(ObjectKind::Manifest, &reader_policy_manifest)
         .unwrap();
@@ -1030,7 +1030,7 @@ fn carrier_recovery_chooses_legitimate_descendant_and_restores_deleted_ciphertex
     // The returning client is another machine; the writer's floor is not its floor.
     let returning_machine = temporary.path().join("returning-machine");
     EncryptedRepository::new(
-        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
         owner.clone(),
         &returning_machine,
     )
@@ -1083,13 +1083,13 @@ fn carrier_recovery_chooses_legitimate_descendant_and_restores_deleted_ciphertex
     );
     git(&attacker, &["push", "-q", "origin", "main"], false);
 
-    let replay_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let replay_storage = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     let junk_id = create_reader_signed_junk(&replay_storage, &reader, &floor_policy, &floor_id);
     replay_storage
         .compare_and_swap_head(Some(&floor_id), &junk_id)
         .unwrap();
 
-    let recovery_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let recovery_storage = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     let recoverer = EncryptedRepository::new(recovery_storage, owner.clone(), &returning_machine);
     let report = recoverer
         .recover(
@@ -1149,12 +1149,12 @@ fn carrier_recovery_chooses_legitimate_descendant_and_restores_deleted_ciphertex
     assert_eq!(manifest.generation, floor_generation + 2);
     assert_eq!(manifest.refs["refs/heads/main"], pushed_object);
     assert!(
-        GitStorage::open(carrier.to_str().unwrap())
+        GitStorage::open_trusted_local(carrier.to_str().unwrap())
             .unwrap()
             .open_object(ObjectKind::Pack, &pack_id)
             .is_ok()
     );
-    let recovered_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let recovered_storage = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     let recovered_bytes = recovered_storage
         .get_object(ObjectKind::Manifest, &current_id)
         .unwrap();
@@ -1208,7 +1208,7 @@ fn carrier_recovery_offers_hidden_legitimate_content_descendant() {
     let owner = KeyFile::generate();
     let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
     let repository = EncryptedRepository::new(
-        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
         owner.clone(),
         support::state_dir(),
     );
@@ -1220,7 +1220,7 @@ fn carrier_recovery_offers_hidden_legitimate_content_descendant() {
             DeviceRoles::reader(),
         )
         .unwrap();
-    let floor_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let floor_storage = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     let floor_bytes = floor_storage
         .get_object(ObjectKind::Manifest, &floor_id)
         .unwrap();
@@ -1238,7 +1238,7 @@ fn carrier_recovery_offers_hidden_legitimate_content_descendant() {
     // The returning client is another machine; the writer's floor is not its floor.
     let returning_machine = temporary.path().join("returning-machine");
     EncryptedRepository::new(
-        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
         owner.clone(),
         &returning_machine,
     )
@@ -1283,14 +1283,14 @@ fn carrier_recovery_offers_hidden_legitimate_content_descendant() {
     git(&attacker, &["commit", "-q", "-m", "replay floor"], false);
     git(&attacker, &["push", "-q", "origin", "main"], false);
 
-    let replay_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let replay_storage = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     let junk_id = create_reader_signed_junk(&replay_storage, &reader, &floor_policy, &floor_id);
     replay_storage
         .compare_and_swap_head(Some(&floor_id), &junk_id)
         .unwrap();
 
     let recoverer = EncryptedRepository::new(
-        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
         owner,
         &returning_machine,
     );
@@ -1381,7 +1381,7 @@ fn carrier_recovery_refuses_history_with_a_merge_hiding_a_legitimate_state() {
     let owner = KeyFile::generate();
     let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
     let repository = EncryptedRepository::new(
-        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
         owner.clone(),
         support::state_dir(),
     );
@@ -1393,7 +1393,7 @@ fn carrier_recovery_refuses_history_with_a_merge_hiding_a_legitimate_state() {
             DeviceRoles::reader(),
         )
         .unwrap();
-    let floor_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let floor_storage = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     let floor_bytes = floor_storage
         .get_object(ObjectKind::Manifest, &floor_id)
         .unwrap();
@@ -1460,14 +1460,14 @@ fn carrier_recovery_refuses_history_with_a_merge_hiding_a_legitimate_state() {
     );
     git(&attacker, &["push", "-q", "origin", "side:main"], false);
 
-    let junk_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let junk_storage = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     let junk_id = create_reader_signed_junk(&junk_storage, &reader, &floor_policy, &floor_id);
     junk_storage
         .compare_and_swap_head(Some(&floor_id), &junk_id)
         .unwrap();
 
     let recoverer = EncryptedRepository::new(
-        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
         owner,
         support::state_dir(),
     );
@@ -1483,7 +1483,7 @@ fn carrier_recovery_refuses_history_with_a_merge_hiding_a_legitimate_state() {
         )
         .unwrap_err();
     assert!(format!("{error:#}").contains("merge commit"), "{error:#}");
-    let after = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let after = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     assert_eq!(
         after.read_head().unwrap().as_deref(),
         Some(junk_id.as_str())
@@ -1506,7 +1506,7 @@ fn carrier_recovery_refuses_conflicting_authenticated_descendants() {
     let owner = KeyFile::generate();
     let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
     let repository = EncryptedRepository::new(
-        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
         owner.clone(),
         support::state_dir(),
     );
@@ -1522,7 +1522,7 @@ fn carrier_recovery_refuses_conflicting_authenticated_descendants() {
         .fetch_into(&GitRepository::open(&returning).unwrap(), "private")
         .unwrap();
 
-    let policy_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let policy_storage = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     let policy_encrypted = policy_storage
         .get_object(ObjectKind::Manifest, &floor_id)
         .unwrap();
@@ -1538,7 +1538,7 @@ fn carrier_recovery_refuses_conflicting_authenticated_descendants() {
     )
     .unwrap();
 
-    let first_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let first_storage = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     let first_fork = create_writer_successor(
         &first_storage,
         &owner,
@@ -1549,7 +1549,7 @@ fn carrier_recovery_refuses_conflicting_authenticated_descendants() {
     first_storage
         .compare_and_swap_head(Some(&floor_id), &first_fork)
         .unwrap();
-    let second_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let second_storage = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     let second_fork = create_writer_successor(
         &second_storage,
         &owner,
@@ -1560,13 +1560,13 @@ fn carrier_recovery_refuses_conflicting_authenticated_descendants() {
     second_storage
         .compare_and_swap_head(Some(&first_fork), &second_fork)
         .unwrap();
-    let junk_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let junk_storage = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     let junk = create_reader_signed_junk(&junk_storage, &reader, &policy, &floor_id);
     junk_storage
         .compare_and_swap_head(Some(&second_fork), &junk)
         .unwrap();
 
-    let recovery_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let recovery_storage = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     let report = EncryptedRepository::new(recovery_storage, owner, support::state_dir())
         .recover(
             &GitRepository::open(&returning).unwrap(),
@@ -1599,7 +1599,7 @@ fn carrier_recovery_refuses_conflicting_authenticated_descendants() {
             .iter()
             .any(|candidate| candidate.manifest_id == second_fork)
     );
-    let current = GitStorage::open(carrier.to_str().unwrap())
+    let current = GitStorage::open_trusted_local(carrier.to_str().unwrap())
         .unwrap()
         .read_head()
         .unwrap();
@@ -1622,7 +1622,7 @@ fn carrier_recovery_loses_cas_without_retrying_when_another_writer_publishes() {
     let owner = KeyFile::generate();
     let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
     let repository = EncryptedRepository::new(
-        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
         owner.clone(),
         support::state_dir(),
     );
@@ -1637,7 +1637,7 @@ fn carrier_recovery_loses_cas_without_retrying_when_another_writer_publishes() {
     repository
         .fetch_into(&GitRepository::open(&returning).unwrap(), "private")
         .unwrap();
-    let policy_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let policy_storage = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     let policy_encrypted = policy_storage
         .get_object(ObjectKind::Manifest, &floor_id)
         .unwrap();
@@ -1653,12 +1653,12 @@ fn carrier_recovery_loses_cas_without_retrying_when_another_writer_publishes() {
     )
     .unwrap();
 
-    let bad_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let bad_storage = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     let junk = create_reader_signed_junk(&bad_storage, &reader, &policy, &floor_id);
     bad_storage
         .compare_and_swap_head(Some(&floor_id), &junk)
         .unwrap();
-    let stale_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let stale_storage = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     let stale_recoverer =
         EncryptedRepository::new(stale_storage, owner.clone(), support::state_dir());
     let offered = stale_recoverer
@@ -1675,7 +1675,7 @@ fn carrier_recovery_loses_cas_without_retrying_when_another_writer_publishes() {
     assert_eq!(offered.classification, RecoveryClass::Invalid);
     assert_eq!(offered.default_base.as_deref(), Some(floor_id.as_str()));
 
-    let competing_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let competing_storage = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     let winner = create_writer_successor(
         &competing_storage,
         &owner,
@@ -1700,7 +1700,7 @@ fn carrier_recovery_loses_cas_without_retrying_when_another_writer_publishes() {
         .unwrap_err();
     assert!(error.to_string().contains("concurrently"));
     let latest = EncryptedRepository::new(
-        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
         owner,
         support::state_dir(),
     );
@@ -1794,7 +1794,7 @@ fn carrier_root_holds_exactly_the_v7_layout() {
     let key = KeyFile::generate();
     key.write_new(&key_path).unwrap();
     init_carrier(temporary.path(), &carrier, &key);
-    let url = format!("e2ee::{}", carrier.display());
+    let url = format!("e2ee::trusted-local:{}", carrier.display());
     push_through_helper(&source, &url, &key_path, temporary.path());
 
     let entries = git(
@@ -1846,7 +1846,7 @@ fn carrier_format_mismatch_names_the_found_format() {
     init_carrier(temporary.path(), &carrier, &key);
     let read_error = || {
         let repository = EncryptedRepository::new(
-            GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+            GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
             key.clone(),
             support::state_dir(),
         );
@@ -1893,14 +1893,14 @@ fn carrier_branch_fragment_selects_the_branch_through_the_helper() {
     );
     let location = format!("{}#vault", carrier.display());
     EncryptedRepository::new(
-        GitStorage::open(&location).unwrap(),
+        GitStorage::open_trusted_local(&location).unwrap(),
         key.clone(),
         support::state_dir(),
     )
     .initialize("owner")
     .unwrap();
 
-    let url = format!("e2ee::{location}");
+    let url = format!("e2ee::trusted-local:{location}");
     push_through_helper(&source, &url, &key_path, temporary.path());
     assert_success(
         helper_command(temporary.path(), temporary.path())
@@ -1970,7 +1970,7 @@ fn format_4_carrier_is_reported_and_blocks_a_second_storage_beside_it() {
     let key = KeyFile::generate();
 
     let refused = EncryptedRepository::new(
-        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
         key.clone(),
         support::state_dir(),
     )
@@ -1986,7 +1986,7 @@ fn format_4_carrier_is_reported_and_blocks_a_second_storage_beside_it() {
     assert_eq!(carrier_refs(&carrier), refs_before);
 
     let read = EncryptedRepository::new(
-        GitStorage::open(&format!("{}#git-remote-e2ee", carrier.display())).unwrap(),
+        GitStorage::open_trusted_local(&format!("{}#git-remote-e2ee", carrier.display())).unwrap(),
         key.clone(),
         support::state_dir(),
     )
@@ -2006,7 +2006,7 @@ fn format_4_carrier_is_reported_and_blocks_a_second_storage_beside_it() {
         false,
     );
     EncryptedRepository::new(
-        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
         key,
         support::state_dir(),
     )
@@ -2037,7 +2037,7 @@ fn carrier_init_refuses_an_existing_branch_and_another_branch_works() {
 
     let key = KeyFile::generate();
     let refused = EncryptedRepository::new(
-        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
         key.clone(),
         support::state_dir(),
     )
@@ -2045,7 +2045,7 @@ fn carrier_init_refuses_an_existing_branch_and_another_branch_works() {
     .unwrap_err();
     assert!(
         format!("{refused:#}").contains(&format!(
-            "branch main of {remote} already exists; use an empty repository or choose another branch with e2ee::{remote}#<branch>",
+            "branch main of {remote} already exists; use an empty repository or choose another branch with e2ee::trusted-local:{remote}#<branch>",
             remote = carrier.display()
         )),
         "{refused:#}"
@@ -2054,7 +2054,7 @@ fn carrier_init_refuses_an_existing_branch_and_another_branch_works() {
 
     let location = format!("{}#vault", carrier.display());
     let encrypted = EncryptedRepository::new(
-        GitStorage::open(&location).unwrap(),
+        GitStorage::open_trusted_local(&location).unwrap(),
         key,
         support::state_dir(),
     );
@@ -2116,7 +2116,7 @@ fn rejected_carrier_publish_restores_the_published_head() {
     let published = "5".repeat(64);
     let rejected = "6".repeat(64);
     let next = "7".repeat(64);
-    let storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let storage = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     storage.compare_and_swap_head(None, &published).unwrap();
     let tip = remote_tip(&carrier);
 
@@ -2168,7 +2168,7 @@ fn rejected_carrier_genesis_leaves_an_uninitialized_checkout() {
     let marker = temporary.path().join("reject");
     fs::write(&marker, "").unwrap();
     reject_pushes_while(&carrier, &marker, true);
-    let storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let storage = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     let rejected = "6".repeat(64);
     let next = "7".repeat(64);
     let error = storage.compare_and_swap_head(None, &rejected).unwrap_err();
@@ -2197,11 +2197,11 @@ fn stale_compare_and_swap_conflicts_even_when_the_remote_head_is_garbage() {
         false,
     );
     let published = "5".repeat(64);
-    GitStorage::open(carrier.to_str().unwrap())
+    GitStorage::open_trusted_local(carrier.to_str().unwrap())
         .unwrap()
         .compare_and_swap_head(None, &published)
         .unwrap();
-    let stale = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let stale = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     edit_carrier(&carrier, &temporary.path().join("editor"), |workdir| {
         fs::write(workdir.join("HEAD"), "not a manifest id\n").unwrap();
     });
@@ -2226,7 +2226,7 @@ fn storage_failure_in_a_helper_push_batch_publishes_none_of_its_refs() {
     let key = KeyFile::generate();
     key.write_new(&key_path).unwrap();
     init_carrier(temporary.path(), &carrier, &key);
-    let url = format!("e2ee::{}", carrier.display());
+    let url = format!("e2ee::trusted-local:{}", carrier.display());
     push_through_helper(&source, &url, &key_path, temporary.path());
 
     let marker = temporary.path().join("reject-once");
@@ -2257,7 +2257,7 @@ fn storage_failure_in_a_helper_push_batch_publishes_none_of_its_refs() {
     }
 
     let manifest = EncryptedRepository::new(
-        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
         key,
         support::state_dir(),
     )
@@ -2293,7 +2293,7 @@ fn carrier_recovery_classifies_missing_head_manifest_as_unavailable() {
     let owner = KeyFile::generate();
     init_carrier(temporary.path(), &carrier, &owner);
     let repository = EncryptedRepository::new(
-        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
         owner.clone(),
         support::state_dir(),
     );
@@ -2314,7 +2314,7 @@ fn carrier_recovery_classifies_missing_head_manifest_as_unavailable() {
     fs::write(source.join("note.md"), "second content\n").unwrap();
     git(&source, &["commit", "-q", "-am", "second"], false);
     let repository = EncryptedRepository::new(
-        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
         owner.clone(),
         support::state_dir(),
     );
@@ -2341,7 +2341,7 @@ fn carrier_recovery_classifies_missing_head_manifest_as_unavailable() {
 
     let recover = |publish| {
         EncryptedRepository::new(
-            GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+            GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
             owner.clone(),
             support::state_dir(),
         )
@@ -2385,7 +2385,7 @@ fn carrier_recovery_refuses_to_skip_a_historical_head_with_missing_objects() {
     let owner = KeyFile::generate();
     init_carrier(temporary.path(), &carrier, &owner);
     let repository = EncryptedRepository::new(
-        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
         owner.clone(),
         support::state_dir(),
     );
@@ -2404,7 +2404,7 @@ fn carrier_recovery_refuses_to_skip_a_historical_head_with_missing_objects() {
         .unwrap();
     let (floor_id, floor) = repository.current_manifest().unwrap();
 
-    let uncommitted = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let uncommitted = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     let genesis_id = floor.previous.clone().unwrap();
     let genesis_bytes = uncommitted
         .get_object(ObjectKind::Manifest, &genesis_id)
@@ -2424,7 +2424,7 @@ fn carrier_recovery_refuses_to_skip_a_historical_head_with_missing_objects() {
             fs::write(workdir.join("HEAD"), format!("{newer_id}\n")).unwrap();
         },
     );
-    let junk_storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let junk_storage = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     let junk = b"invalid successor";
     let junk_id = object_id(junk);
     junk_storage
@@ -2435,7 +2435,7 @@ fn carrier_recovery_refuses_to_skip_a_historical_head_with_missing_objects() {
         .unwrap();
 
     let report = EncryptedRepository::new(
-        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
         owner.clone(),
         support::state_dir(),
     )
@@ -2473,7 +2473,7 @@ fn carrier_history_reads_skip_corrupt_copies_for_an_older_valid_one() {
     let owner = KeyFile::generate();
     init_carrier(temporary.path(), &carrier, &owner);
     let repository = EncryptedRepository::new(
-        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
         owner.clone(),
         support::state_dir(),
     );
@@ -2489,7 +2489,7 @@ fn carrier_history_reads_skip_corrupt_copies_for_an_older_valid_one() {
         .unwrap();
     let (head_id, head) = repository.current_manifest().unwrap();
     let pack_id = head.new_packs[0].id.clone();
-    let original = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let original = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     let manifest_bytes = original.get_object(ObjectKind::Manifest, &head_id).unwrap();
     let pack_bytes = original.get_object(ObjectKind::Pack, &pack_id).unwrap();
 
@@ -2508,7 +2508,7 @@ fn carrier_history_reads_skip_corrupt_copies_for_an_older_valid_one() {
         },
     );
 
-    let storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let storage = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     assert_ne!(
         storage.get_object(ObjectKind::Pack, &pack_id).unwrap(),
         pack_bytes
@@ -2550,7 +2550,7 @@ fn carrier_historical_restore_charges_rejected_copies_against_its_byte_budget() 
     let owner = KeyFile::generate();
     init_carrier(temporary.path(), &carrier, &owner);
     let repository = EncryptedRepository::new(
-        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
         owner.clone(),
         support::state_dir(),
     );
@@ -2566,7 +2566,7 @@ fn carrier_historical_restore_charges_rejected_copies_against_its_byte_budget() 
         .unwrap();
     let (_, head) = repository.current_manifest().unwrap();
     let pack_id = head.new_packs[0].id.clone();
-    let pack_bytes = GitStorage::open(carrier.to_str().unwrap())
+    let pack_bytes = GitStorage::open_trusted_local(carrier.to_str().unwrap())
         .unwrap()
         .get_object(ObjectKind::Pack, &pack_id)
         .unwrap();
@@ -2585,7 +2585,7 @@ fn carrier_historical_restore_charges_rejected_copies_against_its_byte_budget() 
     );
 
     let needed = (corrupt.len() + pack_bytes.len()) as u64;
-    let storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let storage = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     let error = storage
         .restore_historical_object(ObjectKind::Pack, &pack_id, needed - 1)
         .unwrap_err();
@@ -2622,7 +2622,7 @@ fn recover_junk_head_after_later_writer_push(recover_as_owner: bool) {
     init_carrier(temporary.path(), &carrier, &owner);
     let open = |key: &KeyFile| {
         EncryptedRepository::new(
-            GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+            GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
             key.clone(),
             support::state_dir(),
         )
@@ -2697,4 +2697,20 @@ fn carrier_recovery_works_for_the_owner() {
 #[test]
 fn carrier_recovery_works_for_a_writer_added_after_genesis() {
     recover_junk_head_after_later_writer_push(false);
+}
+#[test]
+fn library_carrier_open_requires_explicit_trust_for_local_paths() {
+    let temporary = tempfile::tempdir().unwrap();
+    let _cache = isolated_cache(&temporary);
+    let carrier = temporary.path().join("carrier.git");
+    git(
+        temporary.path(),
+        &["init", "--bare", "-q", carrier.to_str().unwrap()],
+        false,
+    );
+    let error = GitStorage::open(carrier.to_str().unwrap())
+        .err()
+        .expect("ordinary local carrier must be rejected");
+    assert!(format!("{error:#}").contains("trusted-local"));
+    GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
 }

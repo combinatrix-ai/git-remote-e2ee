@@ -30,11 +30,17 @@ An `e2ee::` URL is followed by the storage address:
 
 | URL | Storage |
 |---|---|
-| `e2ee::https://host/you/repo.git`, `e2ee::git@host:you/repo.git`, `e2ee::ssh://…`, `e2ee::file://…`, `e2ee::/srv/repo.git` | A Git repository used as carrier. Anything `git push` accepts, except a remote that starts with `-`, which Git would read as an option. |
+| `e2ee::https://host/you/repo.git`, `e2ee::git@host:you/repo.git`, `e2ee::ssh://…` | A network Git repository used as carrier. |
+| `e2ee::trusted-local:/absolute/carrier.git` | A local Git carrier whose receive hooks you trust to run as your user. |
 | `e2ee::dir:/srv/encrypted/example` | A directory (filesystem backend). |
 
-A relative path is resolved against the directory the command runs in, and the
-helper saves the absolute form in the remote's configuration.
+The directory backend resolves relative paths against the directory the
+command runs in. Local Git carrier paths and `file://` carrier URLs require
+the explicit `trusted-local:` form with an absolute path. Use `dir:` for
+local storage that another user can modify.
+Git can rewrite a remote URL before starting this helper; a rewrite to a plain
+Git URL bypasses encryption. Treat your local Git configuration as trusted and
+do not set URL rewrites or push URLs for `e2ee::` remotes.
 
 ## Keys
 

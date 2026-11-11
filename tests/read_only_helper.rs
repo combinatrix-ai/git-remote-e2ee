@@ -246,10 +246,10 @@ fn read_only_devices_use_both_storage_backends_without_publishing() {
         .output()
         .unwrap();
     assert!(initialize_output.status.success());
-    let carrier_url = format!("e2ee::{}", carrier.display());
+    let carrier_url = format!("e2ee::trusted-local:{}", carrier.display());
     exercise_read_only_helper(
         &temporary.path().join("carrier-case"),
-        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
         &carrier,
         &carrier_url,
     );

@@ -11,6 +11,7 @@ use anyhow::{Result, bail};
 pub enum StorageUrl {
     Directory(PathBuf),
     Git(String),
+    TrustedLocalGit(String),
 }
 
 impl StorageUrl {
@@ -27,20 +28,49 @@ impl StorageUrl {
         if address.is_empty() {
             bail!("empty storage URL")
         }
-        let (path, fragment) = match address.rsplit_once('#') {
-            Some((path, branch)) => (path, Some(branch)),
-            None => (address, None),
-        };
-        let local = Path::new(path);
-        if local.is_relative() && local.exists() {
-            let mut absolute = std::path::absolute(local)?.to_string_lossy().into_owned();
-            if let Some(branch) = fragment {
-                absolute.push('#');
-                absolute.push_str(branch);
+        if let Some(location) = address.strip_prefix("trusted-local:") {
+            let remote = location.split('#').next().unwrap_or_default();
+            if !Path::new(remote).is_absolute() {
+                bail!("trusted-local Git carrier requires an absolute path")
             }
-            return Ok(Self::Git(absolute));
+            return Ok(Self::TrustedLocalGit(location.to_owned()));
+        }
+        let remote = address.split('#').next().unwrap_or_default();
+        if is_local_git_carrier(remote) {
+            bail!(
+                "local Git carrier requires e2ee::trusted-local:/absolute/path; use e2ee::dir:/path for untrusted local storage"
+            )
         }
         Ok(Self::Git(address.to_owned()))
+    }
+}
+
+/// Whether Git treats the address as a local path or file transport rather
+/// than a network URL or scp-style address. Transport policy also forbids
+/// rewrites to local paths after parsing.
+pub(crate) fn is_local_git_carrier(address: &str) -> bool {
+    if address.starts_with("file://") {
+        return true;
+    }
+    if address.contains("://") || address.contains("::") {
+        return false;
+    }
+    if Path::new(address).is_absolute() {
+        return true;
+    }
+    #[cfg(windows)]
+    if matches!(
+        Path::new(address).components().next(),
+        Some(std::path::Component::Prefix(_))
+    ) {
+        return true;
+    }
+    match address.find(':') {
+        Some(colon) if colon > 0 => {
+            let slash = address.find(['/', '\\']);
+            slash.is_some_and(|slash| slash < colon)
+        }
+        _ => true,
     }
 }
 
@@ -49,6 +79,7 @@ impl fmt::Display for StorageUrl {
         match self {
             Self::Directory(path) => write!(formatter, "e2ee::dir:{}", path.display()),
             Self::Git(remote) => write!(formatter, "e2ee::{remote}"),
+            Self::TrustedLocalGit(remote) => write!(formatter, "e2ee::trusted-local:{remote}"),
         }
     }
 }
@@ -58,13 +89,11 @@ mod tests {
     use super::StorageUrl;
 
     #[test]
-    fn git_urls_pass_through_and_dir_prefix_selects_a_directory() {
+    fn remote_git_urls_pass_through_and_dir_prefix_selects_a_directory() {
         for remote in [
             "https://github.com/you/notes.git",
             "ssh://git@host/you/notes.git",
             "git@github.com:you/notes.git",
-            "file:///srv/carrier.git",
-            "/srv/carrier.git",
         ] {
             let parsed = StorageUrl::parse(&format!("e2ee::{remote}")).unwrap();
             assert_eq!(parsed, StorageUrl::Git(remote.to_owned()));
@@ -82,7 +111,6 @@ mod tests {
         for url in [
             "e2ee::https://host/x.git#vault",
             "e2ee::git@github.com:you/notes.git#team/vault",
-            "e2ee::/srv/carrier.git#vault",
         ] {
             let parsed = StorageUrl::parse(url).unwrap();
             assert_eq!(
@@ -94,20 +122,33 @@ mod tests {
     }
 
     #[test]
-    fn relative_paths_become_absolute() {
+    fn directory_paths_become_absolute_and_local_git_requires_opt_in() {
         let current = std::env::current_dir().unwrap();
         assert_eq!(
             StorageUrl::parse("e2ee::dir:store").unwrap(),
             StorageUrl::Directory(current.join("store"))
         );
-        assert_eq!(
-            StorageUrl::parse("e2ee::src").unwrap(),
-            StorageUrl::Git(current.join("src").to_string_lossy().into_owned())
+        for local in [
+            "src",
+            "./src",
+            "../src",
+            "/srv/carrier.git",
+            "file:///srv/carrier.git",
+            "./host:path",
+            "foo/bar:baz",
+        ] {
+            assert!(StorageUrl::parse(&format!("e2ee::{local}")).is_err());
+        }
+        assert!(StorageUrl::parse("e2ee::trusted-local:src").is_err());
+        let trusted = format!(
+            "e2ee::trusted-local:{}#vault",
+            current.join("src").display()
         );
         assert_eq!(
-            StorageUrl::parse("e2ee::src#vault").unwrap(),
-            StorageUrl::Git(format!("{}#vault", current.join("src").display()))
+            StorageUrl::parse(&trusted).unwrap(),
+            StorageUrl::TrustedLocalGit(format!("{}#vault", current.join("src").display()))
         );
+        assert_eq!(StorageUrl::parse(&trusted).unwrap().to_string(), trusted);
     }
 
     #[test]

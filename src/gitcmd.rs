@@ -60,6 +60,11 @@ const OWNED_REPOSITORY_CONFIG: &[&str] = &[
     "core.fsmonitor=false",
 ];
 
+#[cfg(windows)]
+const EMPTY_GIT_CONFIG: &str = "NUL";
+#[cfg(not(windows))]
+const EMPTY_GIT_CONFIG: &str = "/dev/null";
+
 /// A Git repository every command names explicitly, with the environment
 /// policy of whoever owns it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -150,17 +155,37 @@ impl GitRepository {
     }
 
     /// A command on this owned repository that talks to the carrier remote.
-    /// Unlike `git()`, it keeps configuration the caller injected with
-    /// `git -c` (proxies, credential helpers, `insteadOf` rewrites), which
-    /// transport needs; the owned-repository overrides are appended after it,
-    /// so they still win for hooks and signing.
-    pub(crate) fn transport(&self) -> Command {
+    /// Network transport keeps injected configuration for credentials and
+    /// proxies. Trusted local transport discards it so URL rewrites cannot
+    /// redirect the opt-in path to a different local hook receiver.
+    pub(crate) fn transport(&self, trusted_local: bool) -> Command {
         debug_assert_eq!(self.owner, Owner::Program);
         let mut command = Command::new("git");
         remove_all(&mut command, REPOSITORY_SELECTION);
         remove_all(&mut command, COMMIT_IDENTITY);
+        if trusted_local {
+            remove_all(&mut command, INJECTED_CONFIG);
+            command.env("GIT_CONFIG_GLOBAL", EMPTY_GIT_CONFIG);
+            command.env("GIT_CONFIG_NOSYSTEM", "1");
+        }
         for setting in OWNED_REPOSITORY_CONFIG {
             command.arg("-c").arg(setting);
+        }
+        command.arg("-c").arg(if trusted_local {
+            "protocol.file.allow=always"
+        } else {
+            "protocol.file.allow=never"
+        });
+        if let Some(protocols) = std::env::var_os("GIT_ALLOW_PROTOCOL") {
+            let allowed = protocols.to_str().unwrap_or_default();
+            let mut filtered: Vec<&str> = allowed
+                .split(':')
+                .filter(|protocol| !protocol.is_empty() && *protocol != "file")
+                .collect();
+            if trusted_local {
+                filtered.push("file");
+            }
+            command.env("GIT_ALLOW_PROTOCOL", filtered.join(":"));
         }
         match &self.location {
             Location::GitDir(path) => command.arg("--git-dir").arg(path),
@@ -202,6 +227,7 @@ pub(crate) fn without_repository() -> Command {
     remove_all(&mut command, REPOSITORY_SELECTION);
     remove_all(&mut command, INJECTED_CONFIG);
     remove_all(&mut command, COMMIT_IDENTITY);
+    command.env("GIT_TEMPLATE_DIR", "");
     for setting in OWNED_REPOSITORY_CONFIG {
         command.arg("-c").arg(setting);
     }

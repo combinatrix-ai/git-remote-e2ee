@@ -7,6 +7,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use git_remote_e2ee::crypto::KeyFile;
+
 struct Sandbox {
     root: tempfile::TempDir,
 }
@@ -218,7 +220,7 @@ fn carrier_publication_ignores_user_hooks_and_signing() {
     )
     .unwrap();
 
-    let url = format!("e2ee::{}", carrier.display());
+    let url = format!("e2ee::trusted-local:{}", carrier.display());
     success(&sandbox.e2ee(&repo, &["init", &url]).output().unwrap());
     sandbox.git(&repo, &["push", "-q", "--no-verify", "origin", "main"]);
 
@@ -242,7 +244,7 @@ fn an_unreachable_carrier_does_not_trigger_a_cache_check() {
     let sandbox = Sandbox::new();
     let carrier = sandbox.path().join("carrier.git");
     sandbox.git(sandbox.path(), &["init", "-q", "--bare", "carrier.git"]);
-    let url = format!("e2ee::{}", carrier.display());
+    let url = format!("e2ee::trusted-local:{}", carrier.display());
     success(
         &sandbox
             .e2ee(sandbox.path(), &["init", &url])
@@ -268,7 +270,7 @@ fn an_unreachable_carrier_does_not_trigger_a_cache_check() {
 }
 
 #[test]
-fn carrier_transport_keeps_config_injected_with_dash_c_but_not_its_hooks() {
+fn carrier_transport_rejects_an_injected_local_rewrite_even_with_file_allowed() {
     use std::os::unix::fs::PermissionsExt;
 
     let sandbox = Sandbox::new();
@@ -276,7 +278,7 @@ fn carrier_transport_keeps_config_injected_with_dash_c_but_not_its_hooks() {
     sandbox.git(sandbox.path(), &["init", "-q", "--bare", "carrier.git"]);
     let key = sandbox.path().join("owner.key.json");
     let key_arg = key.to_string_lossy().into_owned();
-    let real_url = format!("e2ee::{}", carrier.display());
+    let real_url = format!("e2ee::trusted-local:{}", carrier.display());
     success(
         &sandbox
             .e2ee(sandbox.path(), &["init", &real_url, "--key", &key_arg])
@@ -298,9 +300,10 @@ fn carrier_transport_keeps_config_injected_with_dash_c_but_not_its_hooks() {
     sandbox.git(&repo, &["config", "remote.private.e2ee-key", &key_arg]);
     let rewrite = format!("url.{}.insteadOf=example-carrier:notes", carrier.display());
     let hooks_path = format!("core.hooksPath={}", hooks.display());
-    sandbox.git(
-        &repo,
-        &[
+    let attempted = sandbox
+        .command("git", &repo)
+        .env("GIT_ALLOW_PROTOCOL", "e2ee:file:ssh")
+        .args([
             "-c",
             &rewrite,
             "-c",
@@ -310,12 +313,118 @@ fn carrier_transport_keeps_config_injected_with_dash_c_but_not_its_hooks() {
             "--no-verify",
             "private",
             "main",
-        ],
-    );
+        ])
+        .output()
+        .unwrap();
+    assert!(!attempted.status.success());
+    assert!(String::from_utf8_lossy(&attempted.stderr).contains("file"));
     let tip = sandbox.git(&carrier, &["rev-parse", "refs/heads/main"]);
     let history = sandbox.git(&carrier, &["rev-list", "--count", &tip]);
     assert_eq!(
-        history, "2",
-        "genesis and one push through the rewritten URL"
+        history, "1",
+        "a rewritten local receiver must not see the attempted push"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn trusted_local_transport_cannot_be_redirected_to_another_hook_receiver() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sandbox = Sandbox::new();
+    sandbox.git(sandbox.path(), &["init", "-q", "--bare", "trusted.git"]);
+    sandbox.git(sandbox.path(), &["init", "-q", "--bare", "untrusted.git"]);
+    let trusted = sandbox.path().join("trusted.git");
+    let untrusted = sandbox.path().join("untrusted.git");
+    let marker = sandbox.path().join("wrong-receiver-ran");
+    let hook = untrusted.join("hooks/post-receive");
+    fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let template = sandbox.path().join("malicious-template");
+    fs::create_dir(&template).unwrap();
+    fs::write(
+        template.join("config"),
+        format!(
+            "[url \"{}\"]\n\tinsteadOf = {}\n",
+            untrusted.display(),
+            trusted.display()
+        ),
+    )
+    .unwrap();
+
+    let repo = sandbox.repository("notes");
+    let url = format!("e2ee::trusted-local:{}", trusted.display());
+    success(
+        &sandbox
+            .e2ee(&repo, &["init", &url])
+            .env("GIT_TEMPLATE_DIR", &template)
+            .output()
+            .unwrap(),
+    );
+    assert!(!marker.exists(), "a Git template redirected initialization");
+
+    fs::write(
+        sandbox.global_config(),
+        format!(
+            "[url \"e2ee::trusted-local:{}\"]\n\tinsteadOf = e2ee::trusted-local:{}\n",
+            untrusted.display(),
+            trusted.display()
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        sandbox.git(&repo, &["remote", "get-url", "origin"]),
+        format!("e2ee::trusted-local:{}", untrusted.display())
+    );
+    let rewritten = sandbox
+        .command("git", &repo)
+        .args(["push", "-q", "origin", "main"])
+        .output()
+        .unwrap();
+    assert!(!rewritten.status.success());
+    assert!(String::from_utf8_lossy(&rewritten.stderr).contains("rewritten"));
+    assert!(
+        !marker.exists(),
+        "global URL rewrite reached another receiver"
+    );
+
+    fs::write(sandbox.global_config(), "").unwrap();
+    sandbox.git(&repo, &["push", "-q", "origin", "main"]);
+    let owner = KeyFile::read(Path::new(&sandbox.only_key())).unwrap();
+    let new_device = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
+    let public = new_device.public_device().unwrap();
+    let public_path = sandbox.path().join("new-device.public.json");
+    public.write_new(&public_path).unwrap();
+    success(
+        &sandbox
+            .e2ee(
+                &repo,
+                &[
+                    "device-add",
+                    "origin",
+                    public_path.to_str().unwrap(),
+                    "--expected-device-id",
+                    &public.device_id,
+                    "--role",
+                    "read",
+                    "--label",
+                    "reader",
+                ],
+            )
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "remote.origin.pushurl")
+            .env("GIT_CONFIG_VALUE_0", &untrusted)
+            .output()
+            .unwrap(),
+    );
+    assert!(
+        !marker.exists(),
+        "injected pushurl reached another receiver"
+    );
+    assert_eq!(
+        sandbox.git(&trusted, &["rev-list", "--count", "refs/heads/main"]),
+        "3",
+        "the trusted carrier should hold genesis, the Git push, and device-add"
     );
 }

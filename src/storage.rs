@@ -648,6 +648,7 @@ pub struct GitStorage {
     location: String,
     remote: String,
     branch: String,
+    trusted_local: bool,
     /// Set when the selected branch is absent but the remote still has a
     /// format 4 branch, so reads and initialization stop instead of
     /// starting a second storage beside it.
@@ -942,15 +943,34 @@ impl GitStorage {
     /// Opens `remote`, optionally suffixed with `#<branch>` to select the
     /// carrier branch (default `main`).
     pub fn open(location: &str) -> Result<Self> {
+        Self::open_with_trust(location, false)
+    }
+
+    /// Opens a local Git carrier whose receive hooks the caller trusts to
+    /// execute with this process's privileges.
+    pub fn open_trusted_local(location: &str) -> Result<Self> {
+        Self::open_with_trust(location, true)
+    }
+
+    fn open_with_trust(location: &str, trusted_local: bool) -> Result<Self> {
         let (remote, branch) = parse_carrier_location(location)?;
         let remote = remote.as_str();
         let branch = branch.as_str();
+        if trusted_local {
+            if !Path::new(remote).is_absolute() {
+                bail!("trusted local Git carrier requires an absolute path")
+            }
+        } else if crate::url::is_local_git_carrier(remote) {
+            bail!(
+                "local Git carrier requires e2ee::trusted-local:/absolute/path; use e2ee::dir:/path for untrusted local storage"
+            )
+        }
 
         let lock_timer = trace::Span::new("carrier_cache_lock");
         let mut cache = CarrierCache::lock(remote, branch)?;
         drop(lock_timer);
         let fetch_timer = trace::Span::new("carrier_cache_fetch");
-        let mut base_commit = cache.refresh(remote, branch)?;
+        let mut base_commit = cache.refresh(remote, branch, trusted_local)?;
         drop(fetch_timer);
         let mut checkout = tempfile::Builder::new()
             .prefix("git-remote-e2ee-carrier-")
@@ -964,7 +984,7 @@ impl GitStorage {
             }
             drop(checkout);
             cache.rebuild()?;
-            base_commit = cache.refresh(remote, branch)?;
+            base_commit = cache.refresh(remote, branch, trusted_local)?;
             checkout = tempfile::Builder::new()
                 .prefix("git-remote-e2ee-carrier-")
                 .tempdir()?;
@@ -974,7 +994,7 @@ impl GitStorage {
         drop(checkout_timer);
         let format_4_branch = base_commit.is_none()
             && branch != FORMAT_4_BRANCH
-            && remote_has_branch(&cache.path, remote, FORMAT_4_BRANCH)?;
+            && remote_has_branch(&cache.path, remote, FORMAT_4_BRANCH, trusted_local)?;
         drop(cache);
 
         Ok(Self {
@@ -982,6 +1002,7 @@ impl GitStorage {
             location: location.to_owned(),
             remote: remote.to_owned(),
             branch: branch.to_owned(),
+            trusted_local,
             format_4_branch,
             state: Mutex::new(GitStorageState { base_commit }),
         })
@@ -1064,8 +1085,13 @@ impl GitStorage {
     /// content (for example a hosting provider's initial README).
     fn refuse_foreign_branch(&self, base_commit: &Option<String>) -> Result<()> {
         if base_commit.is_some() {
+            let prefix = if self.trusted_local {
+                "e2ee::trusted-local:"
+            } else {
+                "e2ee::"
+            };
             return Err(StorageOccupied(format!(
-                "branch {branch} of {remote} already exists; use an empty repository or choose another branch with e2ee::{remote}#<branch>",
+                "branch {branch} of {remote} already exists; use an empty repository or choose another branch with {prefix}{remote}#<branch>",
                 branch = self.branch,
                 remote = self.remote,
             ))
@@ -1246,8 +1272,8 @@ impl GitStorage {
         drop(commit_timer);
         let push_timer = trace::Span::new("carrier_git_push");
         let push = GitRepository::owned_work_tree(self.root())
-            .transport()
-            .args(["push", "--quiet", "--no-verify", "origin"])
+            .transport(self.trusted_local)
+            .args(["push", "--quiet", "--no-verify", self.remote.as_str()])
             .arg(format!("HEAD:refs/heads/{}", self.branch))
             .output()?;
         drop(push_timer);
@@ -1258,7 +1284,7 @@ impl GitStorage {
             );
             // Only an observed move of the remote tip is a lost race; a push
             // refused for any other reason leaves the tip at `base_commit`.
-            let Ok(latest) = cache.refresh(&self.remote, &self.branch) else {
+            let Ok(latest) = cache.refresh(&self.remote, &self.branch, self.trusted_local) else {
                 return Err(push_error);
             };
             if latest.as_deref() != Some(new_commit.as_str()) {
@@ -1383,7 +1409,7 @@ impl Storage for GitStorage {
             .lock()
             .map_err(|_| anyhow::anyhow!("carrier state lock poisoned"))?;
         let mut cache = CarrierCache::lock(&self.remote, &self.branch)?;
-        let remote_tip = cache.refresh(&self.remote, &self.branch)?;
+        let remote_tip = cache.refresh(&self.remote, &self.branch, self.trusted_local)?;
         if remote_tip == state.base_commit {
             return Ok(false);
         }
@@ -1400,7 +1426,7 @@ impl Storage for GitStorage {
             .map_err(|_| anyhow::anyhow!("carrier state lock poisoned"))?;
         let mut cache = CarrierCache::lock(&self.remote, &self.branch)?;
         let refresh_timer = trace::Span::new("carrier_cas_refresh");
-        let remote_tip = cache.refresh(&self.remote, &self.branch)?;
+        let remote_tip = cache.refresh(&self.remote, &self.branch, self.trusted_local)?;
         drop(refresh_timer);
         if remote_tip != state.base_commit {
             return Err(CasConflict {
@@ -1459,7 +1485,7 @@ impl Storage for GitStorage {
             bail!("recovery storage token does not match the opened carrier tip")
         }
         let mut cache = CarrierCache::lock(&self.remote, &self.branch)?;
-        let remote_tip = cache.refresh(&self.remote, &self.branch)?;
+        let remote_tip = cache.refresh(&self.remote, &self.branch, self.trusted_local)?;
         if remote_tip != expected_tip {
             return Err(CasConflict {
                 expected: observed.head_id.clone(),
@@ -1809,19 +1835,24 @@ impl CarrierCache {
         })
     }
 
-    fn refresh(&mut self, remote: &str, branch: &str) -> Result<Option<String>> {
+    fn refresh(
+        &mut self,
+        remote: &str,
+        branch: &str,
+        trusted_local: bool,
+    ) -> Result<Option<String>> {
         let initialize_timer = trace::Span::new("carrier_cache_initialize");
         self.ensure_initialized()?;
         drop(initialize_timer);
         let fetch_timer = trace::Span::new("carrier_cache_fetch_remote");
-        match fetch_carrier_branch(&self.path, remote, branch) {
+        match fetch_carrier_branch(&self.path, remote, branch, trusted_local) {
             Ok(tip) => {
                 drop(fetch_timer);
                 Ok(tip)
             }
             Err(FetchError::Local(fetch_error)) if self.is_corrupt()? => {
                 self.rebuild()?;
-                let result = fetch_carrier_branch(&self.path, remote, branch)
+                let result = fetch_carrier_branch(&self.path, remote, branch, trusted_local)
                     .map_err(FetchError::into_inner)
                     .with_context(|| {
                     format!(
@@ -2073,26 +2104,35 @@ fn fetch_carrier_branch(
     cache: &Path,
     remote: &str,
     branch: &str,
+    trusted_local: bool,
 ) -> std::result::Result<Option<String>, FetchError> {
     let remote_ref = format!("refs/heads/{branch}");
     let refspec = format!("+{remote_ref}:{CARRIER_CACHE_FETCH_REF}");
-    let fetch = cache_transport_output(cache, &["fetch", "--quiet", "--no-tags", remote, &refspec])
-        .map_err(FetchError::Local)?;
+    let fetch = cache_transport_output(
+        cache,
+        &["fetch", "--quiet", "--no-tags", remote, &refspec],
+        trusted_local,
+    )
+    .map_err(FetchError::Local)?;
     if fetch.status.success() {
         return git_rev_parse(cache, CARRIER_CACHE_FETCH_REF).map_err(FetchError::Local);
     }
 
-    let ls_remote = cache_transport_output(cache, &["ls-remote", "--heads", remote, &remote_ref])
-        .and_then(|output| {
-            ensure_git_success(&output, "git ls-remote carrier branch")?;
-            Ok(output)
-        })
-        .map_err(|error| {
-            FetchError::Remote(error.context(format!(
-                "git fetch carrier branch failed: {}",
-                String::from_utf8_lossy(&fetch.stderr).trim()
-            )))
-        })?;
+    let ls_remote = cache_transport_output(
+        cache,
+        &["ls-remote", "--heads", remote, &remote_ref],
+        trusted_local,
+    )
+    .and_then(|output| {
+        ensure_git_success(&output, "git ls-remote carrier branch")?;
+        Ok(output)
+    })
+    .map_err(|error| {
+        FetchError::Remote(error.context(format!(
+            "git fetch carrier branch failed: {}",
+            String::from_utf8_lossy(&fetch.stderr).trim()
+        )))
+    })?;
     if String::from_utf8_lossy(&ls_remote.stdout).trim().is_empty() {
         cache_git_output(cache, &["update-ref", "-d", CARRIER_CACHE_FETCH_REF])
             .and_then(|output| {
@@ -2107,7 +2147,12 @@ fn fetch_carrier_branch(
     )))
 }
 
-fn remote_has_branch(cache: &Path, remote: &str, branch: &str) -> Result<bool> {
+fn remote_has_branch(
+    cache: &Path,
+    remote: &str,
+    branch: &str,
+    trusted_local: bool,
+) -> Result<bool> {
     let output = cache_transport_output(
         cache,
         &[
@@ -2116,6 +2161,7 @@ fn remote_has_branch(cache: &Path, remote: &str, branch: &str) -> Result<bool> {
             remote,
             &format!("refs/heads/{branch}"),
         ],
+        trusted_local,
     )?;
     ensure_git_success(&output, "git ls-remote carrier branches")?;
     Ok(!output.stdout.is_empty())
@@ -2195,9 +2241,13 @@ fn cache_git_output(cache: &Path, args: &[&str]) -> Result<std::process::Output>
         .output()?)
 }
 
-fn cache_transport_output(cache: &Path, args: &[&str]) -> Result<std::process::Output> {
+fn cache_transport_output(
+    cache: &Path,
+    args: &[&str],
+    trusted_local: bool,
+) -> Result<std::process::Output> {
     Ok(GitRepository::owned_git_dir(cache)
-        .transport()
+        .transport(trusted_local)
         .args(args)
         .output()?)
 }
@@ -2734,6 +2784,7 @@ mod tests {
             location: "unused".to_owned(),
             remote: "unused".to_owned(),
             branch: "main".to_owned(),
+            trusted_local: false,
             format_4_branch: false,
             state: Mutex::new(GitStorageState { base_commit: None }),
         };

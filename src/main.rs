@@ -185,6 +185,14 @@ macro_rules! with_repository {
                     EncryptedRepository::new(GitStorage::open(remote)?, key, state_dir);
                 $body
             }
+            StorageUrl::TrustedLocalGit(remote) => {
+                let $repository = EncryptedRepository::new(
+                    GitStorage::open_trusted_local(remote)?,
+                    key,
+                    state_dir,
+                );
+                $body
+            }
         }
     }};
 }
