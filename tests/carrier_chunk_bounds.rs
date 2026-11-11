@@ -108,7 +108,7 @@ fn oversized_carrier_chunks_are_rejected_without_being_read() {
     let storage = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     let before = peak_resident_bytes();
     let history = storage
-        .recovery_history(2048, 64 * 1024 * 1024)
+        .recovery_history(2048, 64 * 1024 * 1024, 256)
         .unwrap()
         .unwrap();
     let grown = peak_resident_bytes().saturating_sub(before);

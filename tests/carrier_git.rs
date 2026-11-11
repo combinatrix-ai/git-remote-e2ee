@@ -13,6 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use git_remote_e2ee::crypto::{KeyFile, object_id, random_key};
+use git_remote_e2ee::error::BudgetExhausted;
 use git_remote_e2ee::manifest::{
     Manifest, ManifestAuthorization, open_manifest, peek_manifest_header, seal_manifest,
     unwrap_generation_key, wrap_predecessor_key,
@@ -141,6 +142,76 @@ fn compact_carrier_tree_is_rejected_before_expanding_the_index() {
             "{error:#}"
         );
     }
+}
+
+#[test]
+fn carrier_recovery_counts_missing_head_ids_before_searching_history() {
+    let temporary = tempfile::tempdir().unwrap();
+    let _cache = isolated_cache(&temporary);
+    let carrier = temporary.path().join("carrier.git");
+    let attacker = temporary.path().join("attacker");
+    init_carrier(temporary.path(), &carrier, &KeyFile::generate());
+    git(
+        temporary.path(),
+        &[
+            "clone",
+            "-q",
+            "-b",
+            "main",
+            carrier.to_str().unwrap(),
+            attacker.to_str().unwrap(),
+        ],
+        false,
+    );
+    git(&attacker, &["config", "user.name", "Carrier editor"], false);
+    git(
+        &attacker,
+        &["config", "user.email", "carrier-editor@example.invalid"],
+        false,
+    );
+    let missing = "f".repeat(64);
+    for revision in 0..3 {
+        fs::write(attacker.join("HEAD"), format!("{missing}\n")).unwrap();
+        fs::write(attacker.join("README.md"), format!("revision {revision}\n")).unwrap();
+        git(&attacker, &["add", "HEAD", "README.md"], false);
+        git(
+            &attacker,
+            &["commit", "-q", "-m", "replay missing head"],
+            false,
+        );
+    }
+    git(&attacker, &["push", "-q", "origin", "main"], false);
+
+    let history = GitStorage::open_trusted_local(carrier.to_str().unwrap())
+        .unwrap()
+        .recovery_history(2048, 64 * 1024 * 1024, 2)
+        .unwrap()
+        .unwrap();
+    assert_eq!(history.commits.len(), 4);
+    assert_eq!(
+        history
+            .commits
+            .iter()
+            .filter(|commit| commit.head_id.as_deref() == Some(missing.as_str()))
+            .count(),
+        3
+    );
+    assert!(!history.manifests.contains_key(&missing));
+
+    fs::write(attacker.join("HEAD"), format!("{}\n", "e".repeat(64))).unwrap();
+    git(&attacker, &["add", "HEAD"], false);
+    git(
+        &attacker,
+        &["commit", "-q", "-m", "new missing head"],
+        false,
+    );
+    git(&attacker, &["push", "-q", "origin", "main"], false);
+    let error = GitStorage::open_trusted_local(carrier.to_str().unwrap())
+        .unwrap()
+        .recovery_history(2048, 64 * 1024 * 1024, 2)
+        .unwrap_err();
+    assert!(error.is::<BudgetExhausted>(), "{error:#}");
+    assert!(error.to_string().contains("candidate budget"), "{error:#}");
 }
 
 fn init_source(path: &Path, marker: &str) -> String {
@@ -2575,7 +2646,7 @@ fn carrier_history_reads_skip_corrupt_copies_for_an_older_valid_one() {
         pack_bytes
     );
     let history = storage
-        .recovery_history(2048, 64 * 1024 * 1024)
+        .recovery_history(2048, 64 * 1024 * 1024, 256)
         .unwrap()
         .unwrap();
     assert_eq!(

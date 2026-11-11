@@ -999,9 +999,11 @@ impl<S: Storage> EncryptedRepository<S> {
 
         let floor_id = pinned.head_id.as_str();
         let floor_generation = pinned.generation;
-        let history = self
-            .storage
-            .recovery_history(MAX_RECOVERY_OUTER_COMMITS, MAX_RECOVERY_MANIFEST_BYTES)?;
+        let history = self.storage.recovery_history(
+            MAX_RECOVERY_OUTER_COMMITS,
+            MAX_RECOVERY_MANIFEST_BYTES,
+            MAX_RECOVERY_CANDIDATES,
+        )?;
         let carrier_history = history.is_some();
         let history = history.unwrap_or_default();
         if history.commits.len() > MAX_RECOVERY_OUTER_COMMITS {

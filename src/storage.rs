@@ -148,6 +148,7 @@ pub trait Storage {
         &self,
         _max_commits: usize,
         _max_manifest_bytes: u64,
+        _max_candidates: usize,
     ) -> Result<Option<RecoveryHistory>> {
         Ok(None)
     }
@@ -1525,6 +1526,7 @@ impl Storage for GitStorage {
         &self,
         max_commits: usize,
         max_manifest_bytes: u64,
+        max_candidates: usize,
     ) -> Result<Option<RecoveryHistory>> {
         let commits = self.commit_history(max_commits)?;
         if commits.len() > max_commits {
@@ -1533,6 +1535,7 @@ impl Storage for GitStorage {
             ))
         }
         let mut history = RecoveryHistory::default();
+        let mut attempted = HashSet::new();
         // Every byte read counts, including corrupt copies that are skipped.
         let mut total_bytes = 0_u64;
         for commit_id in &commits {
@@ -1540,8 +1543,13 @@ impl Storage for GitStorage {
                 .stored_head_at_commit(commit_id)?
                 .and_then(|head| head.head_id());
             if let Some(id) = &head_id
-                && !history.manifests.contains_key(id)
+                && attempted.insert(id.clone())
             {
+                if attempted.len() > max_candidates {
+                    bail!(BudgetExhausted(
+                        "recovery candidate budget exhausted".to_owned()
+                    ))
+                }
                 for copy in self.copy_commits(&commits, ObjectKind::Manifest, id)? {
                     let mut bytes = Vec::new();
                     let valid =

@@ -90,6 +90,7 @@ impl Storage for OverBudgetHistoryStorage {
         &self,
         max_commits: usize,
         _max_manifest_bytes: u64,
+        _max_candidates: usize,
     ) -> Result<Option<RecoveryHistory>> {
         Ok(Some(RecoveryHistory {
             commits: (0..=max_commits)
@@ -132,6 +133,7 @@ impl Storage for FixedHistoryStorage {
         &self,
         _max_commits: usize,
         _max_manifest_bytes: u64,
+        _max_candidates: usize,
     ) -> Result<Option<RecoveryHistory>> {
         Ok(Some(RecoveryHistory {
             commits: self
