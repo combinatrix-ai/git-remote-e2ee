@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use crate::continuity::{ContinuityFloor, FileLock, FloorGuard, read_json, write_json};
 use crate::crypto::{
     KeyFile, PublicDevice, SecretKey, SubkeyKind, derive_subkey, object_id, open_pack_stream,
-    random_key, seal_pack_stream,
+    pack_stream_ciphertext_size, random_key, seal_pack_stream, snapshot_verified_pack_ciphertext,
 };
 use crate::error::{
     BudgetExhausted, ForeignRepository, InvalidState, MissingStorageHead, NotActiveReader,
@@ -766,11 +766,9 @@ impl<S: Storage> EncryptedRepository<S> {
                 continue;
             }
             for descriptor in &entry.manifest.new_packs {
-                let mut importer = git::start_pack_import(repo)?;
                 let decrypt_timer = trace::Span::new("pack_decrypt_to_index_pack");
-                self.open_chain_pack(entry, descriptor, &mut importer)?;
+                self.import_chain_pack(repo, entry, descriptor)?;
                 drop(decrypt_timer);
-                importer.finish()?;
             }
         }
         Ok(())
@@ -786,6 +784,53 @@ impl<S: Storage> EncryptedRepository<S> {
         plaintext: impl io::Write,
     ) -> Result<()> {
         let encrypted = self.storage.open_object(ObjectKind::Pack, &descriptor.id)?;
+        let (pack_key, aad) = Self::chain_pack_material(entry, descriptor)?;
+        open_pack_stream(
+            &pack_key,
+            encrypted,
+            plaintext,
+            &aad,
+            descriptor.plaintext_size,
+            &descriptor.id,
+        )?;
+        Ok(())
+    }
+
+    fn import_chain_pack(
+        &self,
+        repo: &GitRepository,
+        entry: &OpenedState,
+        descriptor: &PackDescriptor,
+    ) -> Result<()> {
+        let expected_size = pack_stream_ciphertext_size(descriptor.plaintext_size)?;
+        if expected_size > ObjectKind::Pack.max_bytes() {
+            bail!("pack ciphertext exceeds the maximum object size")
+        }
+        let encrypted = self.storage.open_object(ObjectKind::Pack, &descriptor.id)?;
+        let (pack_key, aad) = Self::chain_pack_material(entry, descriptor)?;
+        let snapshot = snapshot_verified_pack_ciphertext(
+            &pack_key,
+            encrypted,
+            &aad,
+            descriptor.plaintext_size,
+            &descriptor.id,
+        )?;
+        let mut importer = git::start_pack_import(repo)?;
+        open_pack_stream(
+            &pack_key,
+            snapshot,
+            &mut importer,
+            &aad,
+            descriptor.plaintext_size,
+            &descriptor.id,
+        )?;
+        importer.finish()
+    }
+
+    fn chain_pack_material(
+        entry: &OpenedState,
+        descriptor: &PackDescriptor,
+    ) -> Result<(SecretKey, Vec<u8>)> {
         let pack_key = derive_subkey(
             &entry.generation_key,
             &entry.manifest.repository_root,
@@ -793,19 +838,14 @@ impl<S: Storage> EncryptedRepository<S> {
             SubkeyKind::Pack,
             descriptor.ordinal,
         )?;
-        open_pack_stream(
-            &pack_key,
-            encrypted,
-            plaintext,
-            &pack_aad(
+        Ok((
+            pack_key,
+            pack_aad(
                 &entry.manifest.repository_root,
                 descriptor.generation,
                 descriptor.ordinal,
             ),
-            descriptor.plaintext_size,
-            &descriptor.id,
-        )?;
-        Ok(())
+        ))
     }
 
     /// Checks the whole manifest chain against the machine floor and
@@ -1377,9 +1417,7 @@ impl<S: Storage> EncryptedRepository<S> {
         scratch.ensure_no_promisor()?;
         for entry in chain.iter().rev() {
             for descriptor in &entry.manifest.new_packs {
-                let mut importer = git::start_pack_import(&scratch)?;
-                self.open_chain_pack(entry, descriptor, &mut importer)?;
-                importer.finish()?;
+                self.import_chain_pack(&scratch, entry, descriptor)?;
             }
         }
         let refs = &chain

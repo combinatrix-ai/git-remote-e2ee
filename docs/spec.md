@@ -351,9 +351,11 @@ exactly once, consume the exact computed ciphertext length, reject trailing
 bytes, and verify SHA-256 of the complete stored stream against the descriptor
 ID. A malformed header, size mismatch, counter overflow, short read, reordered
 or duplicated segment, authentication failure, trailing byte, or hash mismatch
-is fatal. Plaintext may stream into `git index-pack` before the final object hash
-is known, but no checkout import progress or remote ref may move until all
-cryptographic, content-address, process, and Git-connectivity checks succeed.
+is fatal. Before starting `git index-pack`, a reader MUST verify the complete
+stored ciphertext against the signed descriptor ID in a stable, size-bounded
+snapshot. The verified ciphertext may then be decrypted into Git. No checkout
+import progress or remote ref may move until all cryptographic,
+content-address, process, and Git-connectivity checks succeed.
 Listing an authenticated, continuous manifest chain advances the machine
 continuity floor even if a later pack or Git-connectivity check fails. A
 publisher advances its own floor after its compare-and-swap succeeds.
