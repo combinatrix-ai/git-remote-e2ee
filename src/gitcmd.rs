@@ -215,11 +215,54 @@ impl GitRepository {
             }
             Owner::Program => without_repository(),
         };
+        command.env("GIT_NO_LAZY_FETCH", "1");
         match &self.location {
             Location::GitDir(path) => command.arg("--git-dir").arg(path),
             Location::WorkTree(path) => command.arg("-C").arg(path),
         };
         command
+    }
+
+    /// Partial-clone promisors can receive object IDs during ordinary local
+    /// lookups. This product needs complete local Git objects for inner refs.
+    pub fn ensure_no_promisor(&self) -> Result<()> {
+        let output = self
+            .git()
+            .env_remove("GIT_CONFIG")
+            .args([
+                "config",
+                "--null",
+                "--get-regexp",
+                r"^(extensions\.partialclone|remote\..*\.(promisor|partialclonefilter))$",
+            ])
+            .output()?;
+        if output.status.code() == Some(1) && output.stdout.is_empty() {
+            return Ok(());
+        }
+        if !output.status.success() {
+            bail!("could not check Git partial-clone configuration")
+        }
+        for entry in output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+        {
+            let Some(separator) = entry.iter().position(|byte| *byte == b'\n') else {
+                bail!("invalid Git partial-clone configuration output")
+            };
+            let key = std::str::from_utf8(&entry[..separator])?;
+            let value = std::str::from_utf8(&entry[separator + 1..])?;
+            if key == "extensions.partialclone"
+                || key.ends_with(".partialclonefilter")
+                || !matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "" | "false" | "no" | "off" | "0"
+                )
+            {
+                bail!("partial-clone promisor repositories are unsupported")
+            }
+        }
+        Ok(())
     }
 }
 

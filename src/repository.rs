@@ -531,6 +531,7 @@ impl<S: Storage> EncryptedRepository<S> {
         pushes: &[RefPush<'_>],
         mode: PushMode,
     ) -> Result<PushOutcome> {
+        repo.ensure_no_promisor()?;
         let floor = self.lock_floor()?;
         let current = self
             .pinned_chain(&floor)?
@@ -698,6 +699,7 @@ impl<S: Storage> EncryptedRepository<S> {
     }
 
     pub fn observe_manifest(&self, repo: &GitRepository) -> Result<Manifest> {
+        repo.ensure_no_promisor()?;
         let floor = self.lock_floor()?;
         let checkout = self.open_checkout(repo)?;
         let chain = self.pinned_chain(&floor)?;
@@ -721,6 +723,7 @@ impl<S: Storage> EncryptedRepository<S> {
     }
 
     pub fn import_packs(&self, repo: &GitRepository) -> Result<Manifest> {
+        repo.ensure_no_promisor()?;
         let floor = self.lock_floor()?;
         let checkout = self.open_checkout(repo)?;
         let chain = self.pinned_chain(&floor)?;
@@ -1369,6 +1372,7 @@ impl<S: Storage> EncryptedRepository<S> {
             )
         }
         let scratch = GitRepository::owned_git_dir(temporary.path());
+        scratch.ensure_no_promisor()?;
         for entry in chain.iter().rev() {
             for descriptor in &entry.manifest.new_packs {
                 let mut importer = git::start_pack_import(&scratch)?;

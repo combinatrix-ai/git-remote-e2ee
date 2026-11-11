@@ -123,6 +123,106 @@ fn object_files(git_dir: &Path) -> Vec<PathBuf> {
 }
 
 #[test]
+fn helper_ref_listing_rejects_effective_promisor_configuration() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repository("notes");
+    let storage = sandbox.path().join("storage");
+    let url = format!("e2ee::dir:{}", storage.display());
+    success(&sandbox.e2ee(&repo, &["init", &url]).output().unwrap());
+    sandbox.git(&repo, &["push", "-q", "origin", "main"]);
+    assert!(
+        sandbox
+            .git(&repo, &["ls-remote", "origin"])
+            .contains("refs/heads/main")
+    );
+
+    sandbox.git(&repo, &["config", "remote.spy.promisor", "true"]);
+    let denied = sandbox
+        .command("git", &repo)
+        .args(["ls-remote", "origin"])
+        .output()
+        .unwrap();
+    assert!(!denied.status.success());
+    assert!(denied.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&denied.stderr).contains("partial-clone promisor"),
+        "{}",
+        String::from_utf8_lossy(&denied.stderr)
+    );
+    let shadow = sandbox.path().join("empty-gitconfig");
+    fs::write(
+        &shadow,
+        format!("[remote \"origin\"]\n\te2ee-key = {}\n", sandbox.only_key()),
+    )
+    .unwrap();
+    let denied = sandbox
+        .command("git", &repo)
+        .env("GIT_CONFIG", &shadow)
+        .args(["ls-remote", "origin"])
+        .output()
+        .unwrap();
+    assert!(!denied.status.success());
+    assert!(denied.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&denied.stderr).contains("partial-clone promisor"),
+        "{}",
+        String::from_utf8_lossy(&denied.stderr)
+    );
+
+    sandbox.git(&repo, &["config", "remote.spy.promisor", "false"]);
+    assert!(
+        sandbox
+            .git(&repo, &["ls-remote", "origin"])
+            .contains("refs/heads/main")
+    );
+
+    sandbox.git(&repo, &["config", "--unset-all", "remote.spy.promisor"]);
+    fs::write(
+        sandbox.global_config(),
+        "[remote \"spy\"]\n\tpromisor = true\n",
+    )
+    .unwrap();
+    let denied = sandbox
+        .command("git", &repo)
+        .args(["ls-remote", "origin"])
+        .output()
+        .unwrap();
+    assert!(!denied.status.success());
+    assert!(denied.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&denied.stderr).contains("partial-clone promisor"),
+        "{}",
+        String::from_utf8_lossy(&denied.stderr)
+    );
+
+    sandbox.git(&repo, &["config", "remote.spy.promisor", "false"]);
+    let denied = sandbox
+        .command("git", &repo)
+        .args(["ls-remote", "origin"])
+        .output()
+        .unwrap();
+    assert!(
+        !denied.status.success(),
+        "a global promisor survives a local false"
+    );
+    assert!(denied.stdout.is_empty());
+
+    sandbox.git(&repo, &["config", "--unset-all", "remote.spy.promisor"]);
+    fs::write(sandbox.global_config(), "").unwrap();
+    sandbox.git(
+        &repo,
+        &["config", "remote.spy.partialCloneFilter", "blob:none"],
+    );
+    let denied = sandbox
+        .command("git", &repo)
+        .args(["ls-remote", "origin"])
+        .output()
+        .unwrap();
+    assert!(!denied.status.success());
+    assert!(denied.stdout.is_empty());
+}
+
+#[test]
 fn recovery_scratch_repository_ignores_an_inherited_git_dir() {
     let sandbox = Sandbox::new();
     let (repo, storage) = sandbox.repository_with_invalid_storage_head();

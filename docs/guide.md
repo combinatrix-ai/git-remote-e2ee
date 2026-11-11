@@ -330,7 +330,8 @@ your local remote-tracking refs.
 - Shallow and partial clones are not supported. Pushing from a shallow
   repository is refused before anything is published; run
   `git fetch --unshallow` first. A fresh clone downloads and verifies the
-  complete history.
+  complete history. A configured partial-clone promisor is rejected before
+  encrypted ref IDs are passed to local Git object lookups.
 
 ## Storage contract
 
