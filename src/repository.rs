@@ -692,7 +692,9 @@ impl<S: Storage> EncryptedRepository<S> {
                     let short = reference.strip_prefix("refs/heads/").unwrap();
                     git::update_ref(repo, &format!("refs/remotes/{remote_name}/{short}"), object)?;
                 }
-                git::InnerRefKind::Tag => git::update_ref(repo, reference, object)?,
+                git::InnerRefKind::Tag => {
+                    git::create_tag_if_absent_or_matching(repo, reference, object)?;
+                }
             }
         }
         Ok(manifest)

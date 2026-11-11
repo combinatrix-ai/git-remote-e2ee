@@ -575,6 +575,59 @@ pub fn update_ref(repo: &GitRepository, reference: &str, object: &str) -> Result
     Ok(())
 }
 
+pub fn create_tag_if_absent_or_matching(
+    repo: &GitRepository,
+    reference: &str,
+    object: &str,
+) -> Result<()> {
+    let existing = repo
+        .git()
+        .args([
+            "for-each-ref",
+            "--count=1",
+            "--format=%(refname) %(objectname) %(symref)",
+            reference,
+        ])
+        .output()?;
+    if !existing.status.success() {
+        bail!(
+            "could not inspect local tag {reference}: {}",
+            String::from_utf8_lossy(&existing.stderr).trim()
+        )
+    }
+    for line in String::from_utf8(existing.stdout)?.lines() {
+        if let Some(value) = line
+            .strip_prefix(reference)
+            .and_then(|rest| rest.strip_prefix(' '))
+        {
+            let (current, symbolic_target) = value
+                .split_once(' ')
+                .context("Git returned a malformed local tag")?;
+            if !symbolic_target.is_empty() {
+                bail!("local tag {reference} is symbolic")
+            }
+            if current == object {
+                return Ok(());
+            }
+            bail!("local tag {reference} already points at a different object")
+        }
+    }
+
+    // The empty expected old ID makes creation atomic. --no-deref prevents a
+    // symbolic tag from forwarding this write to another local reference.
+    let created = repo
+        .git()
+        .args(["update-ref", "--no-deref", reference, object, ""])
+        .output()?;
+    if !created.status.success() {
+        bail!(
+            "could not create local tag {reference}: {}",
+            String::from_utf8_lossy(&created.stderr).trim()
+        )
+    }
+    Ok(())
+}
+
 fn git_text(repo: &GitRepository, args: &[&str]) -> Result<String> {
     let output = repo.git().args(args).output()?;
     if !output.status.success() {

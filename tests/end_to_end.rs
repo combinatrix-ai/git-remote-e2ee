@@ -562,6 +562,100 @@ fn pushes_incrementally_and_fetches_into_another_repository() {
 }
 
 #[test]
+fn library_fetch_preserves_existing_local_tags_and_symbolic_targets() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let destination = temporary.path().join("destination");
+    initialize_git(&source);
+    initialize_git(&destination);
+    let remote_commit = commit(&source, "remote\n", "remote");
+    git(&source, &["tag", "v1"]);
+    let local_commit = commit(&destination, "local\n", "local");
+    git(&destination, &["tag", "v1"]);
+
+    let encrypted = EncryptedRepository::new(
+        FilesystemStorage::new(temporary.path().join("remote")),
+        KeyFile::generate(),
+        support::state_dir(),
+    );
+    encrypted.initialize("owner").unwrap();
+    encrypted
+        .push_ref(
+            &GitRepository::open(&source).unwrap(),
+            "refs/tags/v1",
+            RefChange::Update {
+                source: "refs/tags/v1",
+                force: false,
+            },
+        )
+        .unwrap();
+    let destination_repo = GitRepository::open(&destination).unwrap();
+    let error = encrypted
+        .fetch_into(&destination_repo, "encrypted")
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("local tag refs/tags/v1"),
+        "{error:#}"
+    );
+    assert_eq!(
+        git(&destination, &["rev-parse", "refs/tags/v1"]),
+        local_commit
+    );
+
+    git(&destination, &["tag", "-d", "v1"]);
+    encrypted
+        .fetch_into(&destination_repo, "encrypted")
+        .unwrap();
+    assert_eq!(
+        git(&destination, &["rev-parse", "refs/tags/v1"]),
+        remote_commit
+    );
+    encrypted
+        .fetch_into(&destination_repo, "encrypted")
+        .unwrap();
+
+    git(&destination, &["tag", "-d", "v1"]);
+    git(
+        &destination,
+        &["symbolic-ref", "refs/tags/v1", "refs/heads/main"],
+    );
+    git(
+        &destination,
+        &["update-ref", "refs/heads/main", &remote_commit],
+    );
+    let error = encrypted
+        .fetch_into(&destination_repo, "encrypted")
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("local tag refs/tags/v1 is symbolic"),
+        "{error:#}"
+    );
+    assert_eq!(
+        git(&destination, &["symbolic-ref", "refs/tags/v1"]),
+        "refs/heads/main"
+    );
+
+    git(
+        &destination,
+        &["update-ref", "refs/heads/main", &local_commit],
+    );
+    let error = encrypted
+        .fetch_into(&destination_repo, "encrypted")
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("local tag refs/tags/v1"),
+        "{error:#}"
+    );
+    assert_eq!(git(&destination, &["rev-parse", "main"]), local_commit);
+    assert_eq!(
+        git(&destination, &["symbolic-ref", "refs/tags/v1"]),
+        "refs/heads/main"
+    );
+}
+
+#[test]
 fn missing_pack_observation_does_not_advance_import_progress() {
     let temporary = tempfile::tempdir().unwrap();
     let source = temporary.path().join("source");
