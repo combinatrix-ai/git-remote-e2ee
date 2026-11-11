@@ -853,20 +853,26 @@ impl<S: Storage> EncryptedRepository<S> {
                 report.claimed_signer = chain.first().map(|entry| entry.verified_signer.clone());
                 if local_floor.is_some() {
                     match validate_pinned_head(&chain, local_floor.as_ref()) {
-                        Ok(()) => match self.check_chain_ciphertext_presence(&chain) {
-                            Ok(()) => {
-                                report.classification = RecoveryClass::Valid;
-                                report.reason =
+                        Ok(()) => {
+                            let head = chain.first().context("manifest chain is empty")?;
+                            floor_guard.advance(ContinuityFloor::at(&head.id, &head.manifest))?;
+                            report.floor_id = Some(head.id.clone());
+                            report.floor_generation = Some(head.manifest.generation);
+                            match self.check_chain_ciphertext_presence(&chain) {
+                                Ok(()) => {
+                                    report.classification = RecoveryClass::Valid;
+                                    report.reason =
                                         "storage head is authenticated and continuous with the local floor"
                                             .to_owned();
+                                }
+                                Err(error) => {
+                                    report.classification = RecoveryClass::Unavailable;
+                                    report.reason = format!(
+                                        "authenticated storage head has unavailable ciphertext: {error:#}"
+                                    );
+                                }
                             }
-                            Err(error) => {
-                                report.classification = RecoveryClass::Unavailable;
-                                report.reason = format!(
-                                    "authenticated storage head has unavailable ciphertext: {error:#}"
-                                );
-                            }
-                        },
+                        }
                         Err(error) => {
                             report.classification = RecoveryClass::Discontinuous;
                             report.reason =

@@ -258,7 +258,9 @@ compare-and-swap race. Inspect the winning state and run the command again.
 If a storage writer replaces `HEAD` with an invalid manifest, normal fetches
 and pushes stop. Run recovery from a Git repository that has already pinned a
 known good state for that remote. The default command prints a report and does
-not publish or advance the continuity floor:
+not publish. If the storage head has an authenticated chain continuous with
+this machine's existing floor, the report updates that floor even when a
+required pack is missing:
 
 ```console
 cd /work/my-clone

@@ -1559,6 +1559,95 @@ fn rejects_same_generation_manifest_fork_after_fetch_pins_history() {
 }
 
 #[test]
+fn recovery_pins_an_authenticated_revocation_even_when_a_pack_is_missing() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let destination = temporary.path().join("destination");
+    let remote = temporary.path().join("remote");
+    initialize_git(&source);
+    initialize_git(&destination);
+
+    let owner = KeyFile::generate();
+    let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
+    let storage = FilesystemStorage::new(&remote);
+    let writer = EncryptedRepository::new(
+        storage.clone(),
+        owner.clone(),
+        temporary.path().join("writer-state"),
+    );
+    writer.initialize("owner").unwrap();
+    writer
+        .add_device(
+            reader.public_device().unwrap(),
+            "reader",
+            DeviceRoles::reader(),
+        )
+        .unwrap();
+    commit(&source, "before revocation\n", "content");
+    writer
+        .push_ref(
+            &GitRepository::open(&source).unwrap(),
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
+        .unwrap();
+    let (old_head, old_manifest) = writer.current_manifest().unwrap();
+    let pack_id = &old_manifest.new_packs[0].id;
+
+    let valid_state = temporary.path().join("valid-state");
+    let missing_state = temporary.path().join("missing-state");
+    let valid_observer =
+        EncryptedRepository::new(storage.clone(), owner.clone(), valid_state.clone());
+    let missing_observer = EncryptedRepository::new(storage.clone(), owner, missing_state.clone());
+    assert_eq!(valid_observer.current_manifest().unwrap().0, old_head);
+    assert_eq!(missing_observer.current_manifest().unwrap().0, old_head);
+
+    writer.revoke_device(&reader.device_id().unwrap()).unwrap();
+    let (revocation, manifest) = writer.current_manifest().unwrap();
+    let report = valid_observer
+        .recover(
+            &GitRepository::open(&destination).unwrap(),
+            RecoveryOptions {
+                publish: false,
+                base: None,
+                discard_newer: false,
+                accept_stale_floor: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(report.classification, RecoveryClass::Valid);
+    assert_eq!(report.floor_id.as_deref(), Some(revocation.as_str()));
+    assert_eq!(report.floor_generation, Some(manifest.generation));
+
+    fs::remove_file(remote.join("packs").join(&pack_id[..2]).join(pack_id)).unwrap();
+    let report = missing_observer
+        .recover(
+            &GitRepository::open(&destination).unwrap(),
+            RecoveryOptions {
+                publish: false,
+                base: None,
+                discard_newer: false,
+                accept_stale_floor: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(report.classification, RecoveryClass::Unavailable);
+    assert_eq!(report.floor_id.as_deref(), Some(revocation.as_str()));
+    assert_eq!(report.floor_generation, Some(manifest.generation));
+    assert_eq!(
+        storage.read_head().unwrap().as_deref(),
+        Some(revocation.as_str())
+    );
+
+    fs::write(remote.join("HEAD"), format!("{old_head}\n")).unwrap();
+    assert!(valid_observer.current_manifest().is_err());
+    assert!(missing_observer.current_manifest().is_err());
+}
+
+#[test]
 fn recover_replaces_reader_signed_junk_from_the_directory_floor() {
     let temporary = tempfile::tempdir().unwrap();
     let source = temporary.path().join("source");

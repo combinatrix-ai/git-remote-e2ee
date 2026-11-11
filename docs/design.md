@@ -136,9 +136,9 @@ administrative CAS is never automatically rebased.
   `$XDG_STATE_HOME/git-e2ee/<root>/continuity.json`, is the only continuity
   authority. Listing, fetch, push and dry-run push, `init`, `device-*`,
   `verify`, and `recover` take its exclusive lock, require the authenticated
-  chain to pass through it, and advance it after success, so concurrent
-  processes on one machine serialize. Listing advances it on authentication
-  and continuity alone; Git omits the fetch command when nothing needs to be
+  chain to pass through it, and advance it after authentication and continuity,
+  even if a later pack check fails. Processes on one machine serialize. Git
+  omits the fetch command when nothing needs to be
   transferred (after a membership change, a deletion, or a tag pointing at an
   existing object), so a floor that waited for fetch would never pin such a
   state.
@@ -300,11 +300,12 @@ trusting anything the rejected state claims. It is an explicit operation,
 ### Principle
 
 Recovery never derives a base, refs, policy, keys, or pack inventory from the
-rejected state. The default base is the client's continuity floor: the newest
-state it accepted after a complete connectivity check or its own successful
-publication. A fully validated descendant of the floor may be chosen
-explicitly. Anything else storage offers, including a rejected manifest's
-`previous` pointer, is only a discovery hint and is validated independently.
+rejected state. The client's continuity floor is the minimum trusted base: the
+newest continuous authenticated state it observed, even if a later pack check
+failed, or its own successful publication. Discovery may offer a newer
+validated descendant. Anything else storage offers, including a rejected
+manifest's `previous` pointer, is only a discovery hint and is validated
+independently.
 
 The danger is an update this client never saw. If a legitimate state `L`
 followed the floor and storage later replaced it, continuing from the floor
@@ -329,8 +330,10 @@ verifies against a device record in the authenticated policy.
 
 ### `git-e2ee recover`
 
-1. **Discover, read-only.** Classify the head. On the carrier backend, walk the
-   outer commit history back to the floor's manifest within a fixed budget and
+1. **Discover without publishing.** Classify the head. A continuous,
+   authenticated current head advances the local floor, even if a pack is
+   missing. On the carrier backend, walk the outer commit history back to the
+   floor's manifest within a fixed budget and
    list every authenticated manifest that descends from the floor, with its
    generation, outer commit, verified signer, and whether candidates conflict.
    A replay of an older manifest found in outer history is reported, never
@@ -390,9 +393,10 @@ require the current tip to be a single-parent child of it.
 `git-e2ee recover` takes a target (a Git remote name or a storage URL),
 plus `--key` and `--repo`. The repository defaults to `.`; the continuity floor
 is this machine's `$XDG_STATE_HOME/git-e2ee/<repository-root>/continuity.json`,
-where the root comes from the key file. Without `--publish`, the command
-only reports. Publishing an older offer requires `--discard-newer`. Directory
-publication requires `--accept-stale-floor` and prints the warning above.
+where the root comes from the key file. Without `--publish`, the command does
+not change storage, but it can advance the local floor. Publishing an older
+offer requires `--discard-newer`. Directory publication requires
+`--accept-stale-floor` and prints the warning above.
 
 Discovery scans the available carrier history and refuses any history that
 contains a merge commit, since legitimate publications are always
