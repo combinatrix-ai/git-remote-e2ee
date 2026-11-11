@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 
 use anyhow::{Context, Result, bail};
@@ -108,6 +108,8 @@ pub fn is_ancestor(repo: &GitRepository, ancestor: &str, descendant: &str) -> Re
     let status = repo
         .git()
         .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()?;
     match status.code() {
         Some(0) => Ok(true),
@@ -395,15 +397,24 @@ fn read_process_error(file: &mut File) -> String {
     use std::io::Seek;
 
     let _ = file.rewind();
-    let mut message = String::new();
-    let _ = file.read_to_string(&mut message);
-    message.trim().to_owned()
+    let mut message = Vec::new();
+    let _ = file.take(16 * 1024).read_to_end(&mut message);
+    String::from_utf8_lossy(&message).trim().to_owned()
 }
 
 pub fn ensure_refs_connected_since(
     repo: &GitRepository,
     refs: &BTreeMap<String, String>,
     verified_refs: &BTreeMap<String, String>,
+) -> Result<()> {
+    ensure_refs_connected_with_budget(repo, refs, verified_refs, TreeListingBudget::standard())
+}
+
+fn ensure_refs_connected_with_budget(
+    repo: &GitRepository,
+    refs: &BTreeMap<String, String>,
+    verified_refs: &BTreeMap<String, String>,
+    mut tree_budget: TreeListingBudget,
 ) -> Result<()> {
     let _timer = trace::Span::new("git_ref_connectivity_walk");
     if refs.is_empty() {
@@ -412,13 +423,22 @@ pub fn ensure_refs_connected_since(
     let mut objects = Objects::new(repo);
     let mut commit_roots = Vec::new();
     let mut verified_commit_roots = Vec::new();
+    let mut checked_trees = HashSet::new();
     for (reference, object) in refs {
         let ref_kind = InnerRefKind::of(reference)?;
         let target = resolve_tag_chain(&mut objects, reference, object, "fetched")?;
         match target.kind {
             GitObjectType::Commit => commit_roots.push(target.oid),
             GitObjectType::Tree if ref_kind == InnerRefKind::Tag => {
-                ensure_tree_connected(repo, &mut objects, reference, &target.oid)?
+                if checked_trees.insert(target.oid.clone()) {
+                    ensure_tree_connected(
+                        repo,
+                        &mut objects,
+                        reference,
+                        &target.oid,
+                        &mut tree_budget,
+                    )?;
+                }
             }
             GitObjectType::Blob if ref_kind == InnerRefKind::Tag => {}
             _ => bail!("fetched ref {reference} does not resolve to a supported Git object"),
@@ -436,7 +456,15 @@ pub fn ensure_refs_connected_since(
         match target.kind {
             GitObjectType::Commit => verified_commit_roots.push(target.oid),
             GitObjectType::Tree if ref_kind == InnerRefKind::Tag => {
-                ensure_tree_connected(repo, &mut objects, reference, &target.oid)?
+                if checked_trees.insert(target.oid.clone()) {
+                    ensure_tree_connected(
+                        repo,
+                        &mut objects,
+                        reference,
+                        &target.oid,
+                        &mut tree_budget,
+                    )?;
+                }
             }
             GitObjectType::Blob if ref_kind == InnerRefKind::Tag => {}
             _ => bail!("verified ref {reference} does not resolve to a supported Git object"),
@@ -447,7 +475,12 @@ pub fn ensure_refs_connected_since(
         return Ok(());
     }
     let mut command = repo.git();
-    command.args(["rev-list", "--objects", "--missing=print"]);
+    command.args([
+        "rev-list",
+        "--objects",
+        "--no-object-names",
+        "--missing=print",
+    ]);
     for object in &commit_roots {
         command.arg(object);
     }
@@ -457,23 +490,91 @@ pub fn ensure_refs_connected_since(
             command.arg(object);
         }
     }
-    let output = command.output()?;
-    if !output.status.success() {
-        bail!(
-            "git connectivity check failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-    }
-    let output = String::from_utf8(output.stdout)?;
+    let mut output = StreamedGitOutput::spawn(command)?;
     let mut checked_objects = 0;
-    for line in output.lines() {
+    let mut line = Vec::new();
+    while read_delimited(&mut output.stdout, b'\n', 80, &mut line)? {
         checked_objects += 1;
-        if line.starts_with('?') {
+        if line.first() == Some(&b'?') {
             bail!("fetched refs contain missing Git objects")
         }
     }
+    if let Some(reason) = output.finish()? {
+        bail!("git connectivity check failed: {reason}")
+    }
     trace::count("git_ref_connectivity_walk_objects", checked_objects);
     Ok(())
+}
+
+struct StreamedGitOutput {
+    child: Child,
+    stdout: BufReader<ChildStdout>,
+    stderr: File,
+    finished: bool,
+}
+
+impl StreamedGitOutput {
+    fn spawn(mut command: std::process::Command) -> Result<Self> {
+        let stderr = tempfile::tempfile().context("create Git command stderr file")?;
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::from(stderr.try_clone()?))
+            .spawn()?;
+        let stdout = child.stdout.take().context("open Git command stdout")?;
+        Ok(Self {
+            child,
+            stdout: BufReader::new(stdout),
+            stderr,
+            finished: false,
+        })
+    }
+
+    fn finish(&mut self) -> Result<Option<String>> {
+        let status = self.child.wait()?;
+        self.finished = true;
+        Ok((!status.success()).then(|| read_process_error(&mut self.stderr)))
+    }
+}
+
+impl Drop for StreamedGitOutput {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// Git listings can be unexpectedly large or malformed, so read only one
+/// bounded record at a time. An unfinished record is not a clean end of output.
+fn read_delimited(
+    reader: &mut impl BufRead,
+    delimiter: u8,
+    max_bytes: usize,
+    record: &mut Vec<u8>,
+) -> Result<bool> {
+    record.clear();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            if record.is_empty() {
+                return Ok(false);
+            }
+            bail!("Git listing ended inside a record")
+        }
+        let length = available
+            .iter()
+            .position(|byte| *byte == delimiter)
+            .map_or(available.len(), |position| position + 1);
+        if record.len().saturating_add(length) > max_bytes {
+            bail!("Git listing record exceeds {max_bytes} bytes")
+        }
+        record.extend_from_slice(&available[..length]);
+        reader.consume(length);
+        if record.last() == Some(&delimiter) {
+            return Ok(true);
+        }
+    }
 }
 
 struct RefTarget {
@@ -514,36 +615,68 @@ fn resolve_tag_chain(
     }
 }
 
+struct TreeListingBudget {
+    entries: usize,
+    roots: usize,
+    max_entries: usize,
+    max_roots: usize,
+}
+
+impl TreeListingBudget {
+    fn standard() -> Self {
+        Self {
+            entries: 0,
+            roots: 0,
+            max_entries: 4_000_000,
+            max_roots: 256,
+        }
+    }
+
+    fn begin_root(&mut self, reference: &str) -> Result<()> {
+        self.roots = self.roots.saturating_add(1);
+        if self.roots > self.max_roots {
+            bail!("fetched tag {reference} exceeds the tree-root limit")
+        }
+        Ok(())
+    }
+
+    fn charge(&mut self, reference: &str) -> Result<()> {
+        self.entries = self.entries.saturating_add(1);
+        if self.entries > self.max_entries {
+            bail!("fetched tag {reference} expands to too many tree entries")
+        }
+        Ok(())
+    }
+}
+
 fn ensure_tree_connected(
     repo: &GitRepository,
     objects: &mut Objects<'_>,
     reference: &str,
     tree: &str,
+    budget: &mut TreeListingBudget,
 ) -> Result<()> {
-    let output = repo
-        .git()
-        .args(["ls-tree", "-r", "-t", "-z", "--full-tree", tree])
-        .output()?;
-    if !output.status.success() {
-        bail!("fetched tag {reference} contains an incomplete tree")
-    }
-    for entry in output
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|entry| !entry.is_empty())
-    {
-        let header = entry
-            .split(|byte| *byte == b'\t')
-            .next()
-            .context("Git ls-tree returned a malformed entry")?;
-        let header = std::str::from_utf8(header)?;
+    budget.begin_root(reference)?;
+    let mut output = StreamedGitOutput::spawn({
+        let mut command = repo.git();
+        command.args([
+            "ls-tree",
+            "-r",
+            "-t",
+            "--full-tree",
+            "--format=%(objectmode) %(objectname)",
+            tree,
+        ]);
+        command
+    })?;
+    let mut line = Vec::new();
+    while read_delimited(&mut output.stdout, b'\n', 80, &mut line)? {
+        budget.charge(reference)?;
+        let header = std::str::from_utf8(&line[..line.len() - 1])?;
         let mut fields = header.split_ascii_whitespace();
         let mode = fields
             .next()
             .context("Git ls-tree returned an entry without a mode")?;
-        let _kind = fields
-            .next()
-            .context("Git ls-tree returned an entry without an object type")?;
         let object = fields
             .next()
             .context("Git ls-tree returned an entry without an object ID")?;
@@ -555,6 +688,9 @@ fn ensure_tree_connected(
         if !objects.exists(object)? {
             bail!("fetched tag {reference} contains missing Git object {object}")
         }
+    }
+    if let Some(reason) = output.finish()? {
+        bail!("fetched tag {reference} contains an incomplete tree: {reason}")
     }
     Ok(())
 }
@@ -568,6 +704,59 @@ pub fn update_ref(repo: &GitRepository, reference: &str, object: &str) -> Result
         bail!(
             "git update-ref failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }
+    Ok(())
+}
+
+pub fn create_tag_if_absent_or_matching(
+    repo: &GitRepository,
+    reference: &str,
+    object: &str,
+) -> Result<()> {
+    let existing = repo
+        .git()
+        .args([
+            "for-each-ref",
+            "--count=1",
+            "--format=%(refname) %(objectname) %(symref)",
+            reference,
+        ])
+        .output()?;
+    if !existing.status.success() {
+        bail!(
+            "could not inspect local tag {reference}: {}",
+            String::from_utf8_lossy(&existing.stderr).trim()
+        )
+    }
+    for line in String::from_utf8(existing.stdout)?.lines() {
+        if let Some(value) = line
+            .strip_prefix(reference)
+            .and_then(|rest| rest.strip_prefix(' '))
+        {
+            let (current, symbolic_target) = value
+                .split_once(' ')
+                .context("Git returned a malformed local tag")?;
+            if !symbolic_target.is_empty() {
+                bail!("local tag {reference} is symbolic")
+            }
+            if current == object {
+                return Ok(());
+            }
+            bail!("local tag {reference} already points at a different object")
+        }
+    }
+
+    // The empty expected old ID makes creation atomic. --no-deref prevents a
+    // symbolic tag from forwarding this write to another local reference.
+    let created = repo
+        .git()
+        .args(["update-ref", "--no-deref", reference, object, ""])
+        .output()?;
+    if !created.status.success() {
+        bail!(
+            "could not create local tag {reference}: {}",
+            String::from_utf8_lossy(&created.stderr).trim()
         )
     }
     Ok(())
@@ -587,7 +776,10 @@ fn git_text(repo: &GitRepository, args: &[&str]) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_refs_connected_since, has_complete_object_graph};
+    use super::{
+        TreeListingBudget, ensure_refs_connected_since, ensure_refs_connected_with_budget,
+        has_complete_object_graph,
+    };
     use crate::gitcmd::GitRepository;
     use std::collections::BTreeMap;
     use std::fs;
@@ -700,6 +892,80 @@ mod tests {
         let output = child.wait_with_output().unwrap();
         assert!(output.status.success());
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn make_tree(repo: &Path, entries: &str) -> String {
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .arg("mktree")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(entries.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[test]
+    fn compact_repeated_tree_tag_is_checked_without_unbounded_expansion() {
+        let temporary = tempfile::tempdir().unwrap();
+        repository_with_commit(temporary.path());
+        let mut tree = make_tree(temporary.path(), "");
+        for _ in 0..8 {
+            tree = make_tree(
+                temporary.path(),
+                &format!("040000 tree {tree}\ta\n040000 tree {tree}\tb\n"),
+            );
+        }
+        let first_tag = write_tag(temporary.path(), &tree, "tree", b"", b"first tag\n");
+        let duplicate_tag = write_tag(temporary.path(), &tree, "tree", b"", b"second tag\n");
+        let refs = BTreeMap::from([
+            ("refs/tags/first".to_owned(), first_tag.clone()),
+            ("refs/tags/duplicate".to_owned(), duplicate_tag),
+        ]);
+        let repo = GitRepository::open(temporary.path()).unwrap();
+        ensure_refs_connected_since(&repo, &refs, &BTreeMap::new()).unwrap();
+        let budget = TreeListingBudget {
+            max_entries: 600,
+            ..TreeListingBudget::standard()
+        };
+        ensure_refs_connected_with_budget(&repo, &refs, &refs, budget).unwrap();
+
+        let other_tree = make_tree(temporary.path(), &format!("040000 tree {tree}\tc\n"));
+        let other_tag = write_tag(temporary.path(), &other_tree, "tree", b"", b"other tag\n");
+        let distinct_refs = BTreeMap::from([
+            ("refs/tags/first".to_owned(), first_tag),
+            ("refs/tags/other".to_owned(), other_tag),
+        ]);
+        let budget = TreeListingBudget {
+            max_entries: 600,
+            ..TreeListingBudget::standard()
+        };
+        let error =
+            ensure_refs_connected_with_budget(&repo, &distinct_refs, &BTreeMap::new(), budget)
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("too many tree entries"),
+            "{error:#}"
+        );
+
+        let budget = TreeListingBudget {
+            max_entries: 600,
+            max_roots: 1,
+            ..TreeListingBudget::standard()
+        };
+        let error =
+            ensure_refs_connected_with_budget(&repo, &distinct_refs, &BTreeMap::new(), budget)
+                .unwrap_err();
+        assert!(error.to_string().contains("tree-root limit"), "{error:#}");
     }
 
     #[test]

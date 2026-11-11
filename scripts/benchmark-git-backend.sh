@@ -105,10 +105,6 @@ fi
   echo "git-remote-gcrypt checkout must be at $gcrypt_revision" >&2
   exit 2
 }
-[[ -x $gcrypt_checkout/git-remote-gcrypt ]] || {
-  echo "git-remote-gcrypt script is missing or not executable" >&2
-  exit 1
-}
 git -C "$source_repo" cat-file -e HEAD:README.md || {
   echo "benchmark source must contain README.md" >&2
   exit 2
@@ -193,6 +189,14 @@ if (( available_kib < source_git_kib * 12 )); then
   exit 1
 fi
 gpg_home_root=$(cd /tmp && pwd -P)
+case $os in
+  Darwin) tmp_owner=$(stat -f '%u' "$gpg_home_root") ;;
+  Linux) tmp_owner=$(stat -c '%u' "$gpg_home_root") ;;
+esac
+if [[ ! -k $gpg_home_root ]] || [[ $tmp_owner != 0 && ! -O $gpg_home_root ]]; then
+  echo "the system temporary directory must be sticky and owned by root or this user" >&2
+  exit 2
+fi
 gpg_agent_socket_path="$gpg_home_root/git-remote-e2ee-gnupg.XXXXXX/S.gpg-agent"
 if (( ${#gpg_agent_socket_path} >= 90 )); then
   echo "the canonical /tmp path is too long for a GnuPG agent socket: $gpg_home_root" >&2
@@ -208,7 +212,6 @@ git_e2ee="$project_root/target/release/git-e2ee"
   exit 1
 }
 
-export PATH="$gcrypt_checkout:$project_root/target/release:$PATH"
 if [[ ${BENCH_TRACE:-0} == 1 ]]; then
   export GIT_REMOTE_E2EE_TRACE=1
 fi
@@ -216,6 +219,7 @@ work=$(mktemp -d "$work_parent/git-remote-e2ee-bench.XXXXXX")
 export XDG_STATE_HOME="$work/xdg-state" XDG_CONFIG_HOME="$work/xdg-config"
 work=$(cd "$work" && pwd -P)
 chmod 700 "$work"
+helper_dir=
 gpgconf_bin=$(command -v gpgconf || true)
 active_gpg_home=
 cleanup_gpg_home() {
@@ -234,6 +238,19 @@ cleanup_gpg_home() {
 cleanup() {
   if [[ -n $active_gpg_home && -n $gpgconf_bin ]]; then
     "$gpgconf_bin" --homedir "$active_gpg_home" --kill all >/dev/null 2>&1 || true
+  fi
+  if [[ -n $helper_dir ]]; then
+    case $helper_dir in
+      "$gpg_home_root"/git-remote-e2ee-helper.*)
+        if [[ $(cd "$(dirname "$helper_dir")" && pwd -P) == "$gpg_home_root" && -d $helper_dir && ! -L $helper_dir ]]; then
+          rm -rf "$helper_dir"
+        else
+          echo "refusing to remove unexpected helper path: $helper_dir" >&2
+        fi
+        ;;
+      *) echo "refusing to remove unexpected helper path: $helper_dir" >&2 ;;
+    esac
+    helper_dir=
   fi
   if [[ ${BENCH_KEEP_WORK:-0} == 1 ]]; then
     echo "benchmark work directory retained at $work" >&2
@@ -258,6 +275,21 @@ cleanup() {
   esac
 }
 trap cleanup EXIT
+
+# The cache worktree can be edited without changing its pinned HEAD. Extract
+# only the authenticated helper blob into a private directory under the
+# trusted sticky /tmp, even when the benchmark data uses a custom work parent.
+helper_dir=$(mktemp -d "$gpg_home_root/git-remote-e2ee-helper.XXXXXX")
+chmod 700 "$helper_dir"
+GIT_NO_LAZY_FETCH=1 git -C "$gcrypt_checkout" cat-file blob \
+  "$gcrypt_revision:git-remote-gcrypt" >"$helper_dir/git-remote-gcrypt"
+helper_sha256=$(shasum -a 256 "$helper_dir/git-remote-gcrypt" | awk '{print $1}')
+if [[ $helper_sha256 != de943a9e1d9d8781cdac462ea5104f42fc188b8e198c4e6ddc9d7b9ee6e8f160 ]]; then
+  echo "pinned git-remote-gcrypt helper has an unexpected digest" >&2
+  exit 1
+fi
+chmod 700 "$helper_dir/git-remote-gcrypt"
+export PATH="$helper_dir:$project_root/target/release:$PATH"
 
 raw_tsv="$work/measurements.tsv"
 printf 'round\ttransport\tphase\titeration\twall_seconds\tmax_rss_bytes\tremote_or_stored_delta_bytes\tremote_or_stored_total_logical_bytes\tremote_or_stored_total_allocated_bytes\tclient_git_logical_bytes\tclient_git_allocated_bytes\tlocal_state_logical_bytes\tlocal_state_allocated_bytes\tclient_object_store_growth\n' >"$raw_tsv"
@@ -448,7 +480,7 @@ run_round() {
   "$git_e2ee" keygen --output "$key_directory" >/dev/null 2>&1
   "$git_e2ee" keygen --output "$key_carrier" >/dev/null 2>&1
   gcrypt_url="gcrypt::file://$gcrypt_git#gcrypt-carrier"
-  e2ee_url="e2ee::file://$carrier_git"
+  e2ee_url="e2ee::trusted-local:$carrier_git"
 
   git -C "$source_work" remote add plain-local "file://$bare_local"
   git -C "$source_work" remote add gcrypt-directory "gcrypt::$gcrypt_dir"

@@ -1,8 +1,12 @@
-//! Git's ref-name rules, as `git check-ref-format <refname>` applies them
-//! without options (git-check-ref-format(1)).
+//! Git's ref-name rules plus a ban on display controls in protocol refs.
 
-/// Whether `git check-ref-format` accepts `name`.
+use crate::url::is_control_or_invisible;
+
+/// Whether a ref passes Git's rules and remains safe in line-oriented output.
 pub fn is_valid(name: &str) -> bool {
+    if name.chars().any(is_control_or_invisible) {
+        return false;
+    }
     // A single `@` is reserved for HEAD; at least two components are needed
     // without `--allow-onelevel`.
     if name == "@" || !name.contains('/') || name.ends_with('.') {
@@ -86,7 +90,6 @@ mod tests {
         "refs/heads/a\nb",
         "refs/heads/a\u{1}b",
         "refs/heads/a\u{7f}b",
-        "refs/heads/a\u{80}b",
         "refs/heads/a.",
         "refs/heads/a./b",
         "refs/heads/a/b.",
@@ -110,5 +113,20 @@ mod tests {
             accepted += usize::from(expected);
         }
         assert!(accepted > 5 && accepted < CASES.len() - 20);
+    }
+
+    #[test]
+    fn git_accepted_display_controls_are_rejected() {
+        for reference in [
+            "refs/heads/a\u{80}b",
+            "refs/heads/a\u{9b}b",
+            "refs/heads/a\u{2028}b",
+            "refs/heads/a\u{202e}b",
+            "refs/heads/a\u{2066}b",
+            "refs/heads/a\u{200b}b",
+            "refs/heads/a\u{2060}b",
+        ] {
+            assert!(!is_valid(reference), "{reference:?}");
+        }
     }
 }

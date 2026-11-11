@@ -116,6 +116,7 @@ fn push_after_rollback_of_a_revocation_seen_only_by_device_revoke_is_rejected() 
         .unwrap()
         .write_new(&reader_public)
         .unwrap();
+    let reader_id = reader.device_id().unwrap();
     succeed(
         "device-add",
         machine.cli(
@@ -126,6 +127,8 @@ fn push_after_rollback_of_a_revocation_seen_only_by_device_revoke_is_rejected() 
                 reader_public.to_str().unwrap(),
                 "--label",
                 "reader",
+                "--expected-device-id",
+                &reader_id,
                 "--role",
                 "read",
             ],

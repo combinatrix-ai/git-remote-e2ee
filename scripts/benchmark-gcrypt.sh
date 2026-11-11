@@ -22,7 +22,6 @@ source_ref=$(git -C "$source_repo" symbolic-ref --quiet HEAD) || {
   exit 2
 }
 source_branch=${source_ref#refs/heads/}
-source_head=$(git -C "$source_repo" rev-parse HEAD)
 
 case $(uname -s) in
   Darwin) time_style=bsd ;;
@@ -217,9 +216,7 @@ cat >"$results_dir/summary.json" <<JSON
   "tool_commit": "$(git -C "$gcrypt_checkout" rev-parse HEAD)",
   "backend": "local-filesystem",
   "platform": "$(uname -s)",
-  "architecture": "$(uname -m)",
-  "source_head": "$source_head",
-  "final_head": "$expected"
+  "architecture": "$(uname -m)"
 }
 JSON
 

@@ -11,6 +11,7 @@ use crate::crypto::{
     verify_domain,
 };
 use crate::error::Unsupported;
+use crate::url::is_control_or_invisible;
 
 const POLICY_SIGNATURE_DOMAIN: &[u8] = domain!("policy");
 
@@ -337,20 +338,6 @@ pub fn validate_device_label(label: &str) -> Result<()> {
         )
     }
     Ok(())
-}
-
-fn is_control_or_invisible(character: char) -> bool {
-    character.is_control()
-        || matches!(
-            character,
-            '\u{00AD}'
-                | '\u{061C}'
-                | '\u{180E}'
-                | '\u{200B}'..='\u{200F}'
-                | '\u{202A}'..='\u{202E}'
-                | '\u{2060}'..='\u{206F}'
-                | '\u{FEFF}'
-        )
 }
 
 fn validate_devices(devices: &[DeviceRecord]) -> Result<()> {

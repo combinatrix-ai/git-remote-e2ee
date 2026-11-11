@@ -48,7 +48,7 @@ fn carrier_history_hides_device_metadata_and_pads_reader_envelopes() {
         String::from_utf8_lossy(&output.stderr)
     );
     run_metadata_scenario(
-        || GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        || GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
         || carrier_snapshot(&carrier),
         || {
             let paths = git_output(&carrier, &["log", "--all", "--name-only", "--format="]);

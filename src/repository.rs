@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use crate::continuity::{ContinuityFloor, FileLock, FloorGuard, read_json, write_json};
 use crate::crypto::{
     KeyFile, PublicDevice, SecretKey, SubkeyKind, derive_subkey, object_id, open_pack_stream,
-    random_key, seal_pack_stream,
+    pack_stream_ciphertext_size, random_key, seal_pack_stream, snapshot_verified_pack_ciphertext,
 };
 use crate::error::{
     BudgetExhausted, ForeignRepository, InvalidState, MissingStorageHead, NotActiveReader,
@@ -26,6 +26,7 @@ use crate::manifest::{
 use crate::policy::{DeviceRecord, DeviceRoles, PolicyState};
 use crate::storage::{HeadObservation, ObjectKind, Storage, StorageOccupied, StoredHead};
 use crate::trace;
+use crate::url::safe_diagnostic;
 
 const MAX_RECOVERY_OUTER_COMMITS: usize = 2048;
 const MAX_RECOVERY_CANDIDATES: usize = 256;
@@ -131,6 +132,33 @@ pub struct RecoveryReport {
     pub warning: Option<String>,
     pub blocked_reason: Option<String>,
     pub published_manifest: Option<String>,
+}
+
+impl RecoveryReport {
+    fn sanitized(mut self) -> Self {
+        self.reason = safe_diagnostic(&self.reason);
+        self.head_id = self.head_id.map(|text| safe_diagnostic(&text));
+        self.claimed_signer = self.claimed_signer.map(|text| safe_diagnostic(&text));
+        self.floor_id = self.floor_id.map(|text| safe_diagnostic(&text));
+        self.default_base = self.default_base.map(|text| safe_diagnostic(&text));
+        self.replays = self
+            .replays
+            .into_iter()
+            .map(|text| safe_diagnostic(&text))
+            .collect();
+        for candidate in &mut self.candidates {
+            candidate.manifest_id = safe_diagnostic(&candidate.manifest_id);
+            candidate.outer_commit = candidate
+                .outer_commit
+                .take()
+                .map(|text| safe_diagnostic(&text));
+            candidate.verified_signer = safe_diagnostic(&candidate.verified_signer);
+        }
+        self.warning = self.warning.map(|text| safe_diagnostic(&text));
+        self.blocked_reason = self.blocked_reason.map(|text| safe_diagnostic(&text));
+        self.published_manifest = self.published_manifest.map(|text| safe_diagnostic(&text));
+        self
+    }
 }
 
 pub struct RecoveryOptions<'a> {
@@ -243,27 +271,31 @@ struct RecoveryBudget {
 }
 
 impl RecoveryBudget {
-    fn charge_manifest(&mut self, header: &ManifestHeader, byte_count: usize) -> Result<()> {
+    fn charge_bytes(&mut self, byte_count: u64) -> Result<()> {
         self.bytes_read = self
             .bytes_read
-            .checked_add(byte_count as u64)
-            .context("recovery byte budget overflow")?;
+            .checked_add(byte_count)
+            .context("manifest chain byte budget overflow")?;
         if self.bytes_read > MAX_RECOVERY_BYTES {
             bail!(BudgetExhausted(
-                "recovery manifest byte budget exhausted".to_owned()
+                "manifest chain byte budget exhausted".to_owned()
             ))
         }
+        Ok(())
+    }
+
+    fn charge_crypto(&mut self, header: &ManifestHeader) -> Result<()> {
         let operations = (header.generation_key_envelopes.len() as u64)
             .checked_mul(2)
             .and_then(|value| value.checked_add(1))
-            .context("recovery crypto budget overflow")?;
+            .context("manifest chain crypto budget overflow")?;
         self.crypto_operations = self
             .crypto_operations
             .checked_add(operations)
-            .context("recovery crypto budget overflow")?;
+            .context("manifest chain crypto budget overflow")?;
         if self.crypto_operations > MAX_RECOVERY_CRYPTO_OPERATIONS {
             bail!(BudgetExhausted(
-                "recovery cryptographic-operation budget exhausted".to_owned()
+                "manifest chain cryptographic-operation budget exhausted".to_owned()
             ))
         }
         Ok(())
@@ -313,17 +345,20 @@ impl<S: Storage> EncryptedRepository<S> {
     /// floor after this storage view was opened, so a view that fails the
     /// floor is refreshed once before the failure counts as a rollback.
     fn pinned_chain(&self, floor: &FloorGuard) -> Result<Vec<OpenedState>> {
-        let floor = floor.read()?;
+        let pinned = floor.read()?;
         let chain = self.current_chain()?;
-        match validate_pinned_head(&chain, floor.as_ref()) {
-            Ok(()) => Ok(chain),
-            Err(error) if !self.storage.refresh()? => Err(error),
+        let chain = match validate_pinned_head(&chain, pinned.as_ref()) {
+            Ok(()) => chain,
+            Err(error) if !self.storage.refresh()? => return Err(error),
             Err(_) => {
                 let chain = self.current_chain()?;
-                validate_pinned_head(&chain, floor.as_ref())?;
-                Ok(chain)
+                validate_pinned_head(&chain, pinned.as_ref())?;
+                chain
             }
-        }
+        };
+        let head = chain.first().context("manifest chain is empty")?;
+        floor.advance(ContinuityFloor::at(&head.id, &head.manifest))?;
+        Ok(chain)
     }
 
     /// Publishes the genesis head and pins it on this machine. The error says
@@ -376,6 +411,8 @@ impl<S: Storage> EncryptedRepository<S> {
         Ok((floor, genesis, id))
     }
 
+    /// Adds a device after the caller has authenticated its `device_id` with
+    /// the device owner through a channel separate from the public record.
     pub fn add_device(
         &self,
         public: PublicDevice,
@@ -474,7 +511,6 @@ impl<S: Storage> EncryptedRepository<S> {
             .into_iter()
             .next()
             .context("manifest chain is empty")?;
-        floor.advance(ContinuityFloor::at(&current.id, &current.manifest))?;
         Ok(current)
     }
 
@@ -495,6 +531,7 @@ impl<S: Storage> EncryptedRepository<S> {
         pushes: &[RefPush<'_>],
         mode: PushMode,
     ) -> Result<PushOutcome> {
+        repo.ensure_no_promisor()?;
         let floor = self.lock_floor()?;
         let current = self
             .pinned_chain(&floor)?
@@ -540,7 +577,6 @@ impl<S: Storage> EncryptedRepository<S> {
         }
 
         let publication = if mode == PushMode::DryRun || next_refs == current.manifest.refs {
-            floor.advance(ContinuityFloor::at(&current.id, &current.manifest))?;
             Ok(current.id.clone())
         } else {
             self.publish_refs(repo, &mut objects, &floor, &current, next_refs, &pack_refs)
@@ -656,18 +692,20 @@ impl<S: Storage> EncryptedRepository<S> {
                     let short = reference.strip_prefix("refs/heads/").unwrap();
                     git::update_ref(repo, &format!("refs/remotes/{remote_name}/{short}"), object)?;
                 }
-                git::InnerRefKind::Tag => git::update_ref(repo, reference, object)?,
+                git::InnerRefKind::Tag => {
+                    git::create_tag_if_absent_or_matching(repo, reference, object)?;
+                }
             }
         }
         Ok(manifest)
     }
 
     pub fn observe_manifest(&self, repo: &GitRepository) -> Result<Manifest> {
+        repo.ensure_no_promisor()?;
         let floor = self.lock_floor()?;
         let checkout = self.open_checkout(repo)?;
         let chain = self.pinned_chain(&floor)?;
         let current = chain.first().context("manifest chain is empty")?;
-        floor.advance(ContinuityFloor::at(&current.id, &current.manifest))?;
         // Git skips the helper's fetch command when every advertised object is
         // already local, for example after a membership change, a deletion, or
         // a tag that points at an existing object. Record the import here only
@@ -687,6 +725,7 @@ impl<S: Storage> EncryptedRepository<S> {
     }
 
     pub fn import_packs(&self, repo: &GitRepository) -> Result<Manifest> {
+        repo.ensure_no_promisor()?;
         let floor = self.lock_floor()?;
         let checkout = self.open_checkout(repo)?;
         let chain = self.pinned_chain(&floor)?;
@@ -705,7 +744,6 @@ impl<S: Storage> EncryptedRepository<S> {
             git::ensure_refs_connected_since(repo, &current.manifest.refs, &BTreeMap::new())?;
         }
         drop(connectivity_timer);
-        floor.advance(ContinuityFloor::at(&current.id, &current.manifest))?;
         checkout.write(CheckoutProgress {
             format_version: CHECKOUT_PROGRESS_FORMAT,
             imported_generation: Some(current.manifest.generation),
@@ -728,11 +766,9 @@ impl<S: Storage> EncryptedRepository<S> {
                 continue;
             }
             for descriptor in &entry.manifest.new_packs {
-                let mut importer = git::start_pack_import(repo)?;
                 let decrypt_timer = trace::Span::new("pack_decrypt_to_index_pack");
-                self.open_chain_pack(entry, descriptor, &mut importer)?;
+                self.import_chain_pack(repo, entry, descriptor)?;
                 drop(decrypt_timer);
-                importer.finish()?;
             }
         }
         Ok(())
@@ -748,6 +784,53 @@ impl<S: Storage> EncryptedRepository<S> {
         plaintext: impl io::Write,
     ) -> Result<()> {
         let encrypted = self.storage.open_object(ObjectKind::Pack, &descriptor.id)?;
+        let (pack_key, aad) = Self::chain_pack_material(entry, descriptor)?;
+        open_pack_stream(
+            &pack_key,
+            encrypted,
+            plaintext,
+            &aad,
+            descriptor.plaintext_size,
+            &descriptor.id,
+        )?;
+        Ok(())
+    }
+
+    fn import_chain_pack(
+        &self,
+        repo: &GitRepository,
+        entry: &OpenedState,
+        descriptor: &PackDescriptor,
+    ) -> Result<()> {
+        let expected_size = pack_stream_ciphertext_size(descriptor.plaintext_size)?;
+        if expected_size > ObjectKind::Pack.max_bytes() {
+            bail!("pack ciphertext exceeds the maximum object size")
+        }
+        let encrypted = self.storage.open_object(ObjectKind::Pack, &descriptor.id)?;
+        let (pack_key, aad) = Self::chain_pack_material(entry, descriptor)?;
+        let snapshot = snapshot_verified_pack_ciphertext(
+            &pack_key,
+            encrypted,
+            &aad,
+            descriptor.plaintext_size,
+            &descriptor.id,
+        )?;
+        let mut importer = git::start_pack_import(repo)?;
+        open_pack_stream(
+            &pack_key,
+            snapshot,
+            &mut importer,
+            &aad,
+            descriptor.plaintext_size,
+            &descriptor.id,
+        )?;
+        importer.finish()
+    }
+
+    fn chain_pack_material(
+        entry: &OpenedState,
+        descriptor: &PackDescriptor,
+    ) -> Result<(SecretKey, Vec<u8>)> {
         let pack_key = derive_subkey(
             &entry.generation_key,
             &entry.manifest.repository_root,
@@ -755,19 +838,14 @@ impl<S: Storage> EncryptedRepository<S> {
             SubkeyKind::Pack,
             descriptor.ordinal,
         )?;
-        open_pack_stream(
-            &pack_key,
-            encrypted,
-            plaintext,
-            &pack_aad(
+        Ok((
+            pack_key,
+            pack_aad(
                 &entry.manifest.repository_root,
                 descriptor.generation,
                 descriptor.ordinal,
             ),
-            descriptor.plaintext_size,
-            &descriptor.id,
-        )?;
-        Ok(())
+        ))
     }
 
     /// Checks the whole manifest chain against the machine floor and
@@ -787,11 +865,19 @@ impl<S: Storage> EncryptedRepository<S> {
         if count != current.manifest.total_pack_count {
             bail!("manifest delta log pack count mismatch")
         }
-        floor.advance(ContinuityFloor::at(&current.id, &current.manifest))?;
         Ok(current.manifest.clone())
     }
 
     pub fn recover(
+        &self,
+        repo: &GitRepository,
+        options: RecoveryOptions<'_>,
+    ) -> Result<RecoveryReport> {
+        self.recover_inner(repo, options)
+            .map(RecoveryReport::sanitized)
+    }
+
+    fn recover_inner(
         &self,
         repo: &GitRepository,
         options: RecoveryOptions<'_>,
@@ -836,8 +922,8 @@ impl<S: Storage> EncryptedRepository<S> {
         let current_chain = match observation.head_id.as_deref() {
             Some(head) => self.chain_from(
                 head,
-                &mut |id| self.read_manifest_material(id),
-                Some(&mut budget),
+                &mut |id, budget| self.read_manifest_material(id, budget),
+                &mut budget,
             ),
             None => match &observation.head {
                 Some(head) => {
@@ -853,20 +939,26 @@ impl<S: Storage> EncryptedRepository<S> {
                 report.claimed_signer = chain.first().map(|entry| entry.verified_signer.clone());
                 if local_floor.is_some() {
                     match validate_pinned_head(&chain, local_floor.as_ref()) {
-                        Ok(()) => match self.check_chain_ciphertext_presence(&chain) {
-                            Ok(()) => {
-                                report.classification = RecoveryClass::Valid;
-                                report.reason =
+                        Ok(()) => {
+                            let head = chain.first().context("manifest chain is empty")?;
+                            floor_guard.advance(ContinuityFloor::at(&head.id, &head.manifest))?;
+                            report.floor_id = Some(head.id.clone());
+                            report.floor_generation = Some(head.manifest.generation);
+                            match self.check_chain_ciphertext_presence(&chain) {
+                                Ok(()) => {
+                                    report.classification = RecoveryClass::Valid;
+                                    report.reason =
                                         "storage head is authenticated and continuous with the local floor"
                                             .to_owned();
+                                }
+                                Err(error) => {
+                                    report.classification = RecoveryClass::Unavailable;
+                                    report.reason = format!(
+                                        "authenticated storage head has unavailable ciphertext: {error:#}"
+                                    );
+                                }
                             }
-                            Err(error) => {
-                                report.classification = RecoveryClass::Unavailable;
-                                report.reason = format!(
-                                    "authenticated storage head has unavailable ciphertext: {error:#}"
-                                );
-                            }
-                        },
+                        }
                         Err(error) => {
                             report.classification = RecoveryClass::Discontinuous;
                             report.reason =
@@ -901,7 +993,13 @@ impl<S: Storage> EncryptedRepository<S> {
                 if class == RecoveryClass::Invalid
                     && let Some(head) = observation.head_id.as_deref()
                 {
-                    report.claimed_signer = self.claimed_signer_for_head(head).ok();
+                    report.claimed_signer = match self.claimed_signer_for_head(head, &mut budget) {
+                        Ok(signer) => Some(signer),
+                        Err(error) if error.is::<BudgetExhausted>() => {
+                            return Err(error).context("bounded recovery discovery failed");
+                        }
+                        Err(_) => None,
+                    };
                 }
             }
         }
@@ -956,9 +1054,11 @@ impl<S: Storage> EncryptedRepository<S> {
 
         let floor_id = pinned.head_id.as_str();
         let floor_generation = pinned.generation;
-        let history = self
-            .storage
-            .recovery_history(MAX_RECOVERY_OUTER_COMMITS, MAX_RECOVERY_MANIFEST_BYTES)?;
+        let history = self.storage.recovery_history(
+            MAX_RECOVERY_OUTER_COMMITS,
+            MAX_RECOVERY_MANIFEST_BYTES.min(MAX_RECOVERY_BYTES - budget.bytes_read),
+            MAX_RECOVERY_CANDIDATES,
+        )?;
         let carrier_history = history.is_some();
         let history = history.unwrap_or_default();
         if history.commits.len() > MAX_RECOVERY_OUTER_COMMITS {
@@ -976,15 +1076,15 @@ impl<S: Storage> EncryptedRepository<S> {
                 "recovery manifest byte budget exhausted".to_owned()
             ))
         }
-        budget.bytes_read = budget
-            .bytes_read
-            .checked_add(historical_bytes)
-            .context("recovery manifest byte budget overflow")?;
-        if budget.bytes_read > MAX_RECOVERY_BYTES {
+        if history.manifest_bytes_read < historical_bytes {
+            bail!("recovery history underreported manifest bytes")
+        }
+        if history.manifest_bytes_read > MAX_RECOVERY_MANIFEST_BYTES {
             bail!(BudgetExhausted(
                 "recovery manifest byte budget exhausted".to_owned()
             ))
         }
+        budget.charge_bytes(history.manifest_bytes_read)?;
         if carrier_history
             && !history
                 .commits
@@ -998,29 +1098,32 @@ impl<S: Storage> EncryptedRepository<S> {
             return Ok(report);
         }
 
-        let read_history_material = |id: &str| -> Result<(String, Vec<u8>, ManifestHeader)> {
-            match self.read_manifest_material(id) {
-                Ok(material) => Ok(material),
-                Err(current_error) => {
-                    let Some(bytes) = history.manifests.get(id) else {
-                        return Err(current_error.context(format!(
-                            "historical manifest {id} is not in carrier history"
-                        )));
-                    };
-                    if object_id(bytes) != id {
-                        return Err(proven_invalid(anyhow::anyhow!(
-                            "historical manifest {id} content ID mismatch"
-                        )));
+        let read_history_material =
+            |id: &str, budget: &mut RecoveryBudget| -> Result<(String, Vec<u8>, ManifestHeader)> {
+                match self.read_manifest_material(id, budget) {
+                    Ok(material) => Ok(material),
+                    Err(error) if error.is::<BudgetExhausted>() => Err(error),
+                    Err(current_error) => {
+                        let Some(bytes) = history.manifests.get(id) else {
+                            return Err(current_error.context(format!(
+                                "historical manifest {id} is not in carrier history"
+                            )));
+                        };
+                        budget.charge_bytes(bytes.len() as u64)?;
+                        if object_id(bytes) != id {
+                            return Err(proven_invalid(anyhow::anyhow!(
+                                "historical manifest {id} content ID mismatch"
+                            )));
+                        }
+                        let header = peek_manifest_header(bytes).map_err(proven_invalid)?;
+                        Ok((id.to_owned(), bytes.clone(), header))
                     }
-                    let header = peek_manifest_header(bytes).map_err(proven_invalid)?;
-                    Ok((id.to_owned(), bytes.clone(), header))
                 }
-            }
-        };
+            };
         let floor_chain = match self.chain_from(
             floor_id,
-            &mut |id| read_history_material(id),
-            Some(&mut budget),
+            &mut |id, budget| read_history_material(id, budget),
+            &mut budget,
         ) {
             Ok(chain) => chain,
             Err(error) if error.is::<BudgetExhausted>() => {
@@ -1095,8 +1198,8 @@ impl<S: Storage> EncryptedRepository<S> {
                 }
                 let candidate_chain = match self.chain_from(
                     candidate_id,
-                    &mut |id| read_history_material(id),
-                    Some(&mut budget),
+                    &mut |id, budget| read_history_material(id, budget),
+                    &mut budget,
                 ) {
                     Ok(chain) => chain,
                     Err(error) if error.is::<BudgetExhausted>() => {
@@ -1271,8 +1374,8 @@ impl<S: Storage> EncryptedRepository<S> {
         Ok(report)
     }
 
-    fn claimed_signer_for_head(&self, head: &str) -> Result<String> {
-        let (_, encrypted, header) = self.read_manifest_material(head)?;
+    fn claimed_signer_for_head(&self, head: &str, budget: &mut RecoveryBudget) -> Result<String> {
+        let (_, encrypted, header) = self.read_manifest_material(head, budget)?;
         let key = unwrap_generation_key(&header, &self.key)?;
         Ok(open_manifest(&encrypted, &key)?.claimed_signer_id)
     }
@@ -1311,11 +1414,10 @@ impl<S: Storage> EncryptedRepository<S> {
             )
         }
         let scratch = GitRepository::owned_git_dir(temporary.path());
+        scratch.ensure_no_promisor()?;
         for entry in chain.iter().rev() {
             for descriptor in &entry.manifest.new_packs {
-                let mut importer = git::start_pack_import(&scratch)?;
-                self.open_chain_pack(entry, descriptor, &mut importer)?;
-                importer.finish()?;
+                self.import_chain_pack(&scratch, entry, descriptor)?;
             }
         }
         let refs = &chain
@@ -1365,22 +1467,28 @@ impl<S: Storage> EncryptedRepository<S> {
             .storage
             .read_head()?
             .context("encrypted repository is not initialized")?;
-        self.chain_from(&head, &mut |id| self.read_manifest_material(id), None)
+        let mut budget = RecoveryBudget {
+            crypto_operations: 0,
+            bytes_read: 0,
+        };
+        self.chain_from(
+            &head,
+            &mut |id, budget| self.read_manifest_material(id, budget),
+            &mut budget,
+        )
     }
 
     fn chain_from<F>(
         &self,
         head: &str,
         read_material: &mut F,
-        mut budget: Option<&mut RecoveryBudget>,
+        budget: &mut RecoveryBudget,
     ) -> Result<Vec<OpenedState>>
     where
-        F: FnMut(&str) -> Result<(String, Vec<u8>, ManifestHeader)>,
+        F: FnMut(&str, &mut RecoveryBudget) -> Result<(String, Vec<u8>, ManifestHeader)>,
     {
-        let (mut id, mut encrypted, mut header) = read_material(head)?;
-        if let Some(budget) = budget.as_deref_mut() {
-            budget.charge_manifest(&header, encrypted.len())?;
-        }
+        let (mut id, mut encrypted, mut header) = read_material(head, budget)?;
+        budget.charge_crypto(&header)?;
         let mut generation_key = unwrap_generation_key(&header, &self.key)?;
         let mut opened = open_manifest(&encrypted, &generation_key).map_err(proven_invalid)?;
         let mut unverified = Vec::new();
@@ -1401,10 +1509,8 @@ impl<S: Storage> EncryptedRepository<S> {
                 unverified.push((id, opened, generation_key));
                 break;
             };
-            let (parent_id, parent_encrypted, parent_header) = read_material(&previous_id)?;
-            if let Some(budget) = budget.as_deref_mut() {
-                budget.charge_manifest(&parent_header, parent_encrypted.len())?;
-            }
+            let (parent_id, parent_encrypted, parent_header) = read_material(&previous_id, budget)?;
+            budget.charge_crypto(&parent_header)?;
             let parent_key =
                 unwrap_predecessor_key(&generation_key, &opened.manifest, &parent_header)
                     .map_err(proven_invalid)?;
@@ -1493,8 +1599,28 @@ impl<S: Storage> EncryptedRepository<S> {
         Ok(chain_oldest_first)
     }
 
-    fn read_manifest_material(&self, id: &str) -> Result<(String, Vec<u8>, ManifestHeader)> {
-        let bytes = self.storage.get_object(ObjectKind::Manifest, id)?;
+    fn read_manifest_material(
+        &self,
+        id: &str,
+        budget: &mut RecoveryBudget,
+    ) -> Result<(String, Vec<u8>, ManifestHeader)> {
+        let reader = self.storage.open_object(ObjectKind::Manifest, id)?;
+        let mut reader = reader.take(crate::storage::MAX_MANIFEST_BYTES + 1);
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let remaining = MAX_RECOVERY_BYTES - budget.bytes_read;
+            let limit = buffer.len().min(remaining.saturating_add(1) as usize);
+            let read = reader.read(&mut buffer[..limit])?;
+            if read == 0 {
+                break;
+            }
+            budget.charge_bytes(read as u64)?;
+            bytes.extend_from_slice(&buffer[..read]);
+        }
+        if bytes.len() as u64 > crate::storage::MAX_MANIFEST_BYTES {
+            bail!("buffered object exceeds size limit")
+        }
         if object_id(&bytes) != id {
             return Err(proven_invalid(anyhow::anyhow!(
                 "manifest ciphertext hash mismatch"
@@ -1767,8 +1893,11 @@ fn record_rejected_head(
         Err(error) => return Err(error.into()),
     };
     log.format_version = 1;
+    for entry in &mut log.entries {
+        entry.reason = safe_diagnostic(&entry.reason);
+    }
     log.entries.retain(|entry| entry.head_id != head_id);
-    let reason: String = reason.chars().take(512).collect();
+    let reason: String = safe_diagnostic(reason).chars().take(512).collect();
     log.entries.push(RejectedHeadEvidence {
         head_id: head_id.to_owned(),
         classification,
@@ -1783,12 +1912,165 @@ fn record_rejected_head(
 
 #[cfg(test)]
 mod tests {
-    use std::io;
+    use std::io::{self, Read};
 
     use super::{
-        ForeignRepository, InvalidState, MissingStorageHead, NotActiveReader, ObjectUnavailable,
-        RecoveryClass, Unsupported, classify_recovery_error,
+        EncryptedRepository, ForeignRepository, InvalidState, MAX_RECOVERY_BYTES,
+        MissingStorageHead, NotActiveReader, ObjectUnavailable, RecoveryBudget, RecoveryClass,
+        RecoveryReport, Unsupported, classify_recovery_error,
     };
+    use crate::crypto::KeyFile;
+    use crate::error::BudgetExhausted;
+    use crate::storage::{MAX_MANIFEST_BYTES, ObjectKind, ObjectStage, Storage};
+
+    struct ReadOnlyStorage {
+        reader: fn() -> Box<dyn Read + Send>,
+    }
+
+    impl Storage for ReadOnlyStorage {
+        fn begin_object(&self, _kind: ObjectKind) -> anyhow::Result<Box<dyn ObjectStage>> {
+            anyhow::bail!("unused in this test")
+        }
+
+        fn open_object(
+            &self,
+            _kind: ObjectKind,
+            _id: &str,
+        ) -> anyhow::Result<Box<dyn Read + Send>> {
+            Ok((self.reader)())
+        }
+
+        fn read_head(&self) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+
+        fn compare_and_swap_head(
+            &self,
+            _expected: Option<&str>,
+            _next: &str,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("unused in this test")
+        }
+    }
+
+    struct PartialThenError(bool);
+
+    impl Read for PartialThenError {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if self.0 {
+                return Err(io::Error::other("interrupted storage read"));
+            }
+            self.0 = true;
+            output[..4].copy_from_slice(b"junk");
+            Ok(4)
+        }
+    }
+
+    struct SmallReadOnly;
+
+    impl Read for SmallReadOnly {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            assert!(output.len() <= 4, "read past remaining byte budget");
+            output.fill(b'x');
+            Ok(output.len())
+        }
+    }
+
+    #[test]
+    fn failed_manifest_reads_charge_bytes_before_parsing_or_retry() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = EncryptedRepository::new(
+            ReadOnlyStorage {
+                reader: || Box::new(PartialThenError(false)),
+            },
+            KeyFile::generate(),
+            temporary.path(),
+        );
+        let mut budget = RecoveryBudget {
+            crypto_operations: 0,
+            bytes_read: 0,
+        };
+        let id = "0".repeat(64);
+        let error = repository
+            .read_manifest_material(&id, &mut budget)
+            .unwrap_err();
+        assert!(error.to_string().contains("interrupted storage read"));
+        assert_eq!(budget.bytes_read, 4);
+
+        budget.bytes_read = MAX_RECOVERY_BYTES - 3;
+        let error = repository
+            .read_manifest_material(&id, &mut budget)
+            .unwrap_err();
+        assert!(error.is::<BudgetExhausted>(), "{error:#}");
+    }
+
+    #[test]
+    fn oversized_manifest_read_charges_the_limit_byte() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = EncryptedRepository::new(
+            ReadOnlyStorage {
+                reader: || Box::new(io::repeat(b'x')),
+            },
+            KeyFile::generate(),
+            temporary.path(),
+        );
+        let mut budget = RecoveryBudget {
+            crypto_operations: 0,
+            bytes_read: 0,
+        };
+        let error = repository
+            .read_manifest_material(&"0".repeat(64), &mut budget)
+            .unwrap_err();
+        assert!(error.to_string().contains("size limit"), "{error:#}");
+        assert_eq!(budget.bytes_read, MAX_MANIFEST_BYTES + 1);
+    }
+
+    #[test]
+    fn manifest_reader_requests_only_remaining_budget_plus_probe() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = EncryptedRepository::new(
+            ReadOnlyStorage {
+                reader: || Box::new(SmallReadOnly),
+            },
+            KeyFile::generate(),
+            temporary.path(),
+        );
+        let mut budget = RecoveryBudget {
+            crypto_operations: 0,
+            bytes_read: MAX_RECOVERY_BYTES - 3,
+        };
+        let error = repository
+            .read_manifest_material(&"0".repeat(64), &mut budget)
+            .unwrap_err();
+        assert!(error.is::<BudgetExhausted>(), "{error:#}");
+        assert_eq!(budget.bytes_read, MAX_RECOVERY_BYTES + 1);
+    }
+
+    #[test]
+    fn recovery_report_escapes_unverified_fields_without_changing_structure() {
+        let report = RecoveryReport {
+            classification: RecoveryClass::Invalid,
+            reason: "bad\n\u{1b}]52;c;payload\u{7}".to_owned(),
+            head_id: None,
+            claimed_signer: Some("device\r\u{1b}[31m".to_owned()),
+            floor_id: None,
+            floor_generation: None,
+            candidates: Vec::new(),
+            default_base: None,
+            replays: Vec::new(),
+            conflict: false,
+            freshness_unverified: false,
+            warning: None,
+            blocked_reason: None,
+            published_manifest: None,
+        }
+        .sanitized();
+        assert_eq!(report.reason, "bad\\n\\u{1b}]52;c;payload\\u{7}");
+        assert_eq!(
+            report.claimed_signer.as_deref(),
+            Some("device\\r\\u{1b}[31m")
+        );
+    }
 
     #[test]
     fn recovery_classification_ignores_storage_controlled_message_text() {

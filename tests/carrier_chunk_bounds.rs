@@ -55,13 +55,13 @@ fn oversized_carrier_chunks_are_rejected_without_being_read() {
         &["init", "--bare", "-q", carrier.to_str().unwrap()],
     );
     let repository = EncryptedRepository::new(
-        GitStorage::open(carrier.to_str().unwrap()).unwrap(),
+        GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
         KeyFile::generate(),
         support::state_dir(),
     );
     repository.initialize("owner").unwrap();
     let (head_id, _) = repository.current_manifest().unwrap();
-    let manifest = GitStorage::open(carrier.to_str().unwrap())
+    let manifest = GitStorage::open_trusted_local(carrier.to_str().unwrap())
         .unwrap()
         .get_object(ObjectKind::Manifest, &head_id)
         .unwrap();
@@ -105,10 +105,10 @@ fn oversized_carrier_chunks_are_rejected_without_being_read() {
     git(&workdir, &["push", "-q", "origin", "main"]);
     fs::remove_dir_all(&workdir).unwrap();
 
-    let storage = GitStorage::open(carrier.to_str().unwrap()).unwrap();
+    let storage = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     let before = peak_resident_bytes();
     let history = storage
-        .recovery_history(2048, 64 * 1024 * 1024)
+        .recovery_history(2048, 64 * 1024 * 1024, 256)
         .unwrap()
         .unwrap();
     let grown = peak_resident_bytes().saturating_sub(before);

@@ -60,6 +60,11 @@ const OWNED_REPOSITORY_CONFIG: &[&str] = &[
     "core.fsmonitor=false",
 ];
 
+#[cfg(windows)]
+const EMPTY_GIT_CONFIG: &str = "NUL";
+#[cfg(not(windows))]
+const EMPTY_GIT_CONFIG: &str = "/dev/null";
+
 /// A Git repository every command names explicitly, with the environment
 /// policy of whoever owns it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -150,17 +155,40 @@ impl GitRepository {
     }
 
     /// A command on this owned repository that talks to the carrier remote.
-    /// Unlike `git()`, it keeps configuration the caller injected with
-    /// `git -c` (proxies, credential helpers, `insteadOf` rewrites), which
-    /// transport needs; the owned-repository overrides are appended after it,
-    /// so they still win for hooks and signing.
-    pub(crate) fn transport(&self) -> Command {
+    /// Network transport keeps injected configuration for credentials and
+    /// proxies. Trusted local transport discards it so URL rewrites cannot
+    /// redirect the opt-in path to a different local hook receiver.
+    pub(crate) fn transport(&self, trusted_local: bool) -> Command {
         debug_assert_eq!(self.owner, Owner::Program);
         let mut command = Command::new("git");
         remove_all(&mut command, REPOSITORY_SELECTION);
         remove_all(&mut command, COMMIT_IDENTITY);
+        if trusted_local {
+            remove_all(&mut command, INJECTED_CONFIG);
+            command.env("GIT_CONFIG_GLOBAL", EMPTY_GIT_CONFIG);
+            command.env("GIT_CONFIG_NOSYSTEM", "1");
+        }
         for setting in OWNED_REPOSITORY_CONFIG {
             command.arg("-c").arg(setting);
+        }
+        command.arg("-c").arg(if trusted_local {
+            "protocol.file.allow=always"
+        } else {
+            "protocol.file.allow=never"
+        });
+        command.arg("-c").arg("protocol.ext.allow=never");
+        if let Some(protocols) = std::env::var_os("GIT_ALLOW_PROTOCOL") {
+            let allowed = protocols.to_str().unwrap_or_default();
+            let mut filtered: Vec<&str> = allowed
+                .split(':')
+                .filter(|protocol| {
+                    !protocol.is_empty() && *protocol != "file" && *protocol != "ext"
+                })
+                .collect();
+            if trusted_local {
+                filtered.push("file");
+            }
+            command.env("GIT_ALLOW_PROTOCOL", filtered.join(":"));
         }
         match &self.location {
             Location::GitDir(path) => command.arg("--git-dir").arg(path),
@@ -187,11 +215,54 @@ impl GitRepository {
             }
             Owner::Program => without_repository(),
         };
+        command.env("GIT_NO_LAZY_FETCH", "1");
         match &self.location {
             Location::GitDir(path) => command.arg("--git-dir").arg(path),
             Location::WorkTree(path) => command.arg("-C").arg(path),
         };
         command
+    }
+
+    /// Partial-clone promisors can receive object IDs during ordinary local
+    /// lookups. This product needs complete local Git objects for inner refs.
+    pub fn ensure_no_promisor(&self) -> Result<()> {
+        let output = self
+            .git()
+            .env_remove("GIT_CONFIG")
+            .args([
+                "config",
+                "--null",
+                "--get-regexp",
+                r"^(extensions\.partialclone|remote\..*\.(promisor|partialclonefilter))$",
+            ])
+            .output()?;
+        if output.status.code() == Some(1) && output.stdout.is_empty() {
+            return Ok(());
+        }
+        if !output.status.success() {
+            bail!("could not check Git partial-clone configuration")
+        }
+        for entry in output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+        {
+            let Some(separator) = entry.iter().position(|byte| *byte == b'\n') else {
+                bail!("invalid Git partial-clone configuration output")
+            };
+            let key = std::str::from_utf8(&entry[..separator])?;
+            let value = std::str::from_utf8(&entry[separator + 1..])?;
+            if key == "extensions.partialclone"
+                || key.ends_with(".partialclonefilter")
+                || !matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "" | "false" | "no" | "off" | "0"
+                )
+            {
+                bail!("partial-clone promisor repositories are unsupported")
+            }
+        }
+        Ok(())
     }
 }
 
@@ -202,6 +273,7 @@ pub(crate) fn without_repository() -> Command {
     remove_all(&mut command, REPOSITORY_SELECTION);
     remove_all(&mut command, INJECTED_CONFIG);
     remove_all(&mut command, COMMIT_IDENTITY);
+    command.env("GIT_TEMPLATE_DIR", "");
     for setting in OWNED_REPOSITORY_CONFIG {
         command.arg("-c").arg(setting);
     }

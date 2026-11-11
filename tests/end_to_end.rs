@@ -90,6 +90,7 @@ impl Storage for OverBudgetHistoryStorage {
         &self,
         max_commits: usize,
         _max_manifest_bytes: u64,
+        _max_candidates: usize,
     ) -> Result<Option<RecoveryHistory>> {
         Ok(Some(RecoveryHistory {
             commits: (0..=max_commits)
@@ -99,6 +100,7 @@ impl Storage for OverBudgetHistoryStorage {
                 })
                 .collect(),
             manifests: Default::default(),
+            manifest_bytes_read: 0,
         }))
     }
 }
@@ -132,6 +134,7 @@ impl Storage for FixedHistoryStorage {
         &self,
         _max_commits: usize,
         _max_manifest_bytes: u64,
+        _max_candidates: usize,
     ) -> Result<Option<RecoveryHistory>> {
         Ok(Some(RecoveryHistory {
             commits: self
@@ -144,6 +147,7 @@ impl Storage for FixedHistoryStorage {
                 })
                 .collect(),
             manifests: self.manifests.clone(),
+            manifest_bytes_read: self.manifests.values().map(Vec::len).sum::<usize>() as u64,
         }))
     }
 }
@@ -558,6 +562,100 @@ fn pushes_incrementally_and_fetches_into_another_repository() {
 }
 
 #[test]
+fn library_fetch_preserves_existing_local_tags_and_symbolic_targets() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let destination = temporary.path().join("destination");
+    initialize_git(&source);
+    initialize_git(&destination);
+    let remote_commit = commit(&source, "remote\n", "remote");
+    git(&source, &["tag", "v1"]);
+    let local_commit = commit(&destination, "local\n", "local");
+    git(&destination, &["tag", "v1"]);
+
+    let encrypted = EncryptedRepository::new(
+        FilesystemStorage::new(temporary.path().join("remote")),
+        KeyFile::generate(),
+        support::state_dir(),
+    );
+    encrypted.initialize("owner").unwrap();
+    encrypted
+        .push_ref(
+            &GitRepository::open(&source).unwrap(),
+            "refs/tags/v1",
+            RefChange::Update {
+                source: "refs/tags/v1",
+                force: false,
+            },
+        )
+        .unwrap();
+    let destination_repo = GitRepository::open(&destination).unwrap();
+    let error = encrypted
+        .fetch_into(&destination_repo, "encrypted")
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("local tag refs/tags/v1"),
+        "{error:#}"
+    );
+    assert_eq!(
+        git(&destination, &["rev-parse", "refs/tags/v1"]),
+        local_commit
+    );
+
+    git(&destination, &["tag", "-d", "v1"]);
+    encrypted
+        .fetch_into(&destination_repo, "encrypted")
+        .unwrap();
+    assert_eq!(
+        git(&destination, &["rev-parse", "refs/tags/v1"]),
+        remote_commit
+    );
+    encrypted
+        .fetch_into(&destination_repo, "encrypted")
+        .unwrap();
+
+    git(&destination, &["tag", "-d", "v1"]);
+    git(
+        &destination,
+        &["symbolic-ref", "refs/tags/v1", "refs/heads/main"],
+    );
+    git(
+        &destination,
+        &["update-ref", "refs/heads/main", &remote_commit],
+    );
+    let error = encrypted
+        .fetch_into(&destination_repo, "encrypted")
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("local tag refs/tags/v1 is symbolic"),
+        "{error:#}"
+    );
+    assert_eq!(
+        git(&destination, &["symbolic-ref", "refs/tags/v1"]),
+        "refs/heads/main"
+    );
+
+    git(
+        &destination,
+        &["update-ref", "refs/heads/main", &local_commit],
+    );
+    let error = encrypted
+        .fetch_into(&destination_repo, "encrypted")
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("local tag refs/tags/v1"),
+        "{error:#}"
+    );
+    assert_eq!(git(&destination, &["rev-parse", "main"]), local_commit);
+    assert_eq!(
+        git(&destination, &["symbolic-ref", "refs/tags/v1"]),
+        "refs/heads/main"
+    );
+}
+
+#[test]
 fn missing_pack_observation_does_not_advance_import_progress() {
     let temporary = tempfile::tempdir().unwrap();
     let source = temporary.path().join("source");
@@ -626,6 +724,76 @@ fn missing_pack_observation_does_not_advance_import_progress() {
     assert_eq!(fetched.generation, 2);
     assert_eq!(machine_floor(&destination)["generation"], 2);
     assert_eq!(progress(&destination)["imported_generation"], 2);
+}
+
+#[test]
+fn authenticated_revocation_is_pinned_even_when_an_earlier_pack_is_missing() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let destination = temporary.path().join("destination");
+    let remote = temporary.path().join("remote");
+    initialize_git(&source);
+    initialize_git(&destination);
+
+    let owner = KeyFile::generate();
+    let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
+    let storage = FilesystemStorage::new(&remote);
+    let writer = EncryptedRepository::new(
+        storage.clone(),
+        owner.clone(),
+        temporary.path().join("writer-state"),
+    );
+    writer.initialize("owner").unwrap();
+    writer
+        .add_device(
+            reader.public_device().unwrap(),
+            "reader",
+            DeviceRoles::reader(),
+        )
+        .unwrap();
+    commit(&source, "content before revocation\n", "content");
+    writer
+        .push_ref(
+            &GitRepository::open(&source).unwrap(),
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
+        .unwrap();
+    let (pre_revocation, manifest) = writer.current_manifest().unwrap();
+    let pack_id = &manifest.new_packs[0].id;
+
+    let verify_state = temporary.path().join("verify-state");
+    let import_state = temporary.path().join("import-state");
+    let verifier = EncryptedRepository::new(storage.clone(), owner.clone(), verify_state.clone());
+    let importer = EncryptedRepository::new(storage, owner, import_state.clone());
+    assert_eq!(verifier.current_manifest().unwrap().0, pre_revocation);
+    assert_eq!(importer.current_manifest().unwrap().0, pre_revocation);
+
+    writer.revoke_device(&reader.device_id().unwrap()).unwrap();
+    let (revocation, _) = writer.current_manifest().unwrap();
+    fs::remove_file(remote.join("packs").join(&pack_id[..2]).join(pack_id)).unwrap();
+
+    assert!(verifier.verify_ciphertext().is_err());
+    assert!(
+        importer
+            .import_packs(&GitRepository::open(&destination).unwrap())
+            .is_err()
+    );
+    for state in [&verify_state, &import_state] {
+        let floor: serde_json::Value = serde_json::from_slice(
+            &fs::read(state.join(&reader.repository_root).join("continuity.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(floor["head_id"], revocation);
+    }
+    assert!(!state_dir(&destination).join("progress.json").exists());
+
+    fs::write(remote.join("HEAD"), format!("{pre_revocation}\n")).unwrap();
+    assert!(verifier.current_manifest().is_err());
+    assert!(importer.current_manifest().is_err());
 }
 
 #[test]
@@ -826,6 +994,65 @@ fn a_signed_ref_that_is_not_an_object_id_is_rejected_before_git_resolves_it() {
 }
 
 #[test]
+fn rejected_head_evidence_escapes_controls_from_an_invalid_signed_ref() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let remote = temporary.path().join("remote");
+    initialize_git(&source);
+    let key = KeyFile::generate();
+    let repository = EncryptedRepository::new(
+        FilesystemStorage::new(&remote),
+        key.clone(),
+        support::state_dir(),
+    );
+    repository.initialize("owner").unwrap();
+    repository
+        .fetch_into(&GitRepository::open(&source).unwrap(), "e2ee")
+        .unwrap();
+    publish_signed_main_target(&remote, &key, "refs/heads/bad\u{1b}]52;c;payload\u{7}");
+    let old = serde_json::json!({
+        "format_version": 1,
+        "entries": [{
+            "head_id": "a".repeat(64),
+            "classification": "invalid",
+            "reason": "old\u{1b}]52;c;payload\u{7}"
+        }]
+    });
+    fs::write(
+        state_dir(&source).join("rejected-heads.json"),
+        serde_json::to_vec(&old).unwrap(),
+    )
+    .unwrap();
+
+    let report = repository
+        .recover(
+            &GitRepository::open(&source).unwrap(),
+            RecoveryOptions {
+                publish: false,
+                base: None,
+                discard_newer: false,
+                accept_stale_floor: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(report.classification, RecoveryClass::Invalid);
+    assert!(report.reason.contains("\\u{1b}"), "{}", report.reason);
+    assert!(!report.reason.contains(['\u{1b}', '\u{7}']));
+    let evidence: serde_json::Value =
+        serde_json::from_slice(&fs::read(state_dir(&source).join("rejected-heads.json")).unwrap())
+            .unwrap();
+    let reason = evidence["entries"][0]["reason"].as_str().unwrap();
+    assert!(reason.contains("\\u{1b}"), "{reason}");
+    assert!(!reason.contains(['\u{1b}', '\u{7}']));
+    assert_eq!(evidence["entries"].as_array().unwrap().len(), 2);
+    for entry in evidence["entries"].as_array().unwrap() {
+        let reason = entry["reason"].as_str().unwrap();
+        assert!(reason.contains("\\u{1b}"), "{reason}");
+        assert!(!reason.contains(['\u{1b}', '\u{7}']));
+    }
+}
+
+#[test]
 fn storage_cannot_rename_a_signed_head_by_re_encoding_it() {
     let temporary = tempfile::tempdir().unwrap();
     let source = temporary.path().join("source");
@@ -879,7 +1106,7 @@ fn storage_cannot_rename_a_signed_head_by_re_encoding_it() {
 }
 
 #[test]
-fn returning_client_rejects_signed_ref_advance_without_its_pack() {
+fn signed_unreachable_ref_is_rejected_after_pinning_its_manifest() {
     let temporary = tempfile::tempdir().unwrap();
     let source = temporary.path().join("source");
     let destination = temporary.path().join("destination");
@@ -918,8 +1145,100 @@ fn returning_client_rejects_signed_ref_advance_without_its_pack() {
         error.contains("does not resolve") || error.contains("missing Git objects"),
         "unexpected connectivity error: {error}"
     );
-    assert_eq!(machine_floor(&destination)["generation"], 1);
+    assert_eq!(machine_floor(&destination)["generation"], 2);
     assert_eq!(progress(&destination)["imported_generation"], 1);
+}
+
+#[test]
+fn ordinary_manifest_reads_bound_unauthorized_chain_work() {
+    let temporary = tempfile::tempdir().unwrap();
+    let owner = KeyFile::generate();
+    let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
+    let storage = FilesystemStorage::new(temporary.path().join("remote"));
+    let writer = EncryptedRepository::new(
+        storage.clone(),
+        owner.clone(),
+        temporary.path().join("writer-state"),
+    );
+    writer.initialize("owner").unwrap();
+    writer
+        .add_device(
+            reader.public_device().unwrap(),
+            "reader",
+            DeviceRoles::reader(),
+        )
+        .unwrap();
+    let (mut previous, base) = writer.current_manifest().unwrap();
+    let sealed_base = storage.get_object(ObjectKind::Manifest, &previous).unwrap();
+    let mut previous_key =
+        unwrap_generation_key(&peek_manifest_header(&sealed_base).unwrap(), &reader).unwrap();
+    let opened_base = open_manifest(&sealed_base, &previous_key).unwrap();
+    let policy =
+        PolicyState::parse(opened_base.manifest().introduced_policy.as_deref().unwrap()).unwrap();
+
+    let observer_state = temporary.path().join("observer-state");
+    let observer = EncryptedRepository::new(storage.clone(), owner.clone(), &observer_state);
+    assert_eq!(observer.current_manifest().unwrap().0, previous);
+    let floor_path = observer_state
+        .join(&owner.repository_root)
+        .join("continuity.json");
+    let original_floor = fs::read(&floor_path).unwrap();
+
+    for generation in (base.generation + 1)..=(base.generation + 5) {
+        let key = random_key();
+        let manifest = Manifest {
+            format_version: base.format_version,
+            repository_root: base.repository_root.clone(),
+            generation,
+            previous: Some(previous.clone()),
+            policy_id: base.policy_id.clone(),
+            policy_generation: base.policy_generation,
+            authorization: ManifestAuthorization::Writer,
+            total_pack_count: base.total_pack_count,
+            refs: BTreeMap::from([("refs/heads/main".to_owned(), "x".repeat(11 * 1024 * 1024))]),
+            new_packs: Vec::new(),
+            predecessor_key_wrap: Some(
+                wrap_predecessor_key(
+                    &key,
+                    &previous_key,
+                    &owner.repository_root,
+                    generation,
+                    &previous,
+                )
+                .unwrap(),
+            ),
+            introduced_policy: None,
+        };
+        let sealed = seal_manifest(
+            &reader,
+            &policy,
+            &key,
+            ManifestAuthorization::Writer,
+            manifest,
+        )
+        .unwrap();
+        assert!(sealed.len() < 16 * 1024 * 1024);
+        let next = object_id(&sealed);
+        storage
+            .put_object_if_absent(ObjectKind::Manifest, &next, &sealed)
+            .unwrap();
+        storage
+            .compare_and_swap_head(Some(&previous), &next)
+            .unwrap();
+        previous = next;
+        previous_key = key;
+    }
+
+    let error = observer.current_manifest().unwrap_err();
+    assert!(
+        format!("{error:#}").contains("manifest chain byte budget exhausted"),
+        "ordinary manifest read did not stop at the chain budget"
+    );
+    assert_eq!(
+        storage.read_head().unwrap().as_deref(),
+        Some(previous.as_str())
+    );
+    assert_eq!(fs::read(floor_path).unwrap(), original_floor);
 }
 
 #[test]
@@ -1304,7 +1623,7 @@ fn detects_tampered_pack_ciphertext() {
 }
 
 #[test]
-fn late_stream_authentication_failure_does_not_advance_refs_or_pins() {
+fn late_stream_authentication_failure_pins_the_head_but_not_refs_or_progress() {
     let temporary = tempfile::tempdir().unwrap();
     let source = temporary.path().join("source");
     let destination = temporary.path().join("destination");
@@ -1326,12 +1645,21 @@ fn late_stream_authentication_failure_does_not_advance_refs_or_pins() {
     git(&source, &["commit", "-q", "-m", "large"]);
 
     let key = KeyFile::generate();
+    let root = key.repository_root.clone();
     let encrypted = EncryptedRepository::new(
         FilesystemStorage::new(&remote_path),
-        key,
+        key.clone(),
         support::state_dir(),
     );
     encrypted.initialize("owner").unwrap();
+    let genesis = encrypted.current_manifest().unwrap().0;
+    let observer_state = temporary.path().join("observer-state");
+    let observer = EncryptedRepository::new(
+        FilesystemStorage::new(&remote_path),
+        key,
+        observer_state.clone(),
+    );
+    assert_eq!(observer.current_manifest().unwrap().0, genesis);
     encrypted
         .push_ref(
             &GitRepository::open(&source).unwrap(),
@@ -1342,7 +1670,7 @@ fn late_stream_authentication_failure_does_not_advance_refs_or_pins() {
             },
         )
         .unwrap();
-    let manifest = encrypted.current_manifest().unwrap().1;
+    let (head, manifest) = encrypted.current_manifest().unwrap();
     let id = &manifest.new_packs[0].id;
     let path = remote_path.join("packs").join(&id[..2]).join(id);
     let mut bytes = fs::read(&path).unwrap();
@@ -1352,10 +1680,15 @@ fn late_stream_authentication_failure_does_not_advance_refs_or_pins() {
     fs::write(path, bytes).unwrap();
 
     assert!(
-        encrypted
+        observer
             .fetch_into(&GitRepository::open(&destination).unwrap(), "encrypted")
             .is_err()
     );
+    let floor: serde_json::Value = serde_json::from_slice(
+        &fs::read(observer_state.join(root).join("continuity.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(floor["head_id"], head);
     assert!(!state_dir(&destination).join("progress.json").exists());
     let output = Command::new("git")
         .arg("-C")
@@ -1364,6 +1697,8 @@ fn late_stream_authentication_failure_does_not_advance_refs_or_pins() {
         .output()
         .unwrap();
     assert!(!output.status.success());
+    fs::write(remote_path.join("HEAD"), format!("{genesis}\n")).unwrap();
+    assert!(observer.current_manifest().is_err());
 }
 
 #[test]
@@ -1470,6 +1805,95 @@ fn rejects_same_generation_manifest_fork_after_fetch_pins_history() {
         .fetch_into(&GitRepository::open(&destination).unwrap(), "encrypted")
         .unwrap_err();
     assert!(error.to_string().contains("history forked"));
+}
+
+#[test]
+fn recovery_pins_an_authenticated_revocation_even_when_a_pack_is_missing() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let destination = temporary.path().join("destination");
+    let remote = temporary.path().join("remote");
+    initialize_git(&source);
+    initialize_git(&destination);
+
+    let owner = KeyFile::generate();
+    let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
+    let storage = FilesystemStorage::new(&remote);
+    let writer = EncryptedRepository::new(
+        storage.clone(),
+        owner.clone(),
+        temporary.path().join("writer-state"),
+    );
+    writer.initialize("owner").unwrap();
+    writer
+        .add_device(
+            reader.public_device().unwrap(),
+            "reader",
+            DeviceRoles::reader(),
+        )
+        .unwrap();
+    commit(&source, "before revocation\n", "content");
+    writer
+        .push_ref(
+            &GitRepository::open(&source).unwrap(),
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
+        .unwrap();
+    let (old_head, old_manifest) = writer.current_manifest().unwrap();
+    let pack_id = &old_manifest.new_packs[0].id;
+
+    let valid_state = temporary.path().join("valid-state");
+    let missing_state = temporary.path().join("missing-state");
+    let valid_observer =
+        EncryptedRepository::new(storage.clone(), owner.clone(), valid_state.clone());
+    let missing_observer = EncryptedRepository::new(storage.clone(), owner, missing_state.clone());
+    assert_eq!(valid_observer.current_manifest().unwrap().0, old_head);
+    assert_eq!(missing_observer.current_manifest().unwrap().0, old_head);
+
+    writer.revoke_device(&reader.device_id().unwrap()).unwrap();
+    let (revocation, manifest) = writer.current_manifest().unwrap();
+    let report = valid_observer
+        .recover(
+            &GitRepository::open(&destination).unwrap(),
+            RecoveryOptions {
+                publish: false,
+                base: None,
+                discard_newer: false,
+                accept_stale_floor: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(report.classification, RecoveryClass::Valid);
+    assert_eq!(report.floor_id.as_deref(), Some(revocation.as_str()));
+    assert_eq!(report.floor_generation, Some(manifest.generation));
+
+    fs::remove_file(remote.join("packs").join(&pack_id[..2]).join(pack_id)).unwrap();
+    let report = missing_observer
+        .recover(
+            &GitRepository::open(&destination).unwrap(),
+            RecoveryOptions {
+                publish: false,
+                base: None,
+                discard_newer: false,
+                accept_stale_floor: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(report.classification, RecoveryClass::Unavailable);
+    assert_eq!(report.floor_id.as_deref(), Some(revocation.as_str()));
+    assert_eq!(report.floor_generation, Some(manifest.generation));
+    assert_eq!(
+        storage.read_head().unwrap().as_deref(),
+        Some(revocation.as_str())
+    );
+
+    fs::write(remote.join("HEAD"), format!("{old_head}\n")).unwrap();
+    assert!(valid_observer.current_manifest().is_err());
+    assert!(missing_observer.current_manifest().is_err());
 }
 
 #[test]
