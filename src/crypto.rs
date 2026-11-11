@@ -24,6 +24,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+use crate::bounded::{self, Bounded};
 use crate::error::Unsupported;
 use crate::trace;
 
@@ -36,6 +37,7 @@ const SYNTHETIC_NONCE_SALT: &[u8] = domain!("synthetic nonce");
 pub const HPKE_ENCAPSULATED_KEY_SIZE: usize = 32;
 pub const HPKE_CIPHERTEXT_SIZE: usize = 32 + 16;
 pub const PACK_STREAM_CHUNK_SIZE: usize = 1024 * 1024;
+const MAX_PUBLIC_DEVICE_FILE_BYTES: u64 = 4 * 1024;
 const PACK_STREAM_NONCE_SIZE: usize = 19;
 const PACK_STREAM_TAG_SIZE: usize = 16;
 const PACK_STREAM_HEADER_SIZE: usize = PACK_STREAM_MAGIC.len() + 4 + PACK_STREAM_NONCE_SIZE;
@@ -231,8 +233,22 @@ impl PublicDevice {
     }
 
     pub fn read(path: &Path) -> Result<Self> {
-        let bytes = fs::read(path)
-            .with_context(|| format!("read public device file {}", path.display()))?;
+        let bytes = match bounded::read_regular_bounded(path, MAX_PUBLIC_DEVICE_FILE_BYTES)
+            .with_context(|| format!("read public device file {}", path.display()))?
+        {
+            Bounded::Within(bytes) => bytes,
+            Bounded::Absent => bail!("public device file {} does not exist", path.display()),
+            Bounded::Oversized => bail!(
+                "public device file {} exceeds {MAX_PUBLIC_DEVICE_FILE_BYTES} bytes",
+                path.display()
+            ),
+            Bounded::NotRegular => {
+                bail!(
+                    "public device file {} is not a regular file",
+                    path.display()
+                )
+            }
+        };
         let public: Self = serde_json::from_slice(&bytes).context("parse public device file")?;
         validate_public_device(&public)?;
         Ok(public)
@@ -772,6 +788,44 @@ fn validate_root(root: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn public_device_reader_bounds_received_files() {
+        let temporary = tempfile::tempdir().unwrap();
+        let public = KeyFile::generate().public_device().unwrap();
+        let path = temporary.path().join("device.public.json");
+        public.write_new(&path).unwrap();
+        assert_eq!(PublicDevice::read(&path).unwrap(), public);
+
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.resize(MAX_PUBLIC_DEVICE_FILE_BYTES as usize, b' ');
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(PublicDevice::read(&path).unwrap(), public);
+
+        bytes.push(b' ');
+        fs::write(&path, &bytes).unwrap();
+        let error = PublicDevice::read(&path).unwrap_err();
+        assert!(format!("{error:#}").contains("exceeds 4096 bytes"));
+
+        #[cfg(unix)]
+        {
+            let link = temporary.path().join("device-link.json");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            let error = PublicDevice::read(&link).unwrap_err();
+            assert!(format!("{error:#}").contains("not a regular file"));
+
+            let fifo = temporary.path().join("device-pipe.json");
+            assert!(
+                std::process::Command::new("mkfifo")
+                    .arg(&fifo)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let error = PublicDevice::read(&fifo).unwrap_err();
+            assert!(format!("{error:#}").contains("not a regular file"));
+        }
+    }
 
     #[test]
     fn dummy_envelopes_look_like_real_x25519_encapsulations() {

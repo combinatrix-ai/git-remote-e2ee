@@ -153,8 +153,9 @@ The helper saves the path as `remote.origin.e2ee-key` in the new clone. Later
 ## Add a second device
 
 Each device has its own private key, and only the small public device file ever
-leaves it. If machine A created the repository, set up machine B like this.
-Substitute the repository root printed by A's `keygen`.
+leaves it. The reader accepts at most 4 KiB of regular-file content. If machine
+A created the repository, set up machine B like this. Substitute the repository
+root printed by A's `keygen`.
 
 ```console
 # Machine B
