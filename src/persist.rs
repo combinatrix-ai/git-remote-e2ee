@@ -73,6 +73,26 @@ pub(crate) fn replace_file_durably(
     name: &str,
     contents: &[u8],
 ) -> Result<(), ReplaceError> {
+    replace_file_durably_with_mode(directory, name, contents, false)
+}
+
+/// The continuity floor is local security state, so new replacement files
+/// need owner-only permissions even under a permissive process umask.
+#[cfg(unix)]
+pub(crate) fn replace_private_file_durably(
+    directory: &Path,
+    name: &str,
+    contents: &[u8],
+) -> Result<(), ReplaceError> {
+    replace_file_durably_with_mode(directory, name, contents, true)
+}
+
+fn replace_file_durably_with_mode(
+    directory: &Path,
+    name: &str,
+    contents: &[u8],
+    private: bool,
+) -> Result<(), ReplaceError> {
     let directory = if directory.as_os_str().is_empty() {
         Path::new(".")
     } else {
@@ -92,11 +112,16 @@ pub(crate) fn replace_file_durably(
     let mut random = [0_u8; 8];
     OsRng.fill_bytes(&mut random);
     let temporary = directory.join(format!(".{name}.{}.tmp", hex::encode(random)));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .map_err(not_published)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = private;
+    let mut file = options.open(&temporary).map_err(not_published)?;
     let staged = (|| {
         file.write_all(contents)?;
         file.sync_all()?;
