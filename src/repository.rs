@@ -313,17 +313,20 @@ impl<S: Storage> EncryptedRepository<S> {
     /// floor after this storage view was opened, so a view that fails the
     /// floor is refreshed once before the failure counts as a rollback.
     fn pinned_chain(&self, floor: &FloorGuard) -> Result<Vec<OpenedState>> {
-        let floor = floor.read()?;
+        let pinned = floor.read()?;
         let chain = self.current_chain()?;
-        match validate_pinned_head(&chain, floor.as_ref()) {
-            Ok(()) => Ok(chain),
-            Err(error) if !self.storage.refresh()? => Err(error),
+        let chain = match validate_pinned_head(&chain, pinned.as_ref()) {
+            Ok(()) => chain,
+            Err(error) if !self.storage.refresh()? => return Err(error),
             Err(_) => {
                 let chain = self.current_chain()?;
-                validate_pinned_head(&chain, floor.as_ref())?;
-                Ok(chain)
+                validate_pinned_head(&chain, pinned.as_ref())?;
+                chain
             }
-        }
+        };
+        let head = chain.first().context("manifest chain is empty")?;
+        floor.advance(ContinuityFloor::at(&head.id, &head.manifest))?;
+        Ok(chain)
     }
 
     /// Publishes the genesis head and pins it on this machine. The error says
@@ -476,7 +479,6 @@ impl<S: Storage> EncryptedRepository<S> {
             .into_iter()
             .next()
             .context("manifest chain is empty")?;
-        floor.advance(ContinuityFloor::at(&current.id, &current.manifest))?;
         Ok(current)
     }
 
@@ -542,7 +544,6 @@ impl<S: Storage> EncryptedRepository<S> {
         }
 
         let publication = if mode == PushMode::DryRun || next_refs == current.manifest.refs {
-            floor.advance(ContinuityFloor::at(&current.id, &current.manifest))?;
             Ok(current.id.clone())
         } else {
             self.publish_refs(repo, &mut objects, &floor, &current, next_refs, &pack_refs)
@@ -669,7 +670,6 @@ impl<S: Storage> EncryptedRepository<S> {
         let checkout = self.open_checkout(repo)?;
         let chain = self.pinned_chain(&floor)?;
         let current = chain.first().context("manifest chain is empty")?;
-        floor.advance(ContinuityFloor::at(&current.id, &current.manifest))?;
         // Git skips the helper's fetch command when every advertised object is
         // already local, for example after a membership change, a deletion, or
         // a tag that points at an existing object. Record the import here only
@@ -707,7 +707,6 @@ impl<S: Storage> EncryptedRepository<S> {
             git::ensure_refs_connected_since(repo, &current.manifest.refs, &BTreeMap::new())?;
         }
         drop(connectivity_timer);
-        floor.advance(ContinuityFloor::at(&current.id, &current.manifest))?;
         checkout.write(CheckoutProgress {
             format_version: CHECKOUT_PROGRESS_FORMAT,
             imported_generation: Some(current.manifest.generation),
@@ -789,7 +788,6 @@ impl<S: Storage> EncryptedRepository<S> {
         if count != current.manifest.total_pack_count {
             bail!("manifest delta log pack count mismatch")
         }
-        floor.advance(ContinuityFloor::at(&current.id, &current.manifest))?;
         Ok(current.manifest.clone())
     }
 

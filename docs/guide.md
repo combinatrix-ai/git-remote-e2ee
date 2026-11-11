@@ -65,9 +65,14 @@ paths so the floor cannot change with the working directory. `git fetch`,
 head against this floor and then advance it, so once anything on this machine
 has seen a state, storage cannot show an older one. For example, after
 `device-revoke` no checkout on this machine will push onto a replayed
-pre-revocation state, even one that never fetched the revocation. Moving or
-renaming the key file, renaming a Git remote, or adding a second remote or
-clone for the same repository keeps the floor. Every remote for one
+pre-revocation state, even one that never fetched the revocation.
+
+An authenticated newer head advances the floor even if a required encrypted
+pack is missing and the fetch or verification then fails. Restore the missing
+pack before retrying; the older head remains rejected.
+
+Moving or renaming the key file, renaming a Git remote, or adding a second
+remote or clone for the same repository keeps the floor. Every remote for one
 repository root shares it, so a mirror that lags behind the newest state you
 have seen is reported as rolled back. Back up that file together with the key.
 

@@ -629,6 +629,76 @@ fn missing_pack_observation_does_not_advance_import_progress() {
 }
 
 #[test]
+fn authenticated_revocation_is_pinned_even_when_an_earlier_pack_is_missing() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let destination = temporary.path().join("destination");
+    let remote = temporary.path().join("remote");
+    initialize_git(&source);
+    initialize_git(&destination);
+
+    let owner = KeyFile::generate();
+    let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
+    let storage = FilesystemStorage::new(&remote);
+    let writer = EncryptedRepository::new(
+        storage.clone(),
+        owner.clone(),
+        temporary.path().join("writer-state"),
+    );
+    writer.initialize("owner").unwrap();
+    writer
+        .add_device(
+            reader.public_device().unwrap(),
+            "reader",
+            DeviceRoles::reader(),
+        )
+        .unwrap();
+    commit(&source, "content before revocation\n", "content");
+    writer
+        .push_ref(
+            &GitRepository::open(&source).unwrap(),
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
+        .unwrap();
+    let (pre_revocation, manifest) = writer.current_manifest().unwrap();
+    let pack_id = &manifest.new_packs[0].id;
+
+    let verify_state = temporary.path().join("verify-state");
+    let import_state = temporary.path().join("import-state");
+    let verifier = EncryptedRepository::new(storage.clone(), owner.clone(), verify_state.clone());
+    let importer = EncryptedRepository::new(storage, owner, import_state.clone());
+    assert_eq!(verifier.current_manifest().unwrap().0, pre_revocation);
+    assert_eq!(importer.current_manifest().unwrap().0, pre_revocation);
+
+    writer.revoke_device(&reader.device_id().unwrap()).unwrap();
+    let (revocation, _) = writer.current_manifest().unwrap();
+    fs::remove_file(remote.join("packs").join(&pack_id[..2]).join(pack_id)).unwrap();
+
+    assert!(verifier.verify_ciphertext().is_err());
+    assert!(
+        importer
+            .import_packs(&GitRepository::open(&destination).unwrap())
+            .is_err()
+    );
+    for state in [&verify_state, &import_state] {
+        let floor: serde_json::Value = serde_json::from_slice(
+            &fs::read(state.join(&reader.repository_root).join("continuity.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(floor["head_id"], revocation);
+    }
+    assert!(!state_dir(&destination).join("progress.json").exists());
+
+    fs::write(remote.join("HEAD"), format!("{pre_revocation}\n")).unwrap();
+    assert!(verifier.current_manifest().is_err());
+    assert!(importer.current_manifest().is_err());
+}
+
+#[test]
 fn successful_own_publication_advances_the_client_floor() {
     let temporary = tempfile::tempdir().unwrap();
     let source = temporary.path().join("source");
@@ -879,7 +949,7 @@ fn storage_cannot_rename_a_signed_head_by_re_encoding_it() {
 }
 
 #[test]
-fn returning_client_rejects_signed_ref_advance_without_its_pack() {
+fn signed_unreachable_ref_is_rejected_after_pinning_its_manifest() {
     let temporary = tempfile::tempdir().unwrap();
     let source = temporary.path().join("source");
     let destination = temporary.path().join("destination");
@@ -918,7 +988,7 @@ fn returning_client_rejects_signed_ref_advance_without_its_pack() {
         error.contains("does not resolve") || error.contains("missing Git objects"),
         "unexpected connectivity error: {error}"
     );
-    assert_eq!(machine_floor(&destination)["generation"], 1);
+    assert_eq!(machine_floor(&destination)["generation"], 2);
     assert_eq!(progress(&destination)["imported_generation"], 1);
 }
 
@@ -1304,7 +1374,7 @@ fn detects_tampered_pack_ciphertext() {
 }
 
 #[test]
-fn late_stream_authentication_failure_does_not_advance_refs_or_pins() {
+fn late_stream_authentication_failure_pins_the_head_but_not_refs_or_progress() {
     let temporary = tempfile::tempdir().unwrap();
     let source = temporary.path().join("source");
     let destination = temporary.path().join("destination");
@@ -1326,12 +1396,21 @@ fn late_stream_authentication_failure_does_not_advance_refs_or_pins() {
     git(&source, &["commit", "-q", "-m", "large"]);
 
     let key = KeyFile::generate();
+    let root = key.repository_root.clone();
     let encrypted = EncryptedRepository::new(
         FilesystemStorage::new(&remote_path),
-        key,
+        key.clone(),
         support::state_dir(),
     );
     encrypted.initialize("owner").unwrap();
+    let genesis = encrypted.current_manifest().unwrap().0;
+    let observer_state = temporary.path().join("observer-state");
+    let observer = EncryptedRepository::new(
+        FilesystemStorage::new(&remote_path),
+        key,
+        observer_state.clone(),
+    );
+    assert_eq!(observer.current_manifest().unwrap().0, genesis);
     encrypted
         .push_ref(
             &GitRepository::open(&source).unwrap(),
@@ -1342,7 +1421,7 @@ fn late_stream_authentication_failure_does_not_advance_refs_or_pins() {
             },
         )
         .unwrap();
-    let manifest = encrypted.current_manifest().unwrap().1;
+    let (head, manifest) = encrypted.current_manifest().unwrap();
     let id = &manifest.new_packs[0].id;
     let path = remote_path.join("packs").join(&id[..2]).join(id);
     let mut bytes = fs::read(&path).unwrap();
@@ -1352,10 +1431,15 @@ fn late_stream_authentication_failure_does_not_advance_refs_or_pins() {
     fs::write(path, bytes).unwrap();
 
     assert!(
-        encrypted
+        observer
             .fetch_into(&GitRepository::open(&destination).unwrap(), "encrypted")
             .is_err()
     );
+    let floor: serde_json::Value = serde_json::from_slice(
+        &fs::read(observer_state.join(root).join("continuity.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(floor["head_id"], head);
     assert!(!state_dir(&destination).join("progress.json").exists());
     let output = Command::new("git")
         .arg("-C")
@@ -1364,6 +1448,8 @@ fn late_stream_authentication_failure_does_not_advance_refs_or_pins() {
         .output()
         .unwrap();
     assert!(!output.status.success());
+    fs::write(remote_path.join("HEAD"), format!("{genesis}\n")).unwrap();
+    assert!(observer.current_manifest().is_err());
 }
 
 #[test]
