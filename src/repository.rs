@@ -376,6 +376,8 @@ impl<S: Storage> EncryptedRepository<S> {
         Ok((floor, genesis, id))
     }
 
+    /// Adds a device after the caller has authenticated its `device_id` with
+    /// the device owner through a channel separate from the public record.
     pub fn add_device(
         &self,
         public: PublicDevice,

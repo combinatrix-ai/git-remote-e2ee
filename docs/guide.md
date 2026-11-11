@@ -164,10 +164,16 @@ git-e2ee device-export \
   --key ~/.config/git-e2ee/keys/<repository-root>.json \
   --output machine-b.public.json
 
-# Machine A, inside its clone, after receiving only machine-b.public.json
-git-e2ee device-add origin machine-b.public.json --label machine-b
+# Machine B: tell A the full device ID printed by device-export through a
+# separate authenticated channel.
+
+# Machine A, inside its clone, after receiving machine-b.public.json and its ID
+git-e2ee device-add origin machine-b.public.json \
+  --expected-device-id <machine-b-device-id> --role write --label machine-b
 ```
 
+The expected ID must come from machine B over a separately authenticated
+channel; copying it from the received JSON does not detect a substituted file.
 `--label` is required. It names the device in `device-list` and is stored in
 the policy, which travels only inside the encrypted manifest body. A label is
 1 to 64 bytes of UTF-8 with no leading or trailing whitespace and no control
@@ -189,8 +195,8 @@ Machine B can then clone with its own key, as shown above.
 
 `device-add --role` grants one of three roles: `read` can clone, fetch, and
 pull; `write` adds push access; and `admin` also allows device membership
-changes. The default is `write`. For example, add a read-only device with
-`--role read`.
+changes. The role must be chosen explicitly. Use `--role read` for a device
+that does not need to push.
 
 `device-list` prints one line per device, current and revoked, and marks the
 device whose key you used with `*`:

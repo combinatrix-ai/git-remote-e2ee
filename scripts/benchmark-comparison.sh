@@ -278,10 +278,14 @@ repository_root=$(sed -n 's/^[[:space:]]*"repository_root": "\([^"]*\)",$/\1/p' 
   --output "$work/new-user.key.json" >/dev/null
 "$git_e2ee" device-export --key "$work/new-user.key.json" \
   --output "$work/new-user.public.json" >/dev/null
+new_user_id=$(sed -n 's/^[[:space:]]*"device_id": "\([^"]*\)",$/\1/p' \
+  "$work/new-user.public.json")
+[[ -n $new_user_id ]]
 object_snapshot "$work/e2ee-storage" >"$work/packs-before-device-add.sha256"
 run_phase add_user e2ee device-add "$work/e2ee-storage" "$work/e2ee-new-client" \
   "$git_e2ee" device-add "e2ee::dir:$work/e2ee-storage" "$work/new-user.public.json" \
-    --label new-user --key "$work/repository.key.json"
+    --label new-user --expected-device-id "$new_user_id" --role read \
+    --key "$work/repository.key.json"
 active_reader_key="$work/new-user.key.json"
 if (( total_readers > 2 )); then
   for reader_number in $(seq 3 "$total_readers"); do
@@ -292,10 +296,14 @@ if (( total_readers > 2 )); then
       --output "$reader_key" >/dev/null
     "$git_e2ee" device-export --key "$reader_key" \
       --output "$reader_public" >/dev/null
+    reader_id=$(sed -n 's/^[[:space:]]*"device_id": "\([^"]*\)",$/\1/p' \
+      "$reader_public")
+    [[ -n $reader_id ]]
     run_phase "add_reader_$reader_label" e2ee device-add \
       "$work/e2ee-storage" "$work/e2ee-new-client" \
       "$git_e2ee" device-add "e2ee::dir:$work/e2ee-storage" "$reader_public" \
-        --label "reader-$reader_label" --key "$work/repository.key.json"
+        --label "reader-$reader_label" --expected-device-id "$reader_id" \
+        --role read --key "$work/repository.key.json"
     active_reader_key=$reader_key
   done
 fi

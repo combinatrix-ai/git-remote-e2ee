@@ -87,7 +87,10 @@ enum Command {
         /// Label shown in `device-list`; unique among active devices
         #[arg(long)]
         label: String,
-        #[arg(long, value_enum, default_value = "write")]
+        /// Device ID confirmed with its owner through a separate trusted channel
+        #[arg(long)]
+        expected_device_id: String,
+        #[arg(long, value_enum)]
         role: DeviceRole,
         #[arg(long)]
         key: Option<PathBuf>,
@@ -307,6 +310,7 @@ fn main() -> Result<()> {
             target,
             device,
             label,
+            expected_device_id,
             role,
             key,
         } => {
@@ -314,6 +318,11 @@ fn main() -> Result<()> {
                 Target::resolve(&target, key, GitRepository::from_environment()?.as_ref())?;
             let public = PublicDevice::read(&device)?;
             let device_id = public.device_id.clone();
+            if device_id != expected_device_id {
+                bail!(
+                    "public device ID {device_id} does not match --expected-device-id {expected_device_id}"
+                )
+            }
             let roles = DeviceRoles::from(role);
             let (manifest, policy) = with_repository!(&target, |repository| {
                 repository.add_device(public, &label, roles)?
