@@ -403,8 +403,9 @@ never contacts the source repository's configured remotes.
 
 Measured phases are initial push, fresh fetch, full verification, a one-commit
 incremental push containing one small synthetic blob, and returning-client
-fetch. Results contain only aggregate
-sizes, counts, wall time, and peak resident memory. Raw command output and keys
+fetch. Results include aggregate sizes, counts, wall time, peak resident
+memory, and build/platform metadata; `summary.json` omits the source and
+synthetic inner Git commit IDs. Raw command output and keys
 remain in the temporary directory and are deleted by default. Set
 `BENCH_KEEP_WORK=1` only when local debugging is necessary; never publish that
 directory.
