@@ -18,7 +18,7 @@ use crate::error::{BudgetExhausted, ObjectUnavailable, Unsupported};
 use crate::gitcmd::{self, GitRepository};
 use crate::refname;
 use crate::trace;
-use crate::url::{redact_carrier_address, redact_diagnostic, redact_diagnostic_with_args};
+use crate::url::{redact_carrier_address, safe_diagnostic, safe_diagnostic_with_args};
 
 #[derive(Debug, Error)]
 #[error("head changed concurrently (expected {expected:?}, actual {actual:?})")]
@@ -290,7 +290,7 @@ fn check_storage_format(location: &str, format: Option<&[u8]>, head_present: boo
     bail!(
         "storage at {} uses format {}; this git-remote-e2ee reads format {}",
         redact_carrier_address(location),
-        redact_diagnostic(&found),
+        safe_diagnostic(&found),
         crate::FORMAT_VERSION
     )
 }
@@ -2274,8 +2274,8 @@ fn ensure_git_success(output: &std::process::Output, action: &str) -> Result<()>
     if !output.status.success() {
         bail!(
             "{} failed: {}",
-            redact_diagnostic(action),
-            redact_diagnostic(String::from_utf8_lossy(&output.stderr).trim())
+            safe_diagnostic(action),
+            safe_diagnostic(String::from_utf8_lossy(&output.stderr).trim())
         )
     }
     Ok(())
@@ -2296,7 +2296,7 @@ fn git_command(repo: &Path, args: &[&str]) -> Result<()> {
                 .map(|arg| redact_carrier_address(arg))
                 .collect::<Vec<_>>()
                 .join(" "),
-            redact_diagnostic_with_args(String::from_utf8_lossy(&output.stderr).trim(), args)
+            safe_diagnostic_with_args(String::from_utf8_lossy(&output.stderr).trim(), args)
         )
     }
     Ok(())
@@ -2323,7 +2323,7 @@ fn git_command_with_input(repo: &Path, args: &[&str], input: &[u8]) -> Result<()
                 .map(|arg| redact_carrier_address(arg))
                 .collect::<Vec<_>>()
                 .join(" "),
-            redact_diagnostic_with_args(String::from_utf8_lossy(&output.stderr).trim(), args)
+            safe_diagnostic_with_args(String::from_utf8_lossy(&output.stderr).trim(), args)
         )
     }
     Ok(())
@@ -2419,7 +2419,7 @@ fn git_command_with_object_directory_input(
                 .map(|arg| redact_carrier_address(arg))
                 .collect::<Vec<_>>()
                 .join(" "),
-            redact_diagnostic_with_args(String::from_utf8_lossy(&output.stderr).trim(), args)
+            safe_diagnostic_with_args(String::from_utf8_lossy(&output.stderr).trim(), args)
         )
     }
     Ok(())

@@ -108,9 +108,21 @@ pub(crate) fn is_local_git_carrier(address: &str) -> bool {
 impl fmt::Display for StorageUrl {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Directory(path) => write!(formatter, "e2ee::dir:{}", path.display()),
-            Self::Git(remote) => write!(formatter, "e2ee::{}", redact_carrier_address(remote)),
-            Self::TrustedLocalGit(remote) => write!(formatter, "e2ee::trusted-local:{remote}"),
+            Self::Directory(path) => write!(
+                formatter,
+                "e2ee::dir:{}",
+                escape_terminal_controls(&path.display().to_string())
+            ),
+            Self::Git(remote) => write!(
+                formatter,
+                "e2ee::{}",
+                escape_terminal_controls(&redact_carrier_address(remote))
+            ),
+            Self::TrustedLocalGit(remote) => write!(
+                formatter,
+                "e2ee::trusted-local:{}",
+                escape_terminal_controls(remote)
+            ),
         }
     }
 }
@@ -178,7 +190,11 @@ pub fn redact_diagnostic(input: &str) -> String {
     output
 }
 
-pub fn redact_diagnostic_with_args(input: &str, args: &[&str]) -> String {
+pub fn safe_diagnostic(input: &str) -> String {
+    escape_terminal_controls(&redact_diagnostic(input))
+}
+
+pub fn safe_diagnostic_with_args(input: &str, args: &[&str]) -> String {
     let mut safe = input.to_owned();
     for arg in args {
         let redacted = redact_carrier_address(arg);
@@ -186,12 +202,38 @@ pub fn redact_diagnostic_with_args(input: &str, args: &[&str]) -> String {
             safe = safe.replace(arg, &redacted);
         }
     }
-    redact_diagnostic(&safe)
+    safe_diagnostic(&safe)
+}
+
+fn escape_terminal_controls(input: &str) -> String {
+    let mut safe = String::with_capacity(input.len());
+    for character in input.chars() {
+        if is_control_or_invisible(character) {
+            safe.extend(character.escape_default());
+        } else {
+            safe.push(character);
+        }
+    }
+    safe
+}
+
+pub fn is_control_or_invisible(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{00AD}'
+                | '\u{061C}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{206F}'
+                | '\u{FEFF}'
+        )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{StorageUrl, redact_diagnostic, redact_diagnostic_with_args};
+    use super::{StorageUrl, redact_diagnostic, safe_diagnostic, safe_diagnostic_with_args};
 
     #[test]
     fn remote_git_urls_pass_through_and_dir_prefix_selects_a_directory() {
@@ -299,11 +341,19 @@ mod tests {
         let scp = StorageUrl::parse("e2ee::alice@host:private-token/repo.git").unwrap();
         assert_eq!(scp.to_string(), "e2ee::host:[redacted]");
         assert_eq!(
-            redact_diagnostic_with_args(
+            safe_diagnostic_with_args(
                 "fatal: unable to access 'host:private-token'",
                 &["host:private-token"]
             ),
             "fatal: unable to access 'host:[redacted]'"
         );
+        assert_eq!(
+            safe_diagnostic("invalid field\n\r\u{1b}]52;c;clipboard\u{7}"),
+            "invalid field\\n\\r\\u{1b}]52;c;clipboard\\u{7}"
+        );
+        assert_eq!(safe_diagnostic("a\u{200b}b"), "a\\u{200b}b");
+        let local = StorageUrl::Directory("/tmp/unsafe\u{1b}[31m".into());
+        assert_eq!(local.to_string(), "e2ee::dir:/tmp/unsafe\\u{1b}[31m");
+        assert_eq!(local.to_config_string(), "e2ee::dir:/tmp/unsafe\u{1b}[31m");
     }
 }

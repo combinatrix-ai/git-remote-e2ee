@@ -896,6 +896,65 @@ fn a_signed_ref_that_is_not_an_object_id_is_rejected_before_git_resolves_it() {
 }
 
 #[test]
+fn rejected_head_evidence_escapes_controls_from_an_invalid_signed_ref() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let remote = temporary.path().join("remote");
+    initialize_git(&source);
+    let key = KeyFile::generate();
+    let repository = EncryptedRepository::new(
+        FilesystemStorage::new(&remote),
+        key.clone(),
+        support::state_dir(),
+    );
+    repository.initialize("owner").unwrap();
+    repository
+        .fetch_into(&GitRepository::open(&source).unwrap(), "e2ee")
+        .unwrap();
+    publish_signed_main_target(&remote, &key, "refs/heads/bad\u{1b}]52;c;payload\u{7}");
+    let old = serde_json::json!({
+        "format_version": 1,
+        "entries": [{
+            "head_id": "a".repeat(64),
+            "classification": "invalid",
+            "reason": "old\u{1b}]52;c;payload\u{7}"
+        }]
+    });
+    fs::write(
+        state_dir(&source).join("rejected-heads.json"),
+        serde_json::to_vec(&old).unwrap(),
+    )
+    .unwrap();
+
+    let report = repository
+        .recover(
+            &GitRepository::open(&source).unwrap(),
+            RecoveryOptions {
+                publish: false,
+                base: None,
+                discard_newer: false,
+                accept_stale_floor: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(report.classification, RecoveryClass::Invalid);
+    assert!(report.reason.contains("\\u{1b}"), "{}", report.reason);
+    assert!(!report.reason.contains(['\u{1b}', '\u{7}']));
+    let evidence: serde_json::Value =
+        serde_json::from_slice(&fs::read(state_dir(&source).join("rejected-heads.json")).unwrap())
+            .unwrap();
+    let reason = evidence["entries"][0]["reason"].as_str().unwrap();
+    assert!(reason.contains("\\u{1b}"), "{reason}");
+    assert!(!reason.contains(['\u{1b}', '\u{7}']));
+    assert_eq!(evidence["entries"].as_array().unwrap().len(), 2);
+    for entry in evidence["entries"].as_array().unwrap() {
+        let reason = entry["reason"].as_str().unwrap();
+        assert!(reason.contains("\\u{1b}"), "{reason}");
+        assert!(!reason.contains(['\u{1b}', '\u{7}']));
+    }
+}
+
+#[test]
 fn storage_cannot_rename_a_signed_head_by_re_encoding_it() {
     let temporary = tempfile::tempdir().unwrap();
     let source = temporary.path().join("source");

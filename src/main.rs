@@ -13,7 +13,7 @@ use git_remote_e2ee::repository::{
 };
 use git_remote_e2ee::storage::{FilesystemStorage, GitStorage};
 use git_remote_e2ee::url::{
-    StorageUrl, redact_carrier_address, redact_diagnostic, redact_diagnostic_with_args,
+    StorageUrl, redact_carrier_address, safe_diagnostic, safe_diagnostic_with_args,
 };
 
 #[derive(Parser)]
@@ -207,7 +207,7 @@ macro_rules! with_repository {
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("Error: {}", redact_diagnostic(&format!("{error:?}")));
+        eprintln!("Error: {}", safe_diagnostic(&format!("{error:?}")));
         std::process::exit(1);
     }
 }
@@ -230,7 +230,7 @@ fn run() -> Result<()> {
             key.write_new(&output)?;
             println!(
                 "created {} for repository root {}",
-                output.display(),
+                safe_diagnostic(&output.display().to_string()),
                 key.repository_root
             );
         }
@@ -240,7 +240,7 @@ fn run() -> Result<()> {
             println!(
                 "exported device {} to {}",
                 public.device_id,
-                output.display()
+                safe_diagnostic(&output.display().to_string())
             );
         }
         Command::Init {
@@ -271,7 +271,10 @@ fn run() -> Result<()> {
                         None => default_key_path(&generated.repository_root)?,
                     };
                     generated.write_new(&path)?;
-                    println!("created key {} (administrator)", path.display());
+                    println!(
+                        "created key {} (administrator)",
+                        safe_diagnostic(&path.display().to_string())
+                    );
                     created_key = Some(path.clone());
                     path
                 }
@@ -314,7 +317,7 @@ fn run() -> Result<()> {
                         &target.key.to_string_lossy(),
                     ],
                 )?;
-                println!("added remote {name}");
+                println!("added remote {}", safe_diagnostic(&name));
             }
         }
         Command::Verify { target, key } => {
@@ -469,14 +472,14 @@ fn run_git(repository: &GitRepository, args: &[&str]) -> Result<()> {
                 .map(|arg| redact_carrier_address(arg))
                 .collect::<Vec<_>>()
                 .join(" "),
-            redact_diagnostic_with_args(String::from_utf8_lossy(&output.stderr).trim(), args)
+            safe_diagnostic_with_args(String::from_utf8_lossy(&output.stderr).trim(), args)
         )
     }
     Ok(())
 }
 
 fn print_recovery_report(report: &RecoveryReport) {
-    println!("{}", redact_diagnostic(&format_recovery_report(report)));
+    println!("{}", format_recovery_report(report));
 }
 
 fn format_recovery_report(report: &RecoveryReport) -> String {

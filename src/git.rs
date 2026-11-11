@@ -108,6 +108,8 @@ pub fn is_ancestor(repo: &GitRepository, ancestor: &str, descendant: &str) -> Re
     let status = repo
         .git()
         .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()?;
     match status.code() {
         Some(0) => Ok(true),

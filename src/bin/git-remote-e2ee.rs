@@ -10,12 +10,13 @@ use git_remote_e2ee::repository::{
 };
 use git_remote_e2ee::storage::{CasConflict, FilesystemStorage, GitStorage, Storage};
 use git_remote_e2ee::url::{
-    StorageUrl, redact_carrier_address, redact_diagnostic, redact_diagnostic_with_args,
+    StorageUrl, is_control_or_invisible, redact_carrier_address, safe_diagnostic,
+    safe_diagnostic_with_args,
 };
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("e2ee: {}", redact_diagnostic(&format!("{error:#}")));
+        eprintln!("e2ee: {}", safe_diagnostic(&format!("{error:#}")));
         std::process::exit(1);
     }
 }
@@ -87,7 +88,9 @@ fn run_protocol<S: Storage>(
                 writeln!(output, "fetch")?;
                 writeln!(output, "push")?;
                 writeln!(output, "option")?;
-                let tracking_name = if remote_name.contains(':') {
+                let tracking_name = if remote_name.contains(':')
+                    || remote_name.chars().any(is_control_or_invisible)
+                {
                     "e2ee"
                 } else {
                     remote_name.as_str()
@@ -235,22 +238,23 @@ fn report_push_error(
     destination: &str,
     error: &anyhow::Error,
 ) -> Result<()> {
+    let destination = safe_diagnostic(destination);
     if error.is::<ReadOnlyDevice>() {
-        let message = format!(
+        let message = safe_diagnostic(&format!(
             "this device is read-only for {}; ask an administrator for the write role",
             redact_carrier_address(remote_name)
-        );
+        ));
         writeln!(output, "error {destination} {message}")?;
         eprintln!("e2ee: {destination}: {message}");
     } else {
         writeln!(
             output,
             "error {destination} {}",
-            redact_diagnostic_with_args(&push_status(error), &[remote_name])
+            safe_diagnostic_with_args(&push_status(error), &[remote_name])
         )?;
         eprintln!(
             "e2ee: {destination}: {}",
-            redact_diagnostic_with_args(&single_line(error), &[remote_name])
+            safe_diagnostic_with_args(&single_line(error), &[remote_name])
         );
     }
     Ok(())
@@ -267,7 +271,7 @@ fn push_status(error: &anyhow::Error) -> String {
 }
 
 fn single_line(error: &anyhow::Error) -> String {
-    redact_diagnostic(&format!("{error:#}"))
+    safe_diagnostic(&format!("{error:#}"))
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -336,7 +340,7 @@ fn set_local_config(local: &GitRepository, key: &str, value: &str) -> Result<()>
     if !output.status.success() {
         bail!(
             "git config {} failed ({})",
-            redact_diagnostic_with_args(key, &[key]),
+            safe_diagnostic_with_args(key, &[key]),
             output.status
         )
     }
@@ -404,5 +408,22 @@ mod tests {
         let status = String::from_utf8(output).unwrap();
         assert!(status.contains("e2ee:[redacted]"), "{status}");
         assert!(!status.contains("private-token"));
+    }
+
+    #[test]
+    fn rejected_push_status_escapes_controls_without_extra_protocol_lines() {
+        let mut output = Vec::new();
+        report_push_error(
+            &mut output,
+            "origin",
+            "refs/heads/bad\n\u{1b}[31m",
+            &anyhow::anyhow!("bad\u{1b}]52;c;payload\u{7}"),
+        )
+        .unwrap();
+        let status = String::from_utf8(output).unwrap();
+        assert_eq!(status.lines().count(), 1);
+        assert!(status.contains("bad\\n\\u{1b}[31m"), "{status}");
+        assert!(status.contains("bad\\u{1b}]52;c;payload\\u{7}"), "{status}");
+        assert!(!status.contains(['\u{1b}', '\u{7}']));
     }
 }

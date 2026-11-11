@@ -354,6 +354,73 @@ fn carrier_url_credentials_are_hidden_in_cli_errors() {
 }
 
 #[test]
+fn storage_format_controls_are_escaped_in_cli_helper_and_recovery_output() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repository("notes");
+    let storage = sandbox.path().join("storage");
+    let url = format!("e2ee::dir:{}", storage.display());
+    success(&sandbox.e2ee(&repo, &["init", &url]).output().unwrap());
+    fs::write(
+        storage.join("FORMAT"),
+        b"git-remote-e2ee storage 8\n\r\x1b]52;c;injected\x07\n",
+    )
+    .unwrap();
+
+    let verify = sandbox.e2ee(&repo, &["verify", "origin"]).output().unwrap();
+    assert!(!verify.status.success());
+    let verify_error = String::from_utf8(verify.stderr).unwrap();
+    assert!(
+        verify_error.contains("format 8\\n\\r\\u{1b}"),
+        "{verify_error}"
+    );
+    assert!(!verify_error.contains(['\x1b', '\x07', '\r']));
+    assert_eq!(verify_error.lines().count(), 1);
+
+    let fetch = sandbox
+        .command("git", &repo)
+        .args(["fetch", "origin"])
+        .output()
+        .unwrap();
+    assert!(!fetch.status.success());
+    let helper_error = String::from_utf8(fetch.stderr).unwrap();
+    assert!(
+        helper_error.contains("format 8\\n\\r\\u{1b}"),
+        "{helper_error}"
+    );
+    assert!(!helper_error.contains(['\x1b', '\x07', '\r']));
+
+    let recover = sandbox
+        .e2ee(&repo, &["recover", "origin"])
+        .output()
+        .unwrap();
+    assert!(recover.status.success());
+    let report = String::from_utf8(recover.stdout).unwrap();
+    assert!(report.contains("format 8\\n\\r\\u{1b}"), "{report}");
+    assert!(!report.contains(['\x1b', '\x07', '\r']));
+    assert!(report.lines().count() > 1);
+    assert_eq!(
+        report
+            .lines()
+            .filter(|line| line.contains("injected"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn init_escapes_controls_in_a_directory_storage_path() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repository("notes");
+    let storage = sandbox.path().join("store\u{1b}[31m");
+    let url = format!("e2ee::dir:{}", storage.display());
+    let output = sandbox.e2ee(&repo, &["init", &url]).output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("store\\u{1b}[31m"), "{stdout}");
+    assert!(!stdout.contains('\u{1b}'));
+}
+
+#[test]
 fn scp_carrier_failure_does_not_repeat_a_private_path_from_git() {
     let sandbox = Sandbox::new();
     let repo = sandbox.repository("notes");

@@ -26,7 +26,7 @@ use crate::manifest::{
 use crate::policy::{DeviceRecord, DeviceRoles, PolicyState};
 use crate::storage::{HeadObservation, ObjectKind, Storage, StorageOccupied, StoredHead};
 use crate::trace;
-use crate::url::redact_diagnostic;
+use crate::url::safe_diagnostic;
 
 const MAX_RECOVERY_OUTER_COMMITS: usize = 2048;
 const MAX_RECOVERY_CANDIDATES: usize = 256;
@@ -135,10 +135,28 @@ pub struct RecoveryReport {
 }
 
 impl RecoveryReport {
-    fn redacted(mut self) -> Self {
-        self.reason = redact_diagnostic(&self.reason);
-        self.warning = self.warning.map(|text| redact_diagnostic(&text));
-        self.blocked_reason = self.blocked_reason.map(|text| redact_diagnostic(&text));
+    fn sanitized(mut self) -> Self {
+        self.reason = safe_diagnostic(&self.reason);
+        self.head_id = self.head_id.map(|text| safe_diagnostic(&text));
+        self.claimed_signer = self.claimed_signer.map(|text| safe_diagnostic(&text));
+        self.floor_id = self.floor_id.map(|text| safe_diagnostic(&text));
+        self.default_base = self.default_base.map(|text| safe_diagnostic(&text));
+        self.replays = self
+            .replays
+            .into_iter()
+            .map(|text| safe_diagnostic(&text))
+            .collect();
+        for candidate in &mut self.candidates {
+            candidate.manifest_id = safe_diagnostic(&candidate.manifest_id);
+            candidate.outer_commit = candidate
+                .outer_commit
+                .take()
+                .map(|text| safe_diagnostic(&text));
+            candidate.verified_signer = safe_diagnostic(&candidate.verified_signer);
+        }
+        self.warning = self.warning.map(|text| safe_diagnostic(&text));
+        self.blocked_reason = self.blocked_reason.map(|text| safe_diagnostic(&text));
+        self.published_manifest = self.published_manifest.map(|text| safe_diagnostic(&text));
         self
     }
 }
@@ -807,7 +825,7 @@ impl<S: Storage> EncryptedRepository<S> {
         options: RecoveryOptions<'_>,
     ) -> Result<RecoveryReport> {
         self.recover_inner(repo, options)
-            .map(RecoveryReport::redacted)
+            .map(RecoveryReport::sanitized)
     }
 
     fn recover_inner(
@@ -1800,8 +1818,11 @@ fn record_rejected_head(
         Err(error) => return Err(error.into()),
     };
     log.format_version = 1;
+    for entry in &mut log.entries {
+        entry.reason = safe_diagnostic(&entry.reason);
+    }
     log.entries.retain(|entry| entry.head_id != head_id);
-    let reason: String = redact_diagnostic(reason).chars().take(512).collect();
+    let reason: String = safe_diagnostic(reason).chars().take(512).collect();
     log.entries.push(RejectedHeadEvidence {
         head_id: head_id.to_owned(),
         classification,
@@ -1820,8 +1841,34 @@ mod tests {
 
     use super::{
         ForeignRepository, InvalidState, MissingStorageHead, NotActiveReader, ObjectUnavailable,
-        RecoveryClass, Unsupported, classify_recovery_error,
+        RecoveryClass, RecoveryReport, Unsupported, classify_recovery_error,
     };
+
+    #[test]
+    fn recovery_report_escapes_unverified_fields_without_changing_structure() {
+        let report = RecoveryReport {
+            classification: RecoveryClass::Invalid,
+            reason: "bad\n\u{1b}]52;c;payload\u{7}".to_owned(),
+            head_id: None,
+            claimed_signer: Some("device\r\u{1b}[31m".to_owned()),
+            floor_id: None,
+            floor_generation: None,
+            candidates: Vec::new(),
+            default_base: None,
+            replays: Vec::new(),
+            conflict: false,
+            freshness_unverified: false,
+            warning: None,
+            blocked_reason: None,
+            published_manifest: None,
+        }
+        .sanitized();
+        assert_eq!(report.reason, "bad\\n\\u{1b}]52;c;payload\\u{7}");
+        assert_eq!(
+            report.claimed_signer.as_deref(),
+            Some("device\\r\\u{1b}[31m")
+        );
+    }
 
     #[test]
     fn recovery_classification_ignores_storage_controlled_message_text() {
