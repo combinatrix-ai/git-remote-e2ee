@@ -239,6 +239,64 @@ fn carrier_publication_ignores_user_hooks_and_signing() {
     assert!(!signature.contains("gpgsig"), "{signature}");
 }
 
+#[cfg(unix)]
+#[test]
+fn carrier_publication_ignores_indexed_clean_filters() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repository("notes");
+    let carrier = sandbox.path().join("carrier.git");
+    sandbox.git(sandbox.path(), &["init", "-q", "--bare", "carrier.git"]);
+    let url = format!("e2ee::trusted-local:{}", carrier.display());
+    success(&sandbox.e2ee(&repo, &["init", &url]).output().unwrap());
+
+    let attacker = sandbox.path().join("carrier-edit");
+    sandbox.git(
+        sandbox.path(),
+        &[
+            "clone",
+            "-q",
+            "-b",
+            "main",
+            carrier.to_str().unwrap(),
+            attacker.to_str().unwrap(),
+        ],
+    );
+    fs::create_dir_all(attacker.join("packs")).unwrap();
+    fs::write(attacker.join("packs/.gitattributes"), "* filter=probe\n").unwrap();
+    sandbox.git(&attacker, &["add", "packs/.gitattributes"]);
+    sandbox.git(&attacker, &["commit", "-q", "-m", "indexed filter"]);
+    sandbox.git(&attacker, &["push", "-q", "origin", "main"]);
+
+    let marker = sandbox.path().join("filter-invoked");
+    let filter = sandbox.path().join("clean-filter.sh");
+    fs::write(
+        &filter,
+        format!("#!/bin/sh\nprintf invoked > '{}'\ncat\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&filter, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(
+        sandbox.global_config(),
+        format!(
+            "[filter \"probe\"]\n\tclean = {}\n\trequired = true\n",
+            filter.display()
+        ),
+    )
+    .unwrap();
+
+    fs::write(repo.join("note.md"), "encrypted content\n").unwrap();
+    sandbox.git(&repo, &["add", "note.md"]);
+    sandbox.git(&repo, &["commit", "-q", "-m", "content"]);
+    sandbox.git(&repo, &["push", "-q", "origin", "main"]);
+    assert!(
+        !marker.exists(),
+        "carrier publication ran the indexed filter"
+    );
+    success(&sandbox.e2ee(&repo, &["verify", "origin"]).output().unwrap());
+}
+
 #[test]
 fn an_unreachable_carrier_does_not_trigger_a_cache_check() {
     let sandbox = Sandbox::new();

@@ -625,6 +625,7 @@ const CARRIER_CHUNK_SIZE: usize = CARRIER_CHUNK_BYTES as usize;
 /// Bounds one object's `ls-tree` listing: a few hundred bytes per chunk entry.
 const MAX_CARRIER_LISTING_BYTES: u64 = 8 * 1024 * 1024;
 const CARRIER_ATTRIBUTES: &[u8] = b"* -delta\n";
+const CARRIER_STAGING_ATTRIBUTES: &[u8] = b"* -filter -text -ident -working-tree-encoding -eol\n";
 const CARRIER_CACHE_ENV: &str = "GIT_REMOTE_E2EE_CACHE_DIR";
 /// Each cache serves one (remote, branch) pair, so one fixed ref suffices.
 const CARRIER_CACHE_FETCH_REF: &str = "refs/heads/carrier";
@@ -2184,6 +2185,11 @@ fn create_carrier_checkout(
         .args(["init", "--quiet"])
         .output()?;
     ensure_git_success(&output, "git init carrier checkout")?;
+    fs::create_dir_all(checkout.join(".git/info"))?;
+    fs::write(
+        checkout.join(".git/info/attributes"),
+        CARRIER_STAGING_ATTRIBUTES,
+    )?;
     let cache_objects = cache.join("objects");
     let cache_objects = cache_objects
         .to_str()
