@@ -5,8 +5,9 @@ use support::PushRef;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Barrier, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -78,6 +79,68 @@ fn git(repo: &Path, args: &[&str], with_helper: bool) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn git_with_input(repo: &Path, args: &[&str], input: &[u8]) -> String {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .env("GIT_AUTHOR_NAME", "E2EE Git Test")
+        .env("GIT_AUTHOR_EMAIL", "git-remote-e2ee@example.invalid")
+        .env("GIT_COMMITTER_NAME", "E2EE Git Test")
+        .env("GIT_COMMITTER_EMAIL", "git-remote-e2ee@example.invalid")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+#[test]
+fn compact_carrier_tree_is_rejected_before_expanding_the_index() {
+    let temporary = tempfile::tempdir().unwrap();
+    let _cache = isolated_cache(&temporary);
+    for (name, with_file) in [("files.git", true), ("empty.git", false)] {
+        let carrier = temporary.path().join(name);
+        git(
+            temporary.path(),
+            &["init", "--bare", "-q", carrier.to_str().unwrap()],
+            false,
+        );
+        let leaf = if with_file {
+            let blob = git_with_input(&carrier, &["hash-object", "-w", "--stdin"], b"x");
+            format!("100644 blob {blob}\tseed\n")
+        } else {
+            String::new()
+        };
+        let mut tree = git_with_input(&carrier, &["mktree"], leaf.as_bytes());
+        for _ in 0..17 {
+            tree = git_with_input(
+                &carrier,
+                &["mktree"],
+                format!("040000 tree {tree}\ta\n040000 tree {tree}\tb\n").as_bytes(),
+            );
+        }
+        let commit = git_with_input(&carrier, &["commit-tree", &tree], b"fanout\n");
+        git(&carrier, &["update-ref", "refs/heads/main", &commit], false);
+
+        let error = GitStorage::open_trusted_local(carrier.to_str().unwrap())
+            .err()
+            .expect("an expanded tree needs a bounded preflight");
+        assert!(
+            format!("{error:#}").contains("carrier tree index budget"),
+            "{error:#}"
+        );
+    }
 }
 
 fn init_source(path: &Path, marker: &str) -> String {

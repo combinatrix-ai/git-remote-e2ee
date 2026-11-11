@@ -627,6 +627,8 @@ const CARRIER_DEFAULT_BRANCH: &str = "main";
 const CARRIER_CHUNK_SIZE: usize = CARRIER_CHUNK_BYTES as usize;
 /// Bounds one object's `ls-tree` listing: a few hundred bytes per chunk entry.
 const MAX_CARRIER_LISTING_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_CARRIER_INDEX_ENTRIES: u64 = 100_000;
+const MAX_CARRIER_INDEX_PATH_BYTES: u64 = 16 * 1024 * 1024;
 const CARRIER_ATTRIBUTES: &[u8] = b"* -delta\n";
 const CARRIER_STAGING_ATTRIBUTES: &[u8] = b"* -filter -text -ident -working-tree-encoding -eol\n";
 const CARRIER_CACHE_ENV: &str = "GIT_REMOTE_E2EE_CACHE_DIR";
@@ -1255,9 +1257,14 @@ impl GitStorage {
         let add_timer = trace::Span::new("carrier_git_add");
         stage_carrier_checkout(self.root(), &cache.path.join("objects"))?;
         drop(add_timer);
+        ensure_carrier_index_budget(self.root(), &["ls-files", "-z"])?;
         let commit_timer = trace::Span::new("carrier_git_commit");
         let objects = cache.path.join("objects");
         let tree = git_text_with_object_directory(self.root(), &objects, &["write-tree"])?;
+        ensure_carrier_index_budget(
+            self.root(),
+            &["ls-tree", "-r", "-t", "-z", "--name-only", &tree],
+        )?;
         let mut commit_tree = vec!["commit-tree", "--no-gpg-sign", "-m", CARRIER_COMMIT_MESSAGE];
         if let Some(parent) = base_commit {
             commit_tree.extend(["-p", parent]);
@@ -1309,6 +1316,10 @@ impl GitStorage {
         let local_ref = format!("refs/heads/{}", self.branch);
         match base_commit {
             Some(commit) => {
+                ensure_carrier_index_budget(
+                    root,
+                    &["ls-tree", "-r", "-t", "-z", "--name-only", commit],
+                )?;
                 git_command(root, &["update-ref", &local_ref, commit])?;
                 git_command(root, &["read-tree", commit])?;
             }
@@ -2217,6 +2228,10 @@ fn create_carrier_checkout(
     let remote_ref = format!("refs/remotes/origin/{branch}");
     match base_commit {
         Some(commit) => {
+            ensure_carrier_index_budget(
+                checkout,
+                &["ls-tree", "-r", "-t", "-z", "--name-only", commit],
+            )?;
             git_command(checkout, &["update-ref", &remote_ref, commit])?;
             let local_ref = format!("refs/heads/{branch}");
             git_command(checkout, &["update-ref", &local_ref, commit])?;
@@ -2228,6 +2243,45 @@ fn create_carrier_checkout(
         }
     }
     fs::write(checkout.join(".gitattributes"), CARRIER_ATTRIBUTES)?;
+    Ok(())
+}
+
+fn ensure_carrier_index_budget(repo: &Path, args: &[&str]) -> Result<()> {
+    let mut child = GitRepository::owned_work_tree(repo)
+        .git()
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut stdout = child.stdout.take().context("open carrier index listing")?;
+    let mut buffer = [0_u8; 8192];
+    let mut bytes = 0_u64;
+    let mut entries = 0_u64;
+    let result = (|| -> Result<()> {
+        loop {
+            let read = stdout.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            bytes += read as u64;
+            entries += buffer[..read].iter().filter(|byte| **byte == 0).count() as u64;
+            if bytes > MAX_CARRIER_INDEX_PATH_BYTES || entries > MAX_CARRIER_INDEX_ENTRIES {
+                bail!(BudgetExhausted(
+                    "carrier tree index budget exhausted".to_owned()
+                ))
+            }
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    drop(stdout);
+    let status = child.wait();
+    result?;
+    if !status?.success() {
+        bail!("git carrier index listing failed")
+    }
     Ok(())
 }
 

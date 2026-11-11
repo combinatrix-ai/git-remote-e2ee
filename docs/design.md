@@ -209,6 +209,9 @@ Each helper process fetches the carrier branch into a persistent bare object
 cache, then creates a disposable Git directory with an alternate pointing at
 the cache. It seeds a process-local index from the base commit with `git
 read-tree`, without checking out or copying the historical ciphertext files.
+A streamed listing limits carrier tree traversal and each index to 100,000
+entries and 16 MiB of path bytes before `read-tree` or publication. Tree entries
+include directories, so even compact trees with no files are bounded.
 Carrier object reads stream blobs through `git cat-file --batch`; publication
 stages only the new chunk paths and `HEAD` with a NUL-delimited path list, so
 Git does not scan the complete carrier tree. The temporary index keeps
