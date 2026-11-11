@@ -960,10 +960,14 @@ impl GitStorage {
             if !Path::new(remote).is_absolute() {
                 bail!("trusted local Git carrier requires an absolute path")
             }
+        } else if crate::url::is_git_helper_address(remote) {
+            bail!("Git remote-helper syntax is not allowed for a carrier")
         } else if crate::url::is_local_git_carrier(remote) {
             bail!(
                 "local Git carrier requires e2ee::trusted-local:/absolute/path; use e2ee::dir:/path for untrusted local storage"
             )
+        } else if !crate::url::has_supported_git_scheme(remote) {
+            bail!("unsupported Git carrier URL scheme")
         }
 
         let lock_timer = trace::Span::new("carrier_cache_lock");

@@ -36,12 +36,34 @@ impl StorageUrl {
             return Ok(Self::TrustedLocalGit(location.to_owned()));
         }
         let remote = address.split('#').next().unwrap_or_default();
+        if is_git_helper_address(remote) {
+            bail!("Git remote-helper syntax is not allowed for a carrier")
+        }
         if is_local_git_carrier(remote) {
             bail!(
                 "local Git carrier requires e2ee::trusted-local:/absolute/path; use e2ee::dir:/path for untrusted local storage"
             )
         }
+        if !has_supported_git_scheme(remote) {
+            bail!("unsupported Git carrier URL scheme")
+        }
         Ok(Self::Git(address.to_owned()))
+    }
+}
+
+/// An unknown `scheme://` invokes a user-installed Git remote helper.
+pub(crate) fn has_supported_git_scheme(address: &str) -> bool {
+    match address.split_once("://") {
+        Some((scheme, _)) => matches!(scheme, "http" | "https" | "git" | "ssh"),
+        None => true,
+    }
+}
+
+/// Git's `name::address` form launches a `git-remote-name` executable.
+pub(crate) fn is_git_helper_address(address: &str) -> bool {
+    match address.find("::") {
+        Some(helper) => address.find("://").is_none_or(|url| helper < url),
+        None => false,
     }
 }
 
@@ -155,5 +177,18 @@ mod tests {
     fn empty_addresses_are_rejected() {
         assert!(StorageUrl::parse("e2ee::").is_err());
         assert!(StorageUrl::parse("e2ee::dir:").is_err());
+    }
+
+    #[test]
+    fn executable_remote_helper_forms_are_rejected() {
+        for remote in [
+            "ext::sh -c true",
+            "ssh::host",
+            "https::host",
+            "foo://host/repo.git",
+        ] {
+            assert!(StorageUrl::parse(&format!("e2ee::{remote}")).is_err());
+        }
+        assert!(StorageUrl::parse("e2ee::ssh://[::1]/repo.git").is_ok());
     }
 }

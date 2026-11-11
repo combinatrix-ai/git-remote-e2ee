@@ -176,11 +176,14 @@ impl GitRepository {
         } else {
             "protocol.file.allow=never"
         });
+        command.arg("-c").arg("protocol.ext.allow=never");
         if let Some(protocols) = std::env::var_os("GIT_ALLOW_PROTOCOL") {
             let allowed = protocols.to_str().unwrap_or_default();
             let mut filtered: Vec<&str> = allowed
                 .split(':')
-                .filter(|protocol| !protocol.is_empty() && *protocol != "file")
+                .filter(|protocol| {
+                    !protocol.is_empty() && *protocol != "file" && *protocol != "ext"
+                })
                 .collect();
             if trusted_local {
                 filtered.push("file");

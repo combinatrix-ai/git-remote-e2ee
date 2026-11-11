@@ -34,6 +34,10 @@ An `e2ee::` URL is followed by the storage address:
 | `e2ee::trusted-local:/absolute/carrier.git` | A local Git carrier whose receive hooks you trust to run as your user. |
 | `e2ee::dir:/srv/encrypted/example` | A directory (filesystem backend). |
 
+Git carrier transport refuses Git's `ext::` command transport, including when
+Git configuration would otherwise allow it. Direct `name::address` remote
+helper URLs and unknown `scheme://` URLs are also refused; local Git
+configuration remains trusted.
 The directory backend resolves relative paths against the directory the
 command runs in. Local Git carrier paths and `file://` carrier URLs require
 the explicit `trusted-local:` form with an absolute path. Use `dir:` for

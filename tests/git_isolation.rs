@@ -428,3 +428,139 @@ fn trusted_local_transport_cannot_be_redirected_to_another_hook_receiver() {
         "the trusted carrier should hold genesis, the Git push, and device-add"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn carrier_transport_never_runs_ext_commands() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sandbox = Sandbox::new();
+    let key_path = sandbox.path().join("owner.key.json");
+    KeyFile::generate().write_new(&key_path).unwrap();
+    let key_arg = key_path.to_string_lossy().into_owned();
+    let marker = sandbox.path().join("ext-helper-ran");
+    let helper = sandbox.path().join("ext-helper");
+    fs::write(
+        &helper,
+        format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+    let ext = format!("ext::{}", helper.display());
+
+    for (variable, value) in [
+        ("GIT_ALLOW_PROTOCOL", "ext:ssh:https"),
+        ("GIT_CONFIG_COUNT", "1"),
+    ] {
+        let mut command = sandbox.e2ee(
+            sandbox.path(),
+            &["verify", &format!("e2ee::{ext}"), "--key", &key_arg],
+        );
+        command.env(variable, value);
+        if variable == "GIT_CONFIG_COUNT" {
+            command
+                .env("GIT_CONFIG_KEY_0", "protocol.ext.allow")
+                .env("GIT_CONFIG_VALUE_0", "always");
+        }
+        let refused = command.output().unwrap();
+        assert!(!refused.status.success());
+        assert!(!marker.exists(), "direct ext carrier ran its helper");
+    }
+
+    let custom = sandbox.path().join("git-remote-foo");
+    fs::copy(&helper, &custom).unwrap();
+    fs::set_permissions(&custom, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut paths = vec![sandbox.path().to_path_buf()];
+    paths.extend(env::split_paths(&env::var_os("PATH").unwrap_or_default()));
+    let refused = sandbox
+        .e2ee(
+            sandbox.path(),
+            &[
+                "verify",
+                "e2ee::foo://example.invalid/repo",
+                "--key",
+                &key_arg,
+            ],
+        )
+        .env("PATH", env::join_paths(paths).unwrap())
+        .env("GIT_ALLOW_PROTOCOL", "foo")
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(!marker.exists(), "custom URL scheme ran its helper");
+
+    let safe_url = "ssh://example.invalid/encrypted.git";
+    fs::write(
+        sandbox.global_config(),
+        format!("[url \"{ext}\"]\n\tinsteadOf = {safe_url}\n"),
+    )
+    .unwrap();
+    let repo = sandbox.repository("notes");
+    sandbox.git(&repo, &["remote", "add", "carrier", safe_url]);
+    assert_eq!(sandbox.git(&repo, &["remote", "get-url", "carrier"]), ext);
+    let refused = sandbox
+        .e2ee(
+            sandbox.path(),
+            &["verify", &format!("e2ee::{safe_url}"), "--key", &key_arg],
+        )
+        .env("GIT_ALLOW_PROTOCOL", "ext:ssh")
+        .env("GIT_SSH_COMMAND", "false")
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(!marker.exists(), "rewritten ext carrier ran its helper");
+
+    let refused = sandbox
+        .e2ee(
+            sandbox.path(),
+            &["verify", &format!("e2ee::{safe_url}"), "--key", &key_arg],
+        )
+        .env_remove("GIT_ALLOW_PROTOCOL")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "protocol.ext.allow")
+        .env("GIT_CONFIG_VALUE_0", "always")
+        .env("GIT_SSH_COMMAND", "false")
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(!marker.exists(), "injected ext permission ran its helper");
+
+    fs::write(sandbox.global_config(), "").unwrap();
+    let ssh_marker = sandbox.path().join("ssh-transport-ran");
+    let ssh = sandbox.path().join("fake-ssh");
+    fs::write(
+        &ssh,
+        format!("#!/bin/sh\ntouch '{}'\nexit 1\n", ssh_marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+    let refused = sandbox
+        .e2ee(
+            sandbox.path(),
+            &["verify", &format!("e2ee::{safe_url}"), "--key", &key_arg],
+        )
+        .env("GIT_ALLOW_PROTOCOL", "ext:ssh")
+        .env("GIT_SSH_COMMAND", &ssh)
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(ssh_marker.exists(), "safe SSH transport was blocked");
+
+    fs::remove_file(&ssh_marker).unwrap();
+    fs::write(
+        sandbox.global_config(),
+        "[protocol \"ssh\"]\n\tallow = never\n",
+    )
+    .unwrap();
+    let refused = sandbox
+        .e2ee(
+            sandbox.path(),
+            &["verify", &format!("e2ee::{safe_url}"), "--key", &key_arg],
+        )
+        .env_remove("GIT_ALLOW_PROTOCOL")
+        .env("GIT_SSH_COMMAND", &ssh)
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(!ssh_marker.exists(), "explicit SSH denial was overridden");
+}
