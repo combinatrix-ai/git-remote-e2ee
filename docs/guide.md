@@ -324,6 +324,8 @@ your local remote-tracking refs.
 - Normal manifest traversal stops after 64 MiB of encrypted manifest data or
   1,000,000 estimated cryptographic operations. A repository with a longer
   legitimate history cannot be opened by this version.
+- Tree-tag connectivity checks stop after 256 distinct tree roots or 4,000,000
+  expanded entries per operation. Tree tags require Git 2.36 or newer.
 - Recovery discovery has fixed limits of 2,048 carrier commits, 256 distinct
   heads, 64 MiB of manifest data, and 1,000,000 estimated cryptographic
   operations. It fails closed if any limit is exhausted.
