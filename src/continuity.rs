@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::manifest::Manifest;
 
-const FLOOR_FORMAT: u32 = 1;
+const FLOOR_FORMAT: u32 = 2;
 
 /// `$XDG_STATE_HOME/git-e2ee`, or `~/.local/state/git-e2ee`. Only binaries
 /// call this; the library takes its state directory explicitly.
@@ -43,16 +43,20 @@ pub(crate) struct ContinuityFloor {
     pub head_id: String,
     pub generation: u64,
     pub policy_generation: u64,
+    pub anchor_manifest: Option<Manifest>,
+    pub anchor_policy: Option<Vec<u8>>,
 }
 
 impl ContinuityFloor {
-    pub fn at(head_id: &str, manifest: &Manifest) -> Self {
+    pub fn at(head_id: &str, manifest: &Manifest, policy: Vec<u8>) -> Self {
         Self {
             format_version: FLOOR_FORMAT,
             repository_root: manifest.repository_root.clone(),
             head_id: head_id.to_owned(),
             generation: manifest.generation,
             policy_generation: manifest.policy_generation,
+            anchor_manifest: Some(manifest.clone()),
+            anchor_policy: Some(policy),
         }
     }
 }
@@ -488,6 +492,8 @@ pub(crate) fn testing_write_floor(
         head_id: head_id.to_owned(),
         generation,
         policy_generation: 1,
+        anchor_manifest: None,
+        anchor_policy: None,
     })?;
     Ok(guard.path.clone())
 }

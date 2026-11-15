@@ -376,8 +376,11 @@ Every successor is exactly one of:
 2. **Policy transition**: selected policy is the direct authorized child of the
    parent's policy; signer is an administrator in the parent policy; refs and
    cumulative pack count are unchanged; the delta contains no packs.
-3. **Checkpoint**: reserved for future compaction and garbage collection.
-   Current implementations MUST reject it as unsupported.
+3. **Checkpoint**: selected policy and refs are unchanged; signer is an active
+   administrator in that policy. The manifest embeds the exact current signed
+   policy and adds one self-contained pack of all objects reachable from the
+   current refs (or no pack if there are no refs). Earlier manifests and packs
+   remain available for clients whose floor predates the checkpoint.
 
 For every successor:
 
@@ -478,16 +481,31 @@ A fresh clone traverses manifest and key links from `HEAD` to genesis,
 validates each hop, collects pack deltas, decrypts packs with their creation
 generation keys, and imports them oldest-first.
 
-Every normal read, including listing, fetch, push, and verification, applies a
-fixed cumulative budget before retaining or decrypting each predecessor. This
-version limits traversal to 64 MiB of encrypted manifest data and 1,000,000
-estimated cryptographic operations. An over-limit chain is rejected without
-advancing the machine continuity floor.
+Every normal traversal applies a fixed cumulative budget before retaining or
+decrypting each predecessor. This version limits each traversal to 64 MiB of
+encrypted manifest data and 1,000,000 estimated cryptographic operations.
+An over-limit traversal is rejected without advancing the machine continuity
+floor. Explicit `bootstrap --force-full-check` authenticates the full chain
+without these cumulative limits, while retaining per-object limits; its time
+and memory costs grow with history length.
 
-A returning client traverses from `HEAD` to its pinned manifest, validates each
-new hop, and imports only the deltas of generations newer than its recorded
-import progress. Import progress is local cache state, not an authorization
-source.
+A returning client whose protected machine floor contains the authenticated
+manifest and policy traverses from `HEAD` to that exact manifest ID, validates
+each new hop using the cached policy, and imports only the deltas of generations
+newer than its recorded import progress. If the floor lacks that state, it
+traverses to genesis. Import progress is local cache state, not an authorization
+source. The floor's cached manifest and policy are the trusted validation
+anchor and MUST be updated atomically with its ID and generation.
+
+A fresh device may instead import a checkpoint whose exact manifest ID was
+obtained through an authenticated channel. It validates that manifest's
+signature under its embedded policy, verifies that storage's current head
+descends from the exact checkpoint ID, imports the checkpoint's full-history
+pack followed by newer deltas, and checks the complete current Git graph.
+The out-of-band ID is the authority for the history before the checkpoint;
+the embedded policy alone does not prove its own ancestry. An old but valid
+checkpoint ID does not prove global freshness. Checkpoint publication does
+not delete old manifests, packs, or carrier Git history.
 
 After importing the required deltas, the client MUST verify that every current
 ref resolves to a complete local Git object graph before moving remote-tracking
@@ -633,15 +651,17 @@ Unreachable losing objects require later GC.
 ## 11. Continuity and invitations
 
 Each machine pins, per repository root, the root, manifest ID and generation,
-and policy generation (section 9). The policy ID is not stored separately:
-the pinned manifest ID binds it through the manifest's sealed header. The
-floor advances after any successful validation or publication on the machine.
+policy generation, and the authenticated manifest and policy needed to resume
+validation (section 9). The pinned manifest ID binds the cached policy through
+the manifest's sealed header. The floor advances after manifest-chain
+authentication or publication, even if a later pack import fails.
 It rejects rollback, a non-descendant manifest, policy rollback/sideways
 movement, root substitution, and generation gaps. Floor updates are serialized
 and monotonic across concurrent processes.
 
-A fresh device should receive an administrator-authorized invitation checkpoint
-through an authenticated channel containing:
+A fresh device importing a checkpoint MUST receive its exact checkpoint
+manifest ID through an authenticated channel. A future invitation format may
+add structured provenance and freshness information, for example:
 
 ```text
 repository_root
@@ -673,8 +693,9 @@ least `max(N, 4)`.
 Large-content storage is `sum(pack ciphertext sizes)`, independent of `N`.
 Envelope metadata is linear in the padded reader count per generation and
 accumulates as approximately `O(generations * P * G)`. A membership transition
-also carries the signed policy history inside its encrypted body. Fresh clone
-work is linear in manifest generations until checkpoint compaction exists.
+also carries the signed policy history inside its encrypted body. Full
+bootstrap work is linear in manifest generations. A checkpoint import traverses
+only from the current head to its expected checkpoint ID.
 
 ## 13. Security limits
 
@@ -762,7 +783,7 @@ both and can be reused when the original owner key creates the v7 genesis.
 
 ### 14.4 Planned extensions
 
-1. checkpoint/compaction and garbage collection with explicit authority;
+1. checkpoint garbage collection and carrier history compaction with explicit authority;
 2. M-of-N administrator authorization and recovery;
 3. automatic stale-push retry with explicit merge behavior;
 4. S3 backend with conditional-write compatibility tests;

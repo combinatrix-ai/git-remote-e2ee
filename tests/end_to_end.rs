@@ -113,6 +113,60 @@ struct FixedHistoryStorage {
     manifests: BTreeMap<String, Vec<u8>>,
 }
 
+#[derive(Clone)]
+struct CountingManifestStorage {
+    inner: FilesystemStorage,
+    reads: Arc<AtomicUsize>,
+}
+
+impl Storage for CountingManifestStorage {
+    fn begin_object(&self, kind: ObjectKind) -> Result<Box<dyn ObjectStage>> {
+        self.inner.begin_object(kind)
+    }
+
+    fn open_object(&self, kind: ObjectKind, id: &str) -> Result<Box<dyn Read + Send>> {
+        if matches!(kind, ObjectKind::Manifest) {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.open_object(kind, id)
+    }
+
+    fn read_head(&self) -> Result<Option<String>> {
+        self.inner.read_head()
+    }
+
+    fn compare_and_swap_head(&self, expected: Option<&str>, next: &str) -> Result<()> {
+        self.inner.compare_and_swap_head(expected, next)
+    }
+}
+
+#[test]
+fn returning_client_authenticates_only_the_new_manifest_segment() {
+    let temporary = tempfile::tempdir().unwrap();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let owner = KeyFile::generate();
+    let repository = EncryptedRepository::new(
+        CountingManifestStorage {
+            inner: FilesystemStorage::new(temporary.path().join("storage")),
+            reads: reads.clone(),
+        },
+        owner.clone(),
+        temporary.path().join("state"),
+    );
+    repository.initialize("owner").unwrap();
+    let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
+    repository
+        .add_device(
+            reader.public_device().unwrap(),
+            "reader",
+            DeviceRoles::reader(),
+        )
+        .unwrap();
+    reads.store(0, Ordering::SeqCst);
+    repository.list_devices().unwrap();
+    assert_eq!(reads.load(Ordering::SeqCst), 1);
+}
+
 impl Storage for FixedHistoryStorage {
     fn begin_object(&self, kind: ObjectKind) -> Result<Box<dyn ObjectStage>> {
         self.inner.begin_object(kind)

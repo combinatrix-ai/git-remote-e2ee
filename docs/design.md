@@ -512,6 +512,7 @@ large content storage   sum(pack ciphertext sizes), independent of N
 
 Envelope metadata remains linear in padded readers per generation. A policy
 transition also carries the signed policy history in its encrypted body. Fresh
-clone time is linear in generations until checkpoint compaction exists. The
-wire format reserves a checkpoint transition, but current clients reject it as
-unimplemented.
+full bootstrap time is linear in generations. A checkpoint transition carries
+a full pack snapshot and current signed policy; a fresh device can import it
+when its exact manifest ID arrives through a trusted channel. This is logical
+compaction only: old manifests, packs, and carrier Git history remain stored.
