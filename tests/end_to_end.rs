@@ -2493,6 +2493,60 @@ fn an_oversized_storage_head_is_invalid_and_recoverable_from_the_floor() {
 }
 
 #[test]
+fn writer_must_fetch_retained_tags_before_changing_tags() {
+    let temporary = tempfile::tempdir().unwrap();
+    let first_writer = temporary.path().join("first-writer");
+    let second_writer = temporary.path().join("second-writer");
+    initialize_git(&first_writer);
+    initialize_git(&second_writer);
+    let encrypted = EncryptedRepository::new(
+        FilesystemStorage::new(temporary.path().join("remote")),
+        KeyFile::generate(),
+        support::state_dir(),
+    );
+    encrypted.initialize("owner").unwrap();
+    let push = |repo: &Path, reference: &'static str| {
+        encrypted.push_ref(
+            &GitRepository::open(repo).unwrap(),
+            reference,
+            RefChange::Update {
+                source: reference,
+                force: false,
+            },
+        )
+    };
+    commit(&first_writer, "main\n", "main");
+    push(&first_writer, "refs/heads/main").unwrap();
+    encrypted
+        .fetch_into(&GitRepository::open(&second_writer).unwrap(), "encrypted")
+        .unwrap();
+
+    // Tag a tree the second writer never fetched.
+    commit(&first_writer, "tagged only\n", "tagged only");
+    git(&first_writer, &["tag", "first-tree", "HEAD^{tree}"]);
+    push(&first_writer, "refs/tags/first-tree").unwrap();
+
+    git(
+        &second_writer,
+        &["switch", "-q", "-c", "other", "refs/remotes/encrypted/main"],
+    );
+    commit(&second_writer, "other\n", "other");
+    git(&second_writer, &["tag", "second-tree", "HEAD^{tree}"]);
+    let (before, _) = encrypted.current_manifest().unwrap();
+    let error = format!(
+        "{:#}",
+        push(&second_writer, "refs/tags/second-tree").unwrap_err()
+    );
+    assert!(error.contains("fetch first"), "{error}");
+    assert_eq!(encrypted.current_manifest().unwrap().0, before);
+
+    encrypted
+        .fetch_into(&GitRepository::open(&second_writer).unwrap(), "encrypted")
+        .unwrap();
+    push(&second_writer, "refs/tags/second-tree").unwrap();
+}
+
+#[test]
 fn writer_can_add_branch_without_having_other_remote_branch_objects() {
     let temporary = tempfile::tempdir().unwrap();
     let first_writer = temporary.path().join("first-writer");
