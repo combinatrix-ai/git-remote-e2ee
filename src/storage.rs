@@ -728,6 +728,7 @@ struct GitChunkReader {
 
 impl GitChunkReader {
     fn new(repo: &Path, chunks: Vec<(String, String)>) -> Result<Self> {
+        let _timer = trace::Span::new("carrier_cat_file_start");
         Ok(Self {
             cat: CatFile::batch(&GitRepository::owned_work_tree(repo))?,
             chunks,
@@ -1700,6 +1701,7 @@ fn carrier_chunk_entries(
     kind: ObjectKind,
     id: &str,
 ) -> Result<CarrierListing> {
+    let _timer = trace::Span::new("carrier_chunk_listing");
     validate_id(id)?;
     let directory = format!("{}/{}/{id}", kind.directory(), &id[..2]);
     let mut child = GitRepository::owned_work_tree(repo)
