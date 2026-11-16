@@ -1,5 +1,5 @@
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::Path;
 use std::time::Instant;
 
@@ -24,6 +24,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+use crate::bounded::{self, Bounded};
 use crate::error::Unsupported;
 use crate::trace;
 
@@ -36,9 +37,11 @@ const SYNTHETIC_NONCE_SALT: &[u8] = domain!("synthetic nonce");
 pub const HPKE_ENCAPSULATED_KEY_SIZE: usize = 32;
 pub const HPKE_CIPHERTEXT_SIZE: usize = 32 + 16;
 pub const PACK_STREAM_CHUNK_SIZE: usize = 1024 * 1024;
+const MAX_PUBLIC_DEVICE_FILE_BYTES: u64 = 4 * 1024;
 const PACK_STREAM_NONCE_SIZE: usize = 19;
 const PACK_STREAM_TAG_SIZE: usize = 16;
 const PACK_STREAM_HEADER_SIZE: usize = PACK_STREAM_MAGIC.len() + 4 + PACK_STREAM_NONCE_SIZE;
+const VERIFIED_PACK_MEMORY_BYTES: usize = 8 * 1024 * 1024;
 
 type HpkeKem = X25519HkdfSha256;
 type HpkeKdf = HkdfSha256;
@@ -231,8 +234,22 @@ impl PublicDevice {
     }
 
     pub fn read(path: &Path) -> Result<Self> {
-        let bytes = fs::read(path)
-            .with_context(|| format!("read public device file {}", path.display()))?;
+        let bytes = match bounded::read_regular_bounded(path, MAX_PUBLIC_DEVICE_FILE_BYTES)
+            .with_context(|| format!("read public device file {}", path.display()))?
+        {
+            Bounded::Within(bytes) => bytes,
+            Bounded::Absent => bail!("public device file {} does not exist", path.display()),
+            Bounded::Oversized => bail!(
+                "public device file {} exceeds {MAX_PUBLIC_DEVICE_FILE_BYTES} bytes",
+                path.display()
+            ),
+            Bounded::NotRegular => {
+                bail!(
+                    "public device file {} is not a regular file",
+                    path.display()
+                )
+            }
+        };
         let public: Self = serde_json::from_slice(&bytes).context("parse public device file")?;
         validate_public_device(&public)?;
         Ok(public)
@@ -632,17 +649,7 @@ pub fn open_pack_stream(
     if chunk_size != PACK_STREAM_CHUNK_SIZE {
         bail!(Unsupported("unsupported pack stream chunk size".to_owned()))
     }
-    let segments = plaintext_size.div_ceil(PACK_STREAM_CHUNK_SIZE as u64);
-    if segments == 0 || segments >= u32::MAX as u64 {
-        bail!("pack stream exceeds segment counter limit")
-    }
-    let tag_bytes = segments
-        .checked_mul(PACK_STREAM_TAG_SIZE as u64)
-        .context("pack stream tag size overflow")?;
-    let expected_ciphertext_size = (PACK_STREAM_HEADER_SIZE as u64)
-        .checked_add(plaintext_size)
-        .and_then(|size| size.checked_add(tag_bytes))
-        .context("pack ciphertext size overflow")?;
+    let (segments, expected_ciphertext_size) = pack_stream_layout(plaintext_size)?;
 
     let mut hasher = Sha256::new();
     hasher.update(header);
@@ -715,6 +722,67 @@ pub fn open_pack_stream(
     Ok(ciphertext_count)
 }
 
+pub(crate) fn pack_stream_ciphertext_size(plaintext_size: u64) -> Result<u64> {
+    Ok(pack_stream_layout(plaintext_size)?.1)
+}
+
+fn pack_stream_layout(plaintext_size: u64) -> Result<(u64, u64)> {
+    if plaintext_size == 0 {
+        bail!("pack plaintext size must be nonzero")
+    }
+    let segments = plaintext_size.div_ceil(PACK_STREAM_CHUNK_SIZE as u64);
+    if segments >= u32::MAX as u64 {
+        bail!("pack stream exceeds segment counter limit")
+    }
+    let tag_bytes = segments
+        .checked_mul(PACK_STREAM_TAG_SIZE as u64)
+        .context("pack stream tag size overflow")?;
+    let length = (PACK_STREAM_HEADER_SIZE as u64)
+        .checked_add(plaintext_size)
+        .and_then(|size| size.checked_add(tag_bytes))
+        .context("pack ciphertext size overflow")?;
+    Ok((segments, length))
+}
+
+/// Pins the complete ciphertext named by a signed descriptor before a Git
+/// parser is started. The snapshot is encrypted and spills to a private,
+/// unlinked temporary file only for larger packs.
+pub(crate) fn snapshot_verified_pack_ciphertext(
+    key: &[u8; 32],
+    ciphertext: impl Read,
+    base_aad: &[u8],
+    plaintext_size: u64,
+    expected_id: &str,
+) -> Result<tempfile::SpooledTempFile> {
+    let mut snapshot = tempfile::spooled_tempfile(VERIFIED_PACK_MEMORY_BYTES);
+    open_pack_stream(
+        key,
+        CapturingReader {
+            source: ciphertext,
+            snapshot: &mut snapshot,
+        },
+        io::sink(),
+        base_aad,
+        plaintext_size,
+        expected_id,
+    )?;
+    snapshot.rewind()?;
+    Ok(snapshot)
+}
+
+struct CapturingReader<'a, R> {
+    source: R,
+    snapshot: &'a mut tempfile::SpooledTempFile,
+}
+
+impl<R: Read> Read for CapturingReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = self.source.read(buffer)?;
+        self.snapshot.write_all(&buffer[..read])?;
+        Ok(read)
+    }
+}
+
 pub fn object_id(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -772,6 +840,44 @@ fn validate_root(root: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn public_device_reader_bounds_received_files() {
+        let temporary = tempfile::tempdir().unwrap();
+        let public = KeyFile::generate().public_device().unwrap();
+        let path = temporary.path().join("device.public.json");
+        public.write_new(&path).unwrap();
+        assert_eq!(PublicDevice::read(&path).unwrap(), public);
+
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.resize(MAX_PUBLIC_DEVICE_FILE_BYTES as usize, b' ');
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(PublicDevice::read(&path).unwrap(), public);
+
+        bytes.push(b' ');
+        fs::write(&path, &bytes).unwrap();
+        let error = PublicDevice::read(&path).unwrap_err();
+        assert!(format!("{error:#}").contains("exceeds 4096 bytes"));
+
+        #[cfg(unix)]
+        {
+            let link = temporary.path().join("device-link.json");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            let error = PublicDevice::read(&link).unwrap_err();
+            assert!(format!("{error:#}").contains("not a regular file"));
+
+            let fifo = temporary.path().join("device-pipe.json");
+            assert!(
+                std::process::Command::new("mkfifo")
+                    .arg(&fifo)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let error = PublicDevice::read(&fifo).unwrap_err();
+            assert!(format!("{error:#}").contains("not a regular file"));
+        }
+    }
 
     #[test]
     fn dummy_envelopes_look_like_real_x25519_encapsulations() {
@@ -1001,6 +1107,107 @@ mod tests {
             authenticated_plaintext,
             plaintext[..PACK_STREAM_CHUNK_SIZE],
             "the final segment must be withheld until the ID matches"
+        );
+    }
+
+    #[test]
+    fn pack_ciphertext_snapshot_rejects_changes_before_git_receives_plaintext() {
+        let plaintext = pack_bytes(PACK_STREAM_CHUNK_SIZE + 1);
+        let key = random_key();
+        let mut encrypted = Vec::new();
+        let sealed =
+            seal_pack_stream(&key, plaintext.as_slice(), &mut encrypted, b"context").unwrap();
+        let expected_size = pack_stream_ciphertext_size(sealed.plaintext_size).unwrap();
+        assert_eq!(expected_size, encrypted.len() as u64);
+
+        let wrong_id = object_id(b"different ciphertext");
+        let error = snapshot_verified_pack_ciphertext(
+            &key,
+            encrypted.as_slice(),
+            b"context",
+            sealed.plaintext_size,
+            &wrong_id,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("pack ciphertext hash mismatch"));
+        let mut oversized = encrypted.clone();
+        oversized.push(0);
+        assert!(
+            snapshot_verified_pack_ciphertext(
+                &key,
+                oversized.as_slice(),
+                b"context",
+                sealed.plaintext_size,
+                &sealed.object_id
+            )
+            .is_err()
+        );
+
+        let snapshot = snapshot_verified_pack_ciphertext(
+            &key,
+            encrypted.as_slice(),
+            b"context",
+            sealed.plaintext_size,
+            &sealed.object_id,
+        )
+        .unwrap();
+        let mut output = Vec::new();
+        open_pack_stream(
+            &key,
+            snapshot,
+            &mut output,
+            b"context",
+            sealed.plaintext_size,
+            &sealed.object_id,
+        )
+        .unwrap();
+        assert_eq!(output, plaintext);
+    }
+
+    #[test]
+    fn pack_snapshot_stops_at_first_failed_segment() {
+        use std::cell::Cell;
+
+        struct CountingReader<'a> {
+            input: &'a [u8],
+            count: &'a Cell<usize>,
+        }
+
+        impl Read for CountingReader<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                let read = self.input.read(buffer)?;
+                self.count.set(self.count.get() + read);
+                Ok(read)
+            }
+        }
+
+        let plaintext = pack_bytes(VERIFIED_PACK_MEMORY_BYTES + PACK_STREAM_CHUNK_SIZE);
+        let key = random_key();
+        let mut encrypted = Vec::new();
+        let sealed =
+            seal_pack_stream(&key, plaintext.as_slice(), &mut encrypted, b"context").unwrap();
+        assert!(encrypted.len() > VERIFIED_PACK_MEMORY_BYTES);
+        encrypted[PACK_STREAM_HEADER_SIZE + 17] ^= 1;
+        let count = Cell::new(0);
+        let error = snapshot_verified_pack_ciphertext(
+            &key,
+            CountingReader {
+                input: &encrypted,
+                count: &count,
+            },
+            b"context",
+            sealed.plaintext_size,
+            &sealed.object_id,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("pack stream authentication failed")
+        );
+        assert_eq!(
+            count.get(),
+            PACK_STREAM_HEADER_SIZE + PACK_STREAM_CHUNK_SIZE + PACK_STREAM_TAG_SIZE
         );
     }
 

@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 
-use git_remote_e2ee::crypto::KeyFile;
+use git_remote_e2ee::crypto::{KeyFile, PublicDevice};
 
 fn run_cli(state_home: &Path, args: &[String]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_git-e2ee"))
@@ -23,13 +23,24 @@ fn dir_url(storage: &Path) -> String {
     format!("e2ee::dir:{}", storage.display())
 }
 
-fn add_device_args(storage: &Path, key: &Path, public: &Path, label: &str) -> Vec<String> {
+fn add_device_args(
+    storage: &Path,
+    key: &Path,
+    public: &Path,
+    label: &str,
+    role: &str,
+) -> Vec<String> {
+    let expected_device_id = PublicDevice::read(public).unwrap().device_id;
     vec![
         "device-add".to_owned(),
         dir_url(storage),
         path_arg(public),
         "--label".to_owned(),
         label.to_owned(),
+        "--expected-device-id".to_owned(),
+        expected_device_id,
+        "--role".to_owned(),
+        role.to_owned(),
         "--key".to_owned(),
         path_arg(key),
     ]
@@ -58,36 +69,29 @@ fn device_add_parses_roles_and_device_list_uses_role_names() {
         String::from_utf8_lossy(&initialized.stderr)
     );
 
-    let roles = [
-        ("default", None, "write"),
-        ("reader", Some("read"), "read"),
-        ("writer", Some("write"), "write"),
-        ("admin", Some("admin"), "admin"),
-    ];
+    let roles = [("reader", "read"), ("writer", "write"), ("admin", "admin")];
     let mut device_ids = Vec::new();
-    for (name, selected_role, expected_role) in roles {
+    for (name, role) in roles {
         let device_key = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
         let public = device_key.public_device().unwrap();
         let public_path = temporary.path().join(format!("{name}.public.json"));
         public.write_new(&public_path).unwrap();
-        let mut args = add_device_args(&storage, &owner_path, &public_path, name);
-        if let Some(role) = selected_role {
-            args.extend(["--role".to_owned(), role.to_owned()]);
-        }
+        let args = add_device_args(&storage, &owner_path, &public_path, name, role);
         let added = run_cli(temporary.path(), &args);
         assert!(
             added.status.success(),
             "git-e2ee device-add {name}: {}",
             String::from_utf8_lossy(&added.stderr)
         );
-        device_ids.push((public.device_id, name, expected_role));
+        device_ids.push((public.device_id, name, role));
     }
 
     let mut legacy_args = add_device_args(
         &storage,
         &owner_path,
-        &temporary.path().join("default.public.json"),
+        &temporary.path().join("writer.public.json"),
         "legacy",
+        "write",
     );
     legacy_args.push("--admin".to_owned());
     let legacy = run_cli(temporary.path(), &legacy_args);
@@ -117,6 +121,68 @@ fn device_add_parses_roles_and_device_list_uses_role_names() {
     }
     let owner_id = owner.device_id().unwrap();
     assert!(output.contains(&format!("* {owner_id}  ")));
+}
+
+#[test]
+fn device_add_rejects_substituted_identity_and_requires_explicit_role() {
+    let fixture = Fixture::initialized(Some("laptop"));
+    let (victim_id, victim) = fixture.new_device("victim");
+    let (attacker_id, attacker) = fixture.new_device("attacker");
+    let before_generation = fixture.generation();
+    let before_list = fixture.list().stdout;
+    let before_head = fs::read(fixture.storage.join("HEAD")).unwrap();
+
+    let mut substituted = add_device_args(
+        &fixture.storage,
+        &fixture.owner_path,
+        &attacker,
+        "victim",
+        "read",
+    );
+    let expected = substituted
+        .iter()
+        .position(|arg| arg == "--expected-device-id")
+        .unwrap()
+        + 1;
+    substituted[expected] = victim_id.clone();
+    let rejected = fixture.run(&substituted);
+    assert!(!rejected.status.success());
+    let stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert!(
+        stderr.contains(&victim_id) && stderr.contains(&attacker_id),
+        "{stderr}"
+    );
+    assert_eq!(fixture.generation(), before_generation);
+    assert_eq!(fixture.list().stdout, before_list);
+    assert_eq!(fs::read(fixture.storage.join("HEAD")).unwrap(), before_head);
+
+    let valid = add_device_args(
+        &fixture.storage,
+        &fixture.owner_path,
+        &victim,
+        "victim",
+        "read",
+    );
+    for missing in ["--expected-device-id", "--role"] {
+        let mut args = valid.clone();
+        let position = args.iter().position(|arg| arg == missing).unwrap();
+        args.drain(position..=position + 1);
+        let rejected = fixture.run(&args);
+        assert!(!rejected.status.success(), "accepted missing {missing}");
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr).contains(missing),
+            "missing {missing} was not explained"
+        );
+        assert_eq!(fixture.generation(), before_generation);
+        assert_eq!(fs::read(fixture.storage.join("HEAD")).unwrap(), before_head);
+    }
+
+    assert!(fixture.run(&valid).status.success());
+    assert!(
+        String::from_utf8(fixture.list().stdout)
+            .unwrap()
+            .contains(&format!("{victim_id}  victim  role=read  status=active"))
+    );
 }
 
 #[test]
@@ -186,7 +252,7 @@ fn continuity_floor_survives_moving_the_key() {
     assert!(copied.success());
     let added = run_cli(
         temporary.path(),
-        &add_device_args(&storage, &owner_path, &first, "first"),
+        &add_device_args(&storage, &owner_path, &first, "first", "write"),
     );
     assert!(
         added.status.success(),
@@ -199,7 +265,7 @@ fn continuity_floor_survives_moving_the_key() {
     fs::rename(&owner_path, &moved_path).unwrap();
     let rolled_back = run_cli(
         temporary.path(),
-        &add_device_args(&storage, &moved_path, &second, "second"),
+        &add_device_args(&storage, &moved_path, &second, "second", "write"),
     );
     assert!(!rolled_back.status.success());
     let stderr = String::from_utf8_lossy(&rolled_back.stderr);
@@ -275,6 +341,7 @@ impl Fixture {
             &self.owner_path,
             public,
             label,
+            "write",
         ))
     }
 

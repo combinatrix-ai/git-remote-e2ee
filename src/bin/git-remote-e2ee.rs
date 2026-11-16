@@ -9,11 +9,14 @@ use git_remote_e2ee::repository::{
     EncryptedRepository, PushMode, PushRejection, ReadOnlyDevice, RefChange, RefOutcome, RefPush,
 };
 use git_remote_e2ee::storage::{CasConflict, FilesystemStorage, GitStorage, Storage};
-use git_remote_e2ee::url::StorageUrl;
+use git_remote_e2ee::url::{
+    StorageUrl, is_control_or_invisible, redact_carrier_address, safe_diagnostic,
+    safe_diagnostic_with_args,
+};
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("e2ee: {error:#}");
+        eprintln!("e2ee: {}", safe_diagnostic(&format!("{error:#}")));
         std::process::exit(1);
     }
 }
@@ -28,11 +31,23 @@ fn run() -> Result<()> {
 
     let local = GitRepository::from_environment()?
         .context("the e2ee remote helper must run inside a Git repository")?;
+    let state_dir = default_state_dir()?;
     let key_path = configured_key_path(&local, &remote_name)?;
     let key = KeyFile::read(&key_path)?;
     let storage = StorageUrl::parse(&url)?;
+    if matches!(&storage, StorageUrl::TrustedLocalGit(_)) {
+        let passed = format!("e2ee::{}", url.strip_prefix("e2ee::").unwrap_or(&url));
+        let chosen = if remote_name.starts_with("e2ee::trusted-local:") {
+            remote_name.clone()
+        } else {
+            configured_local_value(&local, &format!("remote.{remote_name}.url"))?
+                .context("trusted-local carrier requires a configured remote URL")?
+        };
+        if chosen != passed {
+            bail!("trusted-local carrier URL was rewritten before reaching the helper")
+        }
+    }
     persist_absolute_url(&local, &remote_name, &url, &storage)?;
-    let state_dir = default_state_dir()?;
     match storage {
         StorageUrl::Directory(path) => run_protocol(
             EncryptedRepository::new(FilesystemStorage::new(path), key, state_dir),
@@ -41,6 +56,11 @@ fn run() -> Result<()> {
         ),
         StorageUrl::Git(remote) => run_protocol(
             EncryptedRepository::new(GitStorage::open(&remote)?, key, state_dir),
+            &local,
+            remote_name,
+        ),
+        StorageUrl::TrustedLocalGit(remote) => run_protocol(
+            EncryptedRepository::new(GitStorage::open_trusted_local(&remote)?, key, state_dir),
             &local,
             remote_name,
         ),
@@ -68,7 +88,17 @@ fn run_protocol<S: Storage>(
                 writeln!(output, "fetch")?;
                 writeln!(output, "push")?;
                 writeln!(output, "option")?;
-                writeln!(output, "refspec refs/heads/*:refs/remotes/{remote_name}/*")?;
+                let tracking_name = if remote_name.contains(':')
+                    || remote_name.chars().any(is_control_or_invisible)
+                {
+                    "e2ee"
+                } else {
+                    remote_name.as_str()
+                };
+                writeln!(
+                    output,
+                    "refspec refs/heads/*:refs/remotes/{tracking_name}/*"
+                )?;
                 writeln!(output, "refspec refs/tags/*:refs/tags/*")?;
                 writeln!(output)?;
                 output.flush()?;
@@ -208,15 +238,24 @@ fn report_push_error(
     destination: &str,
     error: &anyhow::Error,
 ) -> Result<()> {
+    let destination = safe_diagnostic(destination);
     if error.is::<ReadOnlyDevice>() {
-        let message = format!(
-            "this device is read-only for {remote_name}; ask an administrator for the write role"
-        );
+        let message = safe_diagnostic(&format!(
+            "this device is read-only for {}; ask an administrator for the write role",
+            redact_carrier_address(remote_name)
+        ));
         writeln!(output, "error {destination} {message}")?;
         eprintln!("e2ee: {destination}: {message}");
     } else {
-        writeln!(output, "error {destination} {}", push_status(error))?;
-        eprintln!("e2ee: {destination}: {}", single_line(error));
+        writeln!(
+            output,
+            "error {destination} {}",
+            safe_diagnostic_with_args(&push_status(error), &[remote_name])
+        )?;
+        eprintln!(
+            "e2ee: {destination}: {}",
+            safe_diagnostic_with_args(&single_line(error), &[remote_name])
+        );
     }
     Ok(())
 }
@@ -232,7 +271,7 @@ fn push_status(error: &anyhow::Error) -> String {
 }
 
 fn single_line(error: &anyhow::Error) -> String {
-    format!("{error:#}")
+    safe_diagnostic(&format!("{error:#}"))
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -266,7 +305,10 @@ fn configured_key_path(local: &GitRepository, remote_name: &str) -> Result<PathB
             .context("persist clone-time key config")?;
         return Ok(path);
     }
-    bail!("missing Git config {key} (or clone-time e2ee.key)")
+    bail!(
+        "missing Git config remote.{}.e2ee-key (or clone-time e2ee.key)",
+        redact_carrier_address(remote_name)
+    )
 }
 
 /// A relative storage path in a clone URL is resolved against the directory
@@ -278,7 +320,7 @@ fn persist_absolute_url(
     url: &str,
     storage: &StorageUrl,
 ) -> Result<()> {
-    let absolute = storage.to_string();
+    let absolute = storage.to_config_string();
     let key = format!("remote.{remote_name}.url");
     let Some(configured) = configured_value(local, &key)? else {
         return Ok(());
@@ -297,8 +339,9 @@ fn set_local_config(local: &GitRepository, key: &str, value: &str) -> Result<()>
         .output()?;
     if !output.status.success() {
         bail!(
-            "git config {key} failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            "git config {} failed ({})",
+            safe_diagnostic_with_args(key, &[key]),
+            output.status
         )
     }
     Ok(())
@@ -306,6 +349,18 @@ fn set_local_config(local: &GitRepository, key: &str, value: &str) -> Result<()>
 
 fn configured_value(local: &GitRepository, key: &str) -> Result<Option<String>> {
     let output = local.git().args(["config", "--get", key]).output()?;
+    if output.status.success() {
+        Ok(Some(String::from_utf8(output.stdout)?.trim().to_owned()))
+    } else {
+        Ok(None)
+    }
+}
+
+fn configured_local_value(local: &GitRepository, key: &str) -> Result<Option<String>> {
+    let output = local
+        .git()
+        .args(["config", "--local", "--get", key])
+        .output()?;
     if output.status.success() {
         Ok(Some(String::from_utf8(output.stdout)?.trim().to_owned()))
     } else {
@@ -337,5 +392,38 @@ mod tests {
         })
         .context("publish manifest");
         assert_eq!(push_status(&error), "fetch first");
+    }
+
+    #[test]
+    fn direct_scp_remote_name_is_redacted_in_push_status() {
+        let mut output = Vec::new();
+        let remote = "e2ee::alice@host:private-token/repo.git";
+        report_push_error(
+            &mut output,
+            remote,
+            "refs/heads/main",
+            &ReadOnlyDevice.into(),
+        )
+        .unwrap();
+        let status = String::from_utf8(output).unwrap();
+        assert!(status.contains("e2ee:[redacted]"), "{status}");
+        assert!(!status.contains("private-token"));
+    }
+
+    #[test]
+    fn rejected_push_status_escapes_controls_without_extra_protocol_lines() {
+        let mut output = Vec::new();
+        report_push_error(
+            &mut output,
+            "origin",
+            "refs/heads/bad\n\u{1b}[31m",
+            &anyhow::anyhow!("bad\u{1b}]52;c;payload\u{7}"),
+        )
+        .unwrap();
+        let status = String::from_utf8(output).unwrap();
+        assert_eq!(status.lines().count(), 1);
+        assert!(status.contains("bad\\n\\u{1b}[31m"), "{status}");
+        assert!(status.contains("bad\\u{1b}]52;c;payload\\u{7}"), "{status}");
+        assert!(!status.contains(['\u{1b}', '\u{7}']));
     }
 }

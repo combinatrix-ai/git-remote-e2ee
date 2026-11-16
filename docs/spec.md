@@ -351,11 +351,14 @@ exactly once, consume the exact computed ciphertext length, reject trailing
 bytes, and verify SHA-256 of the complete stored stream against the descriptor
 ID. A malformed header, size mismatch, counter overflow, short read, reordered
 or duplicated segment, authentication failure, trailing byte, or hash mismatch
-is fatal. Plaintext may stream into `git index-pack` before the final object hash
-is known, but no imported-state pin or remote ref may move until all
-cryptographic, content-address, process, and Git-connectivity checks succeed.
-Listing an authenticated manifest does not advance the continuity floor. A
-publisher advances its own floor only after its compare-and-swap succeeds.
+is fatal. Before starting `git index-pack`, a reader MUST verify the complete
+stored ciphertext against the signed descriptor ID in a stable, size-bounded
+snapshot. The verified ciphertext may then be decrypted into Git. No checkout
+import progress or remote ref may move until all cryptographic,
+content-address, process, and Git-connectivity checks succeed.
+Listing an authenticated, continuous manifest chain advances the machine
+continuity floor even if a later pack or Git-connectivity check fails. A
+publisher advances its own floor after its compare-and-swap succeeds.
 
 Immutable writes MUST be staged within the storage backend and become visible
 under their ciphertext ID only after the complete streamed hash matches that
@@ -475,6 +478,12 @@ A fresh clone traverses manifest and key links from `HEAD` to genesis,
 validates each hop, collects pack deltas, decrypts packs with their creation
 generation keys, and imports them oldest-first.
 
+Every normal read, including listing, fetch, push, and verification, applies a
+fixed cumulative budget before retaining or decrypting each predecessor. This
+version limits traversal to 64 MiB of encrypted manifest data and 1,000,000
+estimated cryptographic operations. An over-limit chain is rejected without
+advancing the machine continuity floor.
+
 A returning client traverses from `HEAD` to its pinned manifest, validates each
 new hop, and imports only the deltas of generations newer than its recorded
 import progress. Import progress is local cache state, not an authorization
@@ -482,11 +491,12 @@ source.
 
 After importing the required deltas, the client MUST verify that every current
 ref resolves to a complete local Git object graph before moving remote-tracking
-refs or pinning the new head. A signed ref advance whose required pack delta is
-absent is invalid even when every cryptographic check succeeds, and a fetch
-that finds an incomplete graph fails. A writer publishing a successor verifies
-only the refs it adds or changes (§8.1); refs it carries over unchanged keep
-the parent's state and are verified by readers on fetch.
+refs or recording checkout import progress. The machine continuity floor
+advances when the signed manifest chain authenticates and passes continuity,
+even if the fetch later finds missing packs or an incomplete Git graph. Such a
+fetch fails without changing refs or import progress. A writer publishing a
+successor verifies only the refs it adds or changes (§8.1); refs it carries
+over unchanged keep the parent's state and are verified by readers on fetch.
 
 Each machine (per OS user) keeps one continuity floor per repository root:
 repository root, manifest ID and generation, and policy generation. Every

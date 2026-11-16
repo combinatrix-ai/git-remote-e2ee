@@ -35,7 +35,6 @@ source_ref=$(git -C "$source_repo" symbolic-ref --quiet HEAD) || {
   exit 2
 }
 source_branch=${source_ref#refs/heads/}
-source_head=$(git -C "$source_repo" rev-parse HEAD)
 source_git_dir=$(git -C "$source_repo" rev-parse --absolute-git-dir)
 source_git_kib=$(du -sk "$source_git_dir" | awk '{print $1}')
 available_kib=$(df -Pk "${TMPDIR:-/tmp}" | awk 'NR == 2 {print $4}')
@@ -278,10 +277,14 @@ repository_root=$(sed -n 's/^[[:space:]]*"repository_root": "\([^"]*\)",$/\1/p' 
   --output "$work/new-user.key.json" >/dev/null
 "$git_e2ee" device-export --key "$work/new-user.key.json" \
   --output "$work/new-user.public.json" >/dev/null
+new_user_id=$(sed -n 's/^[[:space:]]*"device_id": "\([^"]*\)",$/\1/p' \
+  "$work/new-user.public.json")
+[[ -n $new_user_id ]]
 object_snapshot "$work/e2ee-storage" >"$work/packs-before-device-add.sha256"
 run_phase add_user e2ee device-add "$work/e2ee-storage" "$work/e2ee-new-client" \
   "$git_e2ee" device-add "e2ee::dir:$work/e2ee-storage" "$work/new-user.public.json" \
-    --label new-user --key "$work/repository.key.json"
+    --label new-user --expected-device-id "$new_user_id" --role read \
+    --key "$work/repository.key.json"
 active_reader_key="$work/new-user.key.json"
 if (( total_readers > 2 )); then
   for reader_number in $(seq 3 "$total_readers"); do
@@ -292,10 +295,14 @@ if (( total_readers > 2 )); then
       --output "$reader_key" >/dev/null
     "$git_e2ee" device-export --key "$reader_key" \
       --output "$reader_public" >/dev/null
+    reader_id=$(sed -n 's/^[[:space:]]*"device_id": "\([^"]*\)",$/\1/p' \
+      "$reader_public")
+    [[ -n $reader_id ]]
     run_phase "add_reader_$reader_label" e2ee device-add \
       "$work/e2ee-storage" "$work/e2ee-new-client" \
       "$git_e2ee" device-add "e2ee::dir:$work/e2ee-storage" "$reader_public" \
-        --label "reader-$reader_label" --key "$work/repository.key.json"
+        --label "reader-$reader_label" --expected-device-id "$reader_id" \
+        --role read --key "$work/repository.key.json"
     active_reader_key=$reader_key
   done
 fi
@@ -352,15 +359,13 @@ cat >"$results_dir/summary.json" <<JSON
   "architecture": "$(uname -m)",
   "crate_commit": "$crate_sha",
   "crate_dirty": $crate_dirty,
-  "source_head": "$source_head",
   "source_commits": $source_commits,
   "source_files": $source_files,
   "source_git_bytes": $((source_git_kib * 1024)),
   "source_reachable_disk_bytes": $source_reachable_bytes,
   "total_readers": $total_readers,
   "added_readers": $((total_readers - 1)),
-  "device_add_pack_snapshot_unchanged": true,
-  "final_head": "$expected"
+  "device_add_pack_snapshot_unchanged": true
 }
 JSON
 

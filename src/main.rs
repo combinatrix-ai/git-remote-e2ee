@@ -12,7 +12,9 @@ use git_remote_e2ee::repository::{
     EncryptedRepository, InitializeError, RecoveryOptions, RecoveryReport,
 };
 use git_remote_e2ee::storage::{FilesystemStorage, GitStorage};
-use git_remote_e2ee::url::StorageUrl;
+use git_remote_e2ee::url::{
+    StorageUrl, redact_carrier_address, safe_diagnostic, safe_diagnostic_with_args,
+};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -87,7 +89,10 @@ enum Command {
         /// Label shown in `device-list`; unique among active devices
         #[arg(long)]
         label: String,
-        #[arg(long, value_enum, default_value = "write")]
+        /// Device ID confirmed with its owner through a separate trusted channel
+        #[arg(long)]
+        expected_device_id: String,
+        #[arg(long, value_enum)]
         role: DeviceRole,
         #[arg(long)]
         key: Option<PathBuf>,
@@ -146,7 +151,10 @@ impl Target {
                 let key = git_config(repository, &format!("remote.{target}.e2ee-key"), true)?;
                 (url, key.map(PathBuf::from))
             }
-            (Some(url), _) => bail!("Git remote {target} is not an e2ee:: remote ({url})"),
+            (Some(url), _) => bail!(
+                "Git remote {target} is not an e2ee:: remote ({})",
+                redact_carrier_address(&url)
+            ),
             (None, _) if target.starts_with("e2ee::") || target.contains(['/', ':']) => {
                 (target.to_owned(), None)
             }
@@ -154,9 +162,12 @@ impl Target {
                 "no Git remote named {target}; give a storage URL such as e2ee::https://host/you/repo.git"
             ),
         };
-        let key = key
-            .or(configured_key)
-            .with_context(|| format!("no key configured for {target}; pass --key <path>"))?;
+        let key = key.or(configured_key).with_context(|| {
+            format!(
+                "no key configured for {}; pass --key <path>",
+                redact_carrier_address(target)
+            )
+        })?;
         Ok(Self {
             storage: StorageUrl::parse(&url)?,
             key,
@@ -182,11 +193,26 @@ macro_rules! with_repository {
                     EncryptedRepository::new(GitStorage::open(remote)?, key, state_dir);
                 $body
             }
+            StorageUrl::TrustedLocalGit(remote) => {
+                let $repository = EncryptedRepository::new(
+                    GitStorage::open_trusted_local(remote)?,
+                    key,
+                    state_dir,
+                );
+                $body
+            }
         }
     }};
 }
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("Error: {}", safe_diagnostic(&format!("{error:?}")));
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Keygen {
@@ -204,7 +230,7 @@ fn main() -> Result<()> {
             key.write_new(&output)?;
             println!(
                 "created {} for repository root {}",
-                output.display(),
+                safe_diagnostic(&output.display().to_string()),
                 key.repository_root
             );
         }
@@ -214,7 +240,7 @@ fn main() -> Result<()> {
             println!(
                 "exported device {} to {}",
                 public.device_id,
-                output.display()
+                safe_diagnostic(&output.display().to_string())
             );
         }
         Command::Init {
@@ -245,7 +271,10 @@ fn main() -> Result<()> {
                         None => default_key_path(&generated.repository_root)?,
                     };
                     generated.write_new(&path)?;
-                    println!("created key {} (administrator)", path.display());
+                    println!(
+                        "created key {} (administrator)",
+                        safe_diagnostic(&path.display().to_string())
+                    );
                     created_key = Some(path.clone());
                     path
                 }
@@ -278,7 +307,7 @@ fn main() -> Result<()> {
             if let Some(local) = &local {
                 run_git(
                     local,
-                    &["remote", "add", &name, &target.storage.to_string()],
+                    &["remote", "add", &name, &target.storage.to_config_string()],
                 )?;
                 run_git(
                     local,
@@ -288,7 +317,7 @@ fn main() -> Result<()> {
                         &target.key.to_string_lossy(),
                     ],
                 )?;
-                println!("added remote {name}");
+                println!("added remote {}", safe_diagnostic(&name));
             }
         }
         Command::Verify { target, key } => {
@@ -307,6 +336,7 @@ fn main() -> Result<()> {
             target,
             device,
             label,
+            expected_device_id,
             role,
             key,
         } => {
@@ -314,6 +344,11 @@ fn main() -> Result<()> {
                 Target::resolve(&target, key, GitRepository::from_environment()?.as_ref())?;
             let public = PublicDevice::read(&device)?;
             let device_id = public.device_id.clone();
+            if device_id != expected_device_id {
+                bail!(
+                    "public device ID {device_id} does not match --expected-device-id {expected_device_id}"
+                )
+            }
             let roles = DeviceRoles::from(role);
             let (manifest, policy) = with_repository!(&target, |repository| {
                 repository.add_device(public, &label, roles)?
@@ -428,10 +463,16 @@ fn git_config(repository: &GitRepository, key: &str, path: bool) -> Result<Optio
 fn run_git(repository: &GitRepository, args: &[&str]) -> Result<()> {
     let output = repository.git().args(args).output()?;
     if !output.status.success() {
+        if args.starts_with(&["remote", "add"]) {
+            bail!("git remote add failed ({})", output.status)
+        }
         bail!(
             "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
+            args.iter()
+                .map(|arg| redact_carrier_address(arg))
+                .collect::<Vec<_>>()
+                .join(" "),
+            safe_diagnostic_with_args(String::from_utf8_lossy(&output.stderr).trim(), args)
         )
     }
     Ok(())

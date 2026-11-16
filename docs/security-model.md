@@ -8,9 +8,9 @@ guarantee:
 - authenticity and integrity of every fetched state: only devices with write
   authority under the authenticated policy history can author a state that
   conforming clients accept;
-- continuity for a clone that has synced before: it rejects any state older
-  than, or diverging from, its continuity floor, the newest state it accepted
-  after a complete connectivity check or its own successful push;
+- continuity for a machine with a floor for this repository root: it rejects
+  any state older than, or diverging from, the newest authenticated continuous
+  head it observed, even if a later pack check or fetch failed;
 - that a revoked device gets no keys for generations that conforming writers
   build on top of its revocation.
 
@@ -26,8 +26,8 @@ It does **not** prevent:
 
 - the host or anyone with storage write access deleting data, corrupting
   `HEAD`, or refusing service;
-- a brand-new clone, or a clone that has not synced since, being shown an old
-  or forked history, or different clients being shown different histories
+- a machine without a continuity floor being shown an old or forked history,
+  or different machines being shown different histories
   (that needs an external anchor, which is on the roadmap);
 - a revoked writer or administrator creating a valid-looking fork from before
   its revocation, which clients that never saw the revocation cannot tell apart;

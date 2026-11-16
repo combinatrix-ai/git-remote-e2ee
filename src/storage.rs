@@ -18,6 +18,7 @@ use crate::error::{BudgetExhausted, ObjectUnavailable, Unsupported};
 use crate::gitcmd::{self, GitRepository};
 use crate::refname;
 use crate::trace;
+use crate::url::{redact_carrier_address, safe_diagnostic, safe_diagnostic_with_args};
 
 #[derive(Debug, Error)]
 #[error("head changed concurrently (expected {expected:?}, actual {actual:?})")]
@@ -147,6 +148,7 @@ pub trait Storage {
         &self,
         _max_commits: usize,
         _max_manifest_bytes: u64,
+        _max_candidates: usize,
     ) -> Result<Option<RecoveryHistory>> {
         Ok(None)
     }
@@ -237,6 +239,7 @@ pub struct RecoveryCommit {
 pub struct RecoveryHistory {
     pub commits: Vec<RecoveryCommit>,
     pub manifests: std::collections::BTreeMap<String, Vec<u8>>,
+    pub manifest_bytes_read: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -287,7 +290,9 @@ fn check_storage_format(location: &str, format: Option<&[u8]>, head_present: boo
         }
     };
     bail!(
-        "storage at {location} uses format {found}; this git-remote-e2ee reads format {}",
+        "storage at {} uses format {}; this git-remote-e2ee reads format {}",
+        redact_carrier_address(location),
+        safe_diagnostic(&found),
         crate::FORMAT_VERSION
     )
 }
@@ -624,7 +629,10 @@ const CARRIER_DEFAULT_BRANCH: &str = "main";
 const CARRIER_CHUNK_SIZE: usize = CARRIER_CHUNK_BYTES as usize;
 /// Bounds one object's `ls-tree` listing: a few hundred bytes per chunk entry.
 const MAX_CARRIER_LISTING_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_CARRIER_INDEX_ENTRIES: u64 = 100_000;
+const MAX_CARRIER_INDEX_PATH_BYTES: u64 = 16 * 1024 * 1024;
 const CARRIER_ATTRIBUTES: &[u8] = b"* -delta\n";
+const CARRIER_STAGING_ATTRIBUTES: &[u8] = b"* -filter -text -ident -working-tree-encoding -eol\n";
 const CARRIER_CACHE_ENV: &str = "GIT_REMOTE_E2EE_CACHE_DIR";
 /// Each cache serves one (remote, branch) pair, so one fixed ref suffices.
 const CARRIER_CACHE_FETCH_REF: &str = "refs/heads/carrier";
@@ -648,6 +656,7 @@ pub struct GitStorage {
     location: String,
     remote: String,
     branch: String,
+    trusted_local: bool,
     /// Set when the selected branch is absent but the remote still has a
     /// format 4 branch, so reads and initialization stop instead of
     /// starting a second storage beside it.
@@ -950,15 +959,38 @@ impl GitStorage {
     /// Opens `remote`, optionally suffixed with `#<branch>` to select the
     /// carrier branch (default `main`).
     pub fn open(location: &str) -> Result<Self> {
+        Self::open_with_trust(location, false)
+    }
+
+    /// Opens a local Git carrier whose receive hooks the caller trusts to
+    /// execute with this process's privileges.
+    pub fn open_trusted_local(location: &str) -> Result<Self> {
+        Self::open_with_trust(location, true)
+    }
+
+    fn open_with_trust(location: &str, trusted_local: bool) -> Result<Self> {
         let (remote, branch) = parse_carrier_location(location)?;
         let remote = remote.as_str();
         let branch = branch.as_str();
+        if trusted_local {
+            if !Path::new(remote).is_absolute() {
+                bail!("trusted local Git carrier requires an absolute path")
+            }
+        } else if crate::url::is_git_helper_address(remote) {
+            bail!("Git remote-helper syntax is not allowed for a carrier")
+        } else if crate::url::is_local_git_carrier(remote) {
+            bail!(
+                "local Git carrier requires e2ee::trusted-local:/absolute/path; use e2ee::dir:/path for untrusted local storage"
+            )
+        } else if !crate::url::has_supported_git_scheme(remote) {
+            bail!("unsupported Git carrier URL scheme")
+        }
 
         let lock_timer = trace::Span::new("carrier_cache_lock");
         let mut cache = CarrierCache::lock(remote, branch)?;
         drop(lock_timer);
         let fetch_timer = trace::Span::new("carrier_cache_fetch");
-        let mut base_commit = cache.refresh(remote, branch)?;
+        let mut base_commit = cache.refresh(remote, branch, trusted_local)?;
         drop(fetch_timer);
         let mut checkout = tempfile::Builder::new()
             .prefix("git-remote-e2ee-carrier-")
@@ -972,7 +1004,7 @@ impl GitStorage {
             }
             drop(checkout);
             cache.rebuild()?;
-            base_commit = cache.refresh(remote, branch)?;
+            base_commit = cache.refresh(remote, branch, trusted_local)?;
             checkout = tempfile::Builder::new()
                 .prefix("git-remote-e2ee-carrier-")
                 .tempdir()?;
@@ -982,7 +1014,7 @@ impl GitStorage {
         drop(checkout_timer);
         let format_4_branch = base_commit.is_none()
             && branch != FORMAT_4_BRANCH
-            && remote_has_branch(&cache.path, remote, FORMAT_4_BRANCH)?;
+            && remote_has_branch(&cache.path, remote, FORMAT_4_BRANCH, trusted_local)?;
         drop(cache);
 
         Ok(Self {
@@ -990,6 +1022,7 @@ impl GitStorage {
             location: location.to_owned(),
             remote: remote.to_owned(),
             branch: branch.to_owned(),
+            trusted_local,
             format_4_branch,
             state: Mutex::new(GitStorageState { base_commit }),
             manifest_listings: Mutex::new(None),
@@ -1043,7 +1076,7 @@ impl GitStorage {
                 bail!(Unsupported(format!(
                     "branch {} of {} holds format 4 storage; this git-remote-e2ee reads format {}",
                     self.branch,
-                    self.remote,
+                    redact_carrier_address(&self.remote),
                     crate::FORMAT_VERSION
                 )))
             }
@@ -1051,7 +1084,7 @@ impl GitStorage {
                 bail!(Unsupported(format!(
                     "{remote} has no storage on branch {branch}, but its branch {FORMAT_4_BRANCH} holds format 4 storage; this git-remote-e2ee reads format {}. Migrate that storage to format {0} and delete the branch before using this remote",
                     crate::FORMAT_VERSION,
-                    remote = self.remote,
+                    remote = redact_carrier_address(&self.remote),
                     branch = self.branch,
                 )))
             }
@@ -1075,9 +1108,9 @@ impl GitStorage {
     fn refuse_foreign_branch(&self, base_commit: &Option<String>) -> Result<()> {
         if base_commit.is_some() {
             return Err(StorageOccupied(format!(
-                "branch {branch} of {remote} already exists; use an empty repository or choose another branch with e2ee::{remote}#<branch>",
+                "branch {branch} of {remote} already exists; use an empty repository or append #<branch> to the configured carrier URL to choose another branch",
                 branch = self.branch,
-                remote = self.remote,
+                remote = redact_carrier_address(&self.remote),
             ))
             .into());
         }
@@ -1299,6 +1332,7 @@ impl GitStorage {
         commit: &str,
         kind: ObjectKind,
         id: &str,
+        max_bytes: u64,
         mut sink: impl FnMut(usize, &[u8]) -> Result<()>,
     ) -> Result<bool> {
         let CarrierListing::Chunks(chunks) = self.chunk_entries_at(commit, kind, id)? else {
@@ -1307,14 +1341,24 @@ impl GitStorage {
         let mut reader = GitChunkReader::new(self.root(), chunks)?;
         let mut hasher = Sha256::new();
         let mut buffer = vec![0_u8; 64 * 1024];
+        let mut bytes_read = 0_u64;
         loop {
-            let read = match reader.read(&mut buffer) {
+            let limit = buffer
+                .len()
+                .min(max_bytes.saturating_sub(bytes_read).saturating_add(1) as usize);
+            let read = match reader.read(&mut buffer[..limit]) {
                 Ok(0) => break,
                 Ok(read) => read,
                 Err(error) if error.kind() == std::io::ErrorKind::InvalidData => return Ok(false),
                 Err(error) => return Err(error.into()),
             };
             sink(reader.chunk_index(), &buffer[..read])?;
+            bytes_read += read as u64;
+            if bytes_read > max_bytes {
+                bail!(BudgetExhausted(
+                    "carrier copy byte budget exhausted".to_owned()
+                ))
+            }
             hasher.update(&buffer[..read]);
         }
         Ok(hex::encode(hasher.finalize()) == id)
@@ -1353,9 +1397,14 @@ impl GitStorage {
         let add_timer = trace::Span::new("carrier_git_add");
         stage_carrier_checkout(self.root(), &cache.path.join("objects"))?;
         drop(add_timer);
+        ensure_carrier_index_budget(self.root(), &["ls-files", "-z"])?;
         let commit_timer = trace::Span::new("carrier_git_commit");
         let objects = cache.path.join("objects");
         let tree = git_text_with_object_directory(self.root(), &objects, &["write-tree"])?;
+        ensure_carrier_index_budget(
+            self.root(),
+            &["ls-tree", "-r", "-t", "-z", "--name-only", &tree],
+        )?;
         let mut commit_tree = vec!["commit-tree", "--no-gpg-sign", "-m", CARRIER_COMMIT_MESSAGE];
         if let Some(parent) = base_commit {
             commit_tree.extend(["-p", parent]);
@@ -1373,19 +1422,16 @@ impl GitStorage {
         drop(commit_timer);
         let push_timer = trace::Span::new("carrier_git_push");
         let push = GitRepository::owned_work_tree(self.root())
-            .transport()
-            .args(["push", "--quiet", "--no-verify", "origin"])
+            .transport(self.trusted_local)
+            .args(["push", "--quiet", "--no-verify", self.remote.as_str()])
             .arg(format!("HEAD:refs/heads/{}", self.branch))
             .output()?;
         drop(push_timer);
         if !push.status.success() {
-            let push_error = anyhow::anyhow!(
-                "git push carrier branch failed: {}",
-                String::from_utf8_lossy(&push.stderr).trim()
-            );
+            let push_error = anyhow::anyhow!("git push carrier branch failed ({})", push.status);
             // Only an observed move of the remote tip is a lost race; a push
             // refused for any other reason leaves the tip at `base_commit`.
-            let Ok(latest) = cache.refresh(&self.remote, &self.branch) else {
+            let Ok(latest) = cache.refresh(&self.remote, &self.branch, self.trusted_local) else {
                 return Err(push_error);
             };
             if latest.as_deref() != Some(new_commit.as_str()) {
@@ -1410,6 +1456,10 @@ impl GitStorage {
         let local_ref = format!("refs/heads/{}", self.branch);
         match base_commit {
             Some(commit) => {
+                ensure_carrier_index_budget(
+                    root,
+                    &["ls-tree", "-r", "-t", "-z", "--name-only", commit],
+                )?;
                 git_command(root, &["update-ref", &local_ref, commit])?;
                 git_command(root, &["read-tree", commit])?;
             }
@@ -1510,7 +1560,7 @@ impl Storage for GitStorage {
             .lock()
             .map_err(|_| anyhow::anyhow!("carrier state lock poisoned"))?;
         let mut cache = CarrierCache::lock(&self.remote, &self.branch)?;
-        let remote_tip = cache.refresh(&self.remote, &self.branch)?;
+        let remote_tip = cache.refresh(&self.remote, &self.branch, self.trusted_local)?;
         if remote_tip == state.base_commit {
             return Ok(false);
         }
@@ -1527,7 +1577,7 @@ impl Storage for GitStorage {
             .map_err(|_| anyhow::anyhow!("carrier state lock poisoned"))?;
         let mut cache = CarrierCache::lock(&self.remote, &self.branch)?;
         let refresh_timer = trace::Span::new("carrier_cas_refresh");
-        let remote_tip = cache.refresh(&self.remote, &self.branch)?;
+        let remote_tip = cache.refresh(&self.remote, &self.branch, self.trusted_local)?;
         drop(refresh_timer);
         if remote_tip != state.base_commit {
             return Err(CasConflict {
@@ -1586,7 +1636,7 @@ impl Storage for GitStorage {
             bail!("recovery storage token does not match the opened carrier tip")
         }
         let mut cache = CarrierCache::lock(&self.remote, &self.branch)?;
-        let remote_tip = cache.refresh(&self.remote, &self.branch)?;
+        let remote_tip = cache.refresh(&self.remote, &self.branch, self.trusted_local)?;
         if remote_tip != expected_tip {
             return Err(CasConflict {
                 expected: observed.head_id.clone(),
@@ -1615,6 +1665,7 @@ impl Storage for GitStorage {
         &self,
         max_commits: usize,
         max_manifest_bytes: u64,
+        max_candidates: usize,
     ) -> Result<Option<RecoveryHistory>> {
         let commits = self.commit_history(max_commits)?;
         if commits.len() > max_commits {
@@ -1623,6 +1674,7 @@ impl Storage for GitStorage {
             ))
         }
         let mut history = RecoveryHistory::default();
+        let mut attempted = HashSet::new();
         // Every byte read counts, including corrupt copies that are skipped.
         let mut total_bytes = 0_u64;
         for commit_id in &commits {
@@ -1630,12 +1682,21 @@ impl Storage for GitStorage {
                 .stored_head_at_commit(commit_id)?
                 .and_then(|head| head.head_id());
             if let Some(id) = &head_id
-                && !history.manifests.contains_key(id)
+                && attempted.insert(id.clone())
             {
+                if attempted.len() > max_candidates {
+                    bail!(BudgetExhausted(
+                        "recovery candidate budget exhausted".to_owned()
+                    ))
+                }
                 for copy in self.copy_commits(&commits, ObjectKind::Manifest, id)? {
                     let mut bytes = Vec::new();
-                    let valid =
-                        self.read_copy_at(&copy, ObjectKind::Manifest, id, |_, chunk| {
+                    let valid = self.read_copy_at(
+                        &copy,
+                        ObjectKind::Manifest,
+                        id,
+                        max_manifest_bytes.saturating_sub(total_bytes),
+                        |_, chunk| {
                             total_bytes = total_bytes
                                 .checked_add(chunk.len() as u64)
                                 .context("carrier recovery manifest byte count overflow")?;
@@ -1646,7 +1707,8 @@ impl Storage for GitStorage {
                             }
                             bytes.extend_from_slice(chunk);
                             Ok(())
-                        })?;
+                        },
+                    )?;
                     if valid {
                         history.manifests.insert(id.clone(), bytes);
                         break;
@@ -1658,6 +1720,7 @@ impl Storage for GitStorage {
                 head_id,
             });
         }
+        history.manifest_bytes_read = total_bytes;
         Ok(Some(history))
     }
 
@@ -1682,26 +1745,32 @@ impl Storage for GitStorage {
             let object_dir = staging.path().join("object");
             fs::create_dir(&object_dir)?;
             let mut current: Option<(usize, File)> = None;
-            let valid = self.read_copy_at(&copy, kind, id, |index, piece| {
-                total_bytes = total_bytes
-                    .checked_add(piece.len() as u64)
-                    .context("carrier restore byte count overflow")?;
-                if total_bytes > max_bytes {
-                    bail!(BudgetExhausted(
-                        "carrier recovery restore byte budget exhausted".to_owned()
-                    ))
-                }
-                if current.as_ref().map(|(open, _)| *open) != Some(index) {
-                    if let Some((_, file)) = current.take() {
-                        file.sync_all()?;
+            let valid = self.read_copy_at(
+                &copy,
+                kind,
+                id,
+                max_bytes.saturating_sub(total_bytes),
+                |index, piece| {
+                    total_bytes = total_bytes
+                        .checked_add(piece.len() as u64)
+                        .context("carrier restore byte count overflow")?;
+                    if total_bytes > max_bytes {
+                        bail!(BudgetExhausted(
+                            "carrier recovery restore byte budget exhausted".to_owned()
+                        ))
                     }
-                    let file = File::create(object_dir.join(format!("{index:08}")))?;
-                    current = Some((index, file));
-                }
-                let (_, file) = current.as_mut().expect("chunk file opened above");
-                file.write_all(piece)?;
-                Ok(())
-            })?;
+                    if current.as_ref().map(|(open, _)| *open) != Some(index) {
+                        if let Some((_, file)) = current.take() {
+                            file.sync_all()?;
+                        }
+                        let file = File::create(object_dir.join(format!("{index:08}")))?;
+                        current = Some((index, file));
+                    }
+                    let (_, file) = current.as_mut().expect("chunk file opened above");
+                    file.write_all(piece)?;
+                    Ok(())
+                },
+            )?;
             if let Some((_, file)) = current.take() {
                 file.sync_all()?;
             }
@@ -1937,19 +2006,24 @@ impl CarrierCache {
         })
     }
 
-    fn refresh(&mut self, remote: &str, branch: &str) -> Result<Option<String>> {
+    fn refresh(
+        &mut self,
+        remote: &str,
+        branch: &str,
+        trusted_local: bool,
+    ) -> Result<Option<String>> {
         let initialize_timer = trace::Span::new("carrier_cache_initialize");
         self.ensure_initialized()?;
         drop(initialize_timer);
         let fetch_timer = trace::Span::new("carrier_cache_fetch_remote");
-        match fetch_carrier_branch(&self.path, remote, branch) {
+        match fetch_carrier_branch(&self.path, remote, branch, trusted_local) {
             Ok(tip) => {
                 drop(fetch_timer);
                 Ok(tip)
             }
             Err(FetchError::Local(fetch_error)) if self.is_corrupt()? => {
                 self.rebuild()?;
-                let result = fetch_carrier_branch(&self.path, remote, branch)
+                let result = fetch_carrier_branch(&self.path, remote, branch, trusted_local)
                     .map_err(FetchError::into_inner)
                     .with_context(|| {
                     format!(
@@ -2101,13 +2175,22 @@ fn parse_carrier_location(location: &str) -> Result<(String, String)> {
     // Git would read such a remote as an option: `--upload-pack=<command>`
     // runs the command.
     if remote.starts_with('-') {
-        bail!("carrier Git remote {remote:?} must not start with '-'")
+        bail!(
+            "carrier Git remote {:?} must not start with '-'",
+            redact_carrier_address(remote)
+        )
     }
     if branch.is_empty() {
-        bail!("empty carrier branch in {location:?}")
+        bail!(
+            "empty carrier branch in {:?}",
+            redact_carrier_address(location)
+        )
     }
     if !refname::is_valid(&format!("refs/heads/{branch}")) || branch.starts_with('-') {
-        bail!("invalid carrier branch name {branch:?} in {location:?}")
+        bail!(
+            "invalid carrier branch name {branch:?} in {:?}",
+            redact_carrier_address(location)
+        )
     }
     Ok((remote.to_owned(), branch.to_owned()))
 }
@@ -2201,26 +2284,37 @@ fn fetch_carrier_branch(
     cache: &Path,
     remote: &str,
     branch: &str,
+    trusted_local: bool,
 ) -> std::result::Result<Option<String>, FetchError> {
     let remote_ref = format!("refs/heads/{branch}");
     let refspec = format!("+{remote_ref}:{CARRIER_CACHE_FETCH_REF}");
-    let fetch = cache_transport_output(cache, &["fetch", "--quiet", "--no-tags", remote, &refspec])
-        .map_err(FetchError::Local)?;
+    let fetch = cache_transport_output(
+        cache,
+        &["fetch", "--quiet", "--no-tags", remote, &refspec],
+        trusted_local,
+    )
+    .map_err(FetchError::Local)?;
     if fetch.status.success() {
         return git_rev_parse(cache, CARRIER_CACHE_FETCH_REF).map_err(FetchError::Local);
     }
 
-    let ls_remote = cache_transport_output(cache, &["ls-remote", "--heads", remote, &remote_ref])
-        .and_then(|output| {
-            ensure_git_success(&output, "git ls-remote carrier branch")?;
-            Ok(output)
-        })
-        .map_err(|error| {
-            FetchError::Remote(error.context(format!(
-                "git fetch carrier branch failed: {}",
-                String::from_utf8_lossy(&fetch.stderr).trim()
-            )))
-        })?;
+    let ls_remote = cache_transport_output(
+        cache,
+        &["ls-remote", "--heads", remote, &remote_ref],
+        trusted_local,
+    )
+    .and_then(|output| {
+        if !output.status.success() {
+            bail!("git ls-remote carrier branch failed ({})", output.status)
+        }
+        Ok(output)
+    })
+    .map_err(|error| {
+        FetchError::Remote(error.context(format!(
+            "git fetch carrier branch failed ({})",
+            fetch.status
+        )))
+    })?;
     if String::from_utf8_lossy(&ls_remote.stdout).trim().is_empty() {
         cache_git_output(cache, &["update-ref", "-d", CARRIER_CACHE_FETCH_REF])
             .and_then(|output| {
@@ -2230,12 +2324,17 @@ fn fetch_carrier_branch(
         return Ok(None);
     }
     Err(FetchError::Local(anyhow::anyhow!(
-        "git fetch carrier branch failed: {}",
-        String::from_utf8_lossy(&fetch.stderr).trim()
+        "git fetch carrier branch failed ({})",
+        fetch.status
     )))
 }
 
-fn remote_has_branch(cache: &Path, remote: &str, branch: &str) -> Result<bool> {
+fn remote_has_branch(
+    cache: &Path,
+    remote: &str,
+    branch: &str,
+    trusted_local: bool,
+) -> Result<bool> {
     let output = cache_transport_output(
         cache,
         &[
@@ -2244,8 +2343,11 @@ fn remote_has_branch(cache: &Path, remote: &str, branch: &str) -> Result<bool> {
             remote,
             &format!("refs/heads/{branch}"),
         ],
+        trusted_local,
     )?;
-    ensure_git_success(&output, "git ls-remote carrier branches")?;
+    if !output.status.success() {
+        bail!("git ls-remote carrier branches failed ({})", output.status)
+    }
     Ok(!output.stdout.is_empty())
 }
 
@@ -2262,6 +2364,11 @@ fn create_carrier_checkout(
         .args(["init", "--quiet"])
         .output()?;
     ensure_git_success(&output, "git init carrier checkout")?;
+    fs::create_dir_all(checkout.join(".git/info"))?;
+    fs::write(
+        checkout.join(".git/info/attributes"),
+        CARRIER_STAGING_ATTRIBUTES,
+    )?;
     let cache_objects = cache.join("objects");
     let cache_objects = cache_objects
         .to_str()
@@ -2281,6 +2388,10 @@ fn create_carrier_checkout(
     let remote_ref = format!("refs/remotes/origin/{branch}");
     match base_commit {
         Some(commit) => {
+            ensure_carrier_index_budget(
+                checkout,
+                &["ls-tree", "-r", "-t", "-z", "--name-only", commit],
+            )?;
             git_command(checkout, &["update-ref", &remote_ref, commit])?;
             let local_ref = format!("refs/heads/{branch}");
             git_command(checkout, &["update-ref", &local_ref, commit])?;
@@ -2292,6 +2403,45 @@ fn create_carrier_checkout(
         }
     }
     fs::write(checkout.join(".gitattributes"), CARRIER_ATTRIBUTES)?;
+    Ok(())
+}
+
+fn ensure_carrier_index_budget(repo: &Path, args: &[&str]) -> Result<()> {
+    let mut child = GitRepository::owned_work_tree(repo)
+        .git()
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut stdout = child.stdout.take().context("open carrier index listing")?;
+    let mut buffer = [0_u8; 8192];
+    let mut bytes = 0_u64;
+    let mut entries = 0_u64;
+    let result = (|| -> Result<()> {
+        loop {
+            let read = stdout.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            bytes += read as u64;
+            entries += buffer[..read].iter().filter(|byte| **byte == 0).count() as u64;
+            if bytes > MAX_CARRIER_INDEX_PATH_BYTES || entries > MAX_CARRIER_INDEX_ENTRIES {
+                bail!(BudgetExhausted(
+                    "carrier tree index budget exhausted".to_owned()
+                ))
+            }
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    drop(stdout);
+    let status = child.wait();
+    result?;
+    if !status?.success() {
+        bail!("git carrier index listing failed")
+    }
     Ok(())
 }
 
@@ -2323,9 +2473,13 @@ fn cache_git_output(cache: &Path, args: &[&str]) -> Result<std::process::Output>
         .output()?)
 }
 
-fn cache_transport_output(cache: &Path, args: &[&str]) -> Result<std::process::Output> {
+fn cache_transport_output(
+    cache: &Path,
+    args: &[&str],
+    trusted_local: bool,
+) -> Result<std::process::Output> {
     Ok(GitRepository::owned_git_dir(cache)
-        .transport()
+        .transport(trusted_local)
         .args(args)
         .output()?)
 }
@@ -2333,8 +2487,9 @@ fn cache_transport_output(cache: &Path, args: &[&str]) -> Result<std::process::O
 fn ensure_git_success(output: &std::process::Output, action: &str) -> Result<()> {
     if !output.status.success() {
         bail!(
-            "{action} failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            "{} failed: {}",
+            safe_diagnostic(action),
+            safe_diagnostic(String::from_utf8_lossy(&output.stderr).trim())
         )
     }
     Ok(())
@@ -2346,10 +2501,16 @@ fn git_command(repo: &Path, args: &[&str]) -> Result<()> {
         .args(args)
         .output()?;
     if !output.status.success() {
+        if args.starts_with(&["remote", "add"]) {
+            bail!("git remote add carrier failed ({})", output.status)
+        }
         bail!(
             "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
+            args.iter()
+                .map(|arg| redact_carrier_address(arg))
+                .collect::<Vec<_>>()
+                .join(" "),
+            safe_diagnostic_with_args(String::from_utf8_lossy(&output.stderr).trim(), args)
         )
     }
     Ok(())
@@ -2372,8 +2533,11 @@ fn git_command_with_input(repo: &Path, args: &[&str], input: &[u8]) -> Result<()
     if !output.status.success() {
         bail!(
             "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
+            args.iter()
+                .map(|arg| redact_carrier_address(arg))
+                .collect::<Vec<_>>()
+                .join(" "),
+            safe_diagnostic_with_args(String::from_utf8_lossy(&output.stderr).trim(), args)
         )
     }
     Ok(())
@@ -2465,8 +2629,11 @@ fn git_command_with_object_directory_input(
     if !output.status.success() {
         bail!(
             "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
+            args.iter()
+                .map(|arg| redact_carrier_address(arg))
+                .collect::<Vec<_>>()
+                .join(" "),
+            safe_diagnostic_with_args(String::from_utf8_lossy(&output.stderr).trim(), args)
         )
     }
     Ok(())
@@ -2480,6 +2647,16 @@ mod tests {
 
     use super::*;
     use crate::crypto::object_id;
+
+    #[test]
+    fn invalid_scp_carrier_branch_does_not_echo_private_path() {
+        let error = GitStorage::open("alice@host:private-token/repo.git#bad branch")
+            .err()
+            .unwrap();
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("host:[redacted]"), "{diagnostic}");
+        assert!(!diagnostic.contains("private-token"));
+    }
 
     struct PartialWriteSink {
         published: Arc<AtomicBool>,
@@ -2862,14 +3039,16 @@ mod tests {
             location: "unused".to_owned(),
             remote: "unused".to_owned(),
             branch: "main".to_owned(),
+            trusted_local: false,
             format_4_branch: false,
             state: Mutex::new(GitStorageState { base_commit: None }),
             manifest_listings: Mutex::new(None),
             pack_listings: Mutex::new(None),
         };
         let id = "ab".repeat(32);
-        let read =
-            |commit: &str| storage.read_copy_at(commit, ObjectKind::Manifest, &id, |_, _| Ok(()));
+        let read = |commit: &str| {
+            storage.read_copy_at(commit, ObjectKind::Manifest, &id, u64::MAX, |_, _| Ok(()))
+        };
 
         assert!(!read(&commit).unwrap(), "an absent copy is not an error");
         let unknown_commit = "1".repeat(40);
@@ -2910,6 +3089,7 @@ mod tests {
             location: "unused".to_owned(),
             remote: "unused".to_owned(),
             branch: "main".to_owned(),
+            trusted_local: false,
             format_4_branch: false,
             state: Mutex::new(GitStorageState {
                 base_commit: Some(commit.clone()),

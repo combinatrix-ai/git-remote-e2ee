@@ -30,11 +30,21 @@ An `e2ee::` URL is followed by the storage address:
 
 | URL | Storage |
 |---|---|
-| `e2ee::https://host/you/repo.git`, `e2ee::git@host:you/repo.git`, `e2ee::ssh://…`, `e2ee::file://…`, `e2ee::/srv/repo.git` | A Git repository used as carrier. Anything `git push` accepts, except a remote that starts with `-`, which Git would read as an option. |
+| `e2ee::https://host/you/repo.git`, `e2ee::git@host:you/repo.git`, `e2ee::ssh://…` | A network Git repository used as carrier. |
+| `e2ee::trusted-local:/absolute/carrier.git` | A local Git carrier whose receive hooks you trust to run as your user. |
 | `e2ee::dir:/srv/encrypted/example` | A directory (filesystem backend). |
 
-A relative path is resolved against the directory the command runs in, and the
-helper saves the absolute form in the remote's configuration.
+Git carrier transport refuses Git's `ext::` command transport, including when
+Git configuration would otherwise allow it. Direct `name::address` remote
+helper URLs and unknown `scheme://` URLs are also refused; local Git
+configuration remains trusted.
+The directory backend resolves relative paths against the directory the
+command runs in. Local Git carrier paths and `file://` carrier URLs require
+the explicit `trusted-local:` form with an absolute path. Use `dir:` for
+local storage that another user can modify.
+Git can rewrite a remote URL before starting this helper; a rewrite to a plain
+Git URL bypasses encryption. Treat your local Git configuration as trusted and
+do not set URL rewrites or push URLs for `e2ee::` remotes.
 
 ## Keys
 
@@ -48,14 +58,21 @@ Unix every command refuses a key file that other users can access; run
 
 Each machine keeps one continuity floor per repository root at
 `$XDG_STATE_HOME/git-e2ee/<repository-root>/continuity.json` (by default under
-`~/.local/state`). `git fetch`, `git push`, `init`, `device-add`,
+`~/.local/state`). `XDG_STATE_HOME` and the fallback `HOME` must be absolute
+paths so the floor cannot change with the working directory. `git fetch`,
+`git push`, `init`, `device-add`,
 `device-revoke`, `device-list`, `verify`, and `recover` all check the storage
 head against this floor and then advance it, so once anything on this machine
 has seen a state, storage cannot show an older one. For example, after
 `device-revoke` no checkout on this machine will push onto a replayed
-pre-revocation state, even one that never fetched the revocation. Moving or
-renaming the key file, renaming a Git remote, or adding a second remote or
-clone for the same repository keeps the floor. Every remote for one
+pre-revocation state, even one that never fetched the revocation.
+
+An authenticated newer head advances the floor even if a required encrypted
+pack is missing and the fetch or verification then fails. Restore the missing
+pack before retrying; the older head remains rejected.
+
+Moving or renaming the key file, renaming a Git remote, or adding a second
+remote or clone for the same repository keeps the floor. Every remote for one
 repository root shares it, so a mirror that lags behind the newest state you
 have seen is reported as rolled back. Back up that file together with the key.
 
@@ -151,8 +168,9 @@ The helper saves the path as `remote.origin.e2ee-key` in the new clone. Later
 ## Add a second device
 
 Each device has its own private key, and only the small public device file ever
-leaves it. If machine A created the repository, set up machine B like this.
-Substitute the repository root printed by A's `keygen`.
+leaves it. The reader accepts at most 4 KiB of regular-file content. If machine
+A created the repository, set up machine B like this. Substitute the repository
+root printed by A's `keygen`.
 
 ```console
 # Machine B
@@ -161,10 +179,16 @@ git-e2ee device-export \
   --key ~/.config/git-e2ee/keys/<repository-root>.json \
   --output machine-b.public.json
 
-# Machine A, inside its clone, after receiving only machine-b.public.json
-git-e2ee device-add origin machine-b.public.json --label machine-b
+# Machine B: tell A the full device ID printed by device-export through a
+# separate authenticated channel.
+
+# Machine A, inside its clone, after receiving machine-b.public.json and its ID
+git-e2ee device-add origin machine-b.public.json \
+  --expected-device-id <machine-b-device-id> --role write --label machine-b
 ```
 
+The expected ID must come from machine B over a separately authenticated
+channel; copying it from the received JSON does not detect a substituted file.
 `--label` is required. It names the device in `device-list` and is stored in
 the policy, which travels only inside the encrypted manifest body. A label is
 1 to 64 bytes of UTF-8 with no leading or trailing whitespace and no control
@@ -186,8 +210,8 @@ Machine B can then clone with its own key, as shown above.
 
 `device-add --role` grants one of three roles: `read` can clone, fetch, and
 pull; `write` adds push access; and `admin` also allows device membership
-changes. The default is `write`. For example, add a read-only device with
-`--role read`.
+changes. The role must be chosen explicitly. Use `--role read` for a device
+that does not need to push.
 
 `device-list` prints one line per device, current and revoked, and marks the
 device whose key you used with `*`:
@@ -234,7 +258,9 @@ compare-and-swap race. Inspect the winning state and run the command again.
 If a storage writer replaces `HEAD` with an invalid manifest, normal fetches
 and pushes stop. Run recovery from a Git repository that has already pinned a
 known good state for that remote. The default command prints a report and does
-not publish or advance the continuity floor:
+not publish. If the storage head has an authenticated chain continuous with
+this machine's existing floor, the report updates that floor even when a
+required pack is missing:
 
 ```console
 cd /work/my-clone
@@ -295,13 +321,19 @@ your local remote-tracking refs.
 - A new or deleted local carrier cache downloads the complete carrier branch.
   Later operations reuse its objects and fetch only new carrier objects.
   `GIT_REMOTE_E2EE_CACHE_DIR` overrides the cache parent directory.
+- Normal manifest traversal stops after 64 MiB of encrypted manifest data or
+  1,000,000 estimated cryptographic operations. A repository with a longer
+  legitimate history cannot be opened by this version.
+- Tree-tag connectivity checks stop after 256 distinct tree roots or 4,000,000
+  expanded entries per operation. Tree tags require Git 2.36 or newer.
 - Recovery discovery has fixed limits of 2,048 carrier commits, 256 distinct
   heads, 64 MiB of manifest data, and 1,000,000 estimated cryptographic
   operations. It fails closed if any limit is exhausted.
 - Shallow and partial clones are not supported. Pushing from a shallow
   repository is refused before anything is published; run
   `git fetch --unshallow` first. A fresh clone downloads and verifies the
-  complete history.
+  complete history. A configured partial-clone promisor is rejected before
+  encrypted ref IDs are passed to local Git object lookups.
 
 ## Storage contract
 

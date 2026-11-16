@@ -161,7 +161,7 @@ fn verify_takes_a_carrier_url_outside_a_repository() {
     let carrier = sandbox.path().join("carrier.git");
     sandbox.git(sandbox.path(), &["init", "-q", "--bare", "carrier.git"]);
     let key = sandbox.path().join("owner.key.json");
-    let url = format!("e2ee::{}", carrier.display());
+    let url = format!("e2ee::trusted-local:{}", carrier.display());
     let key_arg = key.to_string_lossy().into_owned();
 
     let output = success(&sandbox.e2ee(sandbox.path(), &["init", &url, "--key", &key_arg]));
@@ -172,6 +172,62 @@ fn verify_takes_a_carrier_url_outside_a_repository() {
     let missing_key = sandbox.e2ee(sandbox.path(), &["verify", &url]);
     assert!(!missing_key.status.success());
     assert!(String::from_utf8_lossy(&missing_key.stderr).contains("--key"));
+}
+
+#[test]
+fn verify_rejects_relative_continuity_home() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repository("notes");
+    let url = format!("e2ee::dir:{}", sandbox.path().join("storage").display());
+    success(&sandbox.e2ee(&repo, &["init", &url]));
+    let key = sandbox.keys().pop().unwrap();
+    let key_arg = key.to_string_lossy().into_owned();
+
+    let relative_xdg = sandbox
+        .command(env!("CARGO_BIN_EXE_git-e2ee"), sandbox.path())
+        .env("XDG_STATE_HOME", "relative-state")
+        .args(["verify", &url, "--key", &key_arg])
+        .output()
+        .unwrap();
+    assert!(!relative_xdg.status.success());
+    assert!(
+        String::from_utf8_lossy(&relative_xdg.stderr)
+            .contains("XDG_STATE_HOME must be an absolute path")
+    );
+    assert!(!sandbox.path().join("relative-state").exists());
+
+    let helper = sandbox
+        .command("git", &repo)
+        .env("XDG_STATE_HOME", "relative-state")
+        .args(["ls-remote", "origin"])
+        .output()
+        .unwrap();
+    assert!(!helper.status.success());
+    assert!(
+        String::from_utf8_lossy(&helper.stderr).contains("XDG_STATE_HOME must be an absolute path")
+    );
+    assert!(!sandbox.path().join("relative-state").exists());
+
+    let relative_home = sandbox
+        .command(env!("CARGO_BIN_EXE_git-e2ee"), sandbox.path())
+        .env_remove("XDG_STATE_HOME")
+        .env("HOME", "relative-home")
+        .args(["verify", &url, "--key", &key_arg])
+        .output()
+        .unwrap();
+    assert!(!relative_home.status.success());
+    assert!(
+        String::from_utf8_lossy(&relative_home.stderr).contains("HOME must be an absolute path")
+    );
+    assert!(!sandbox.path().join("relative-home").exists());
+
+    let absolute_xdg = sandbox
+        .command(env!("CARGO_BIN_EXE_git-e2ee"), sandbox.path())
+        .env("HOME", "relative-home")
+        .args(["verify", &url, "--key", &key_arg])
+        .output()
+        .unwrap();
+    success(&absolute_xdg);
 }
 
 #[test]
@@ -200,11 +256,43 @@ fn init_with_carrier_hook(sandbox: &Sandbox, hook: &str, body: &str) -> (String,
     let path = sandbox.path().join("carrier.git/hooks").join(hook);
     fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-    let url = format!("e2ee::{}", sandbox.path().join("carrier.git").display());
+    let url = format!(
+        "e2ee::trusted-local:{}",
+        sandbox.path().join("carrier.git").display()
+    );
     let output = sandbox.e2ee(sandbox.path(), &["init", &url]);
     assert!(!output.status.success());
     fs::remove_file(&path).unwrap();
     (url, String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
+#[cfg(unix)]
+#[test]
+fn local_git_carrier_requires_trusted_opt_in_before_running_receive_hooks() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sandbox = Sandbox::new();
+    sandbox.git(sandbox.path(), &["init", "-q", "--bare", "carrier.git"]);
+    let carrier = sandbox.path().join("carrier.git");
+    let marker = sandbox.path().join("receive-hook-ran");
+    let hook = carrier.join("hooks/post-receive");
+    fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+    for url in [
+        format!("e2ee::{}", carrier.display()),
+        format!("e2ee::file://{}", carrier.display()),
+    ] {
+        let refused = sandbox.e2ee(sandbox.path(), &["init", &url]);
+        assert!(!refused.status.success());
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("trusted-local"),
+            "{}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+        assert!(!marker.exists());
+        assert!(sandbox.keys().is_empty());
+    }
 }
 
 #[cfg(unix)]
@@ -258,7 +346,7 @@ fn init_refused_by_an_occupied_carrier_branch_removes_its_key() {
     sandbox.git(sandbox.path(), &["init", "-q", "--bare", "carrier.git"]);
     let carrier = sandbox.path().join("carrier.git");
     sandbox.git(&repo, &["push", "-q", &carrier.to_string_lossy(), "main"]);
-    let url = format!("e2ee::{}", carrier.display());
+    let url = format!("e2ee::trusted-local:{}", carrier.display());
 
     let output = sandbox.e2ee(sandbox.path(), &["init", &url]);
     assert!(!output.status.success());
@@ -285,7 +373,7 @@ fn a_storage_url_that_git_would_read_as_an_option_runs_nothing() {
         let output = sandbox.e2ee(sandbox.path(), &arguments);
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("must not start with '-'"), "{stderr}");
+        assert!(stderr.contains("trusted-local"), "{stderr}");
     }
     assert!(!marker.exists(), "the storage URL ran a command");
 }

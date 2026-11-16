@@ -77,7 +77,7 @@ case $os in
 esac
 
 missing=()
-for tool in git gpg cargo rustc du df awk find sort stat mktemp hostname date sed tr tail wc chmod cp mv mkdir rmdir rm cat dirname; do
+for tool in git gpg cargo rustc du df awk find sort stat mktemp hostname date sed tr tail wc chmod cp mv mkdir rmdir rm cat dirname shasum; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     printf "missing required command on PATH: %s\n" "$tool" >&2
     missing+=("$tool")
@@ -294,10 +294,6 @@ fi
 
 if [[ -e $gcrypt_cache || -L $gcrypt_cache ]]; then
   validate_single_branch_cache "$gcrypt_cache" "$gcrypt_revision" git-remote-gcrypt
-  [[ -x $gcrypt_cache/git-remote-gcrypt ]] || {
-    echo "git-remote-gcrypt executable is missing in $gcrypt_cache" >&2
-    exit 1
-  }
   echo "Reusing git-remote-gcrypt cache at $gcrypt_cache" >&2
 else
   echo "Fetching the pinned git-remote-gcrypt history" >&2
@@ -305,17 +301,12 @@ else
   git clone --quiet --no-tags --single-branch "$gcrypt_url" "$stage_dir/repo"
   git -C "$stage_dir/repo" checkout --quiet --detach "$gcrypt_revision"
   validate_single_branch_cache "$stage_dir/repo" "$gcrypt_revision" git-remote-gcrypt
-  [[ -x $stage_dir/repo/git-remote-gcrypt ]] || {
-    echo "git-remote-gcrypt executable is missing at the pinned revision" >&2
-    exit 1
-  }
   publish_cache "$stage_dir" "$gcrypt_cache" git-remote-gcrypt "$gcrypt_revision"
   echo "Cached git-remote-gcrypt at $gcrypt_cache" >&2
 fi
 
 [[ $(git -C "$godot_cache" rev-parse HEAD) == "$godot_revision" ]]
 [[ $(git -C "$gcrypt_cache" rev-parse HEAD) == "$gcrypt_revision" ]]
-[[ -x $gcrypt_cache/git-remote-gcrypt ]]
 
 if [[ -n ${BENCH_RESULTS_DIR:-} ]]; then
   results_dir=$BENCH_RESULTS_DIR
