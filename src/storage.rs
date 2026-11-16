@@ -653,12 +653,13 @@ pub struct GitStorage {
     /// starting a second storage beside it.
     format_4_branch: bool,
     state: Mutex<GitStorageState>,
-    manifest_listings: Mutex<Option<ManifestListingCache>>,
+    manifest_listings: Mutex<Option<CarrierListingCache>>,
+    pack_listings: Mutex<Option<CarrierListingCache>>,
 }
 
-struct ManifestListingCache {
+struct CarrierListingCache {
     commit: String,
-    directories: HashMap<String, Vec<u8>>,
+    directories: Option<HashMap<String, Vec<u8>>>,
 }
 
 struct GitStorageState {
@@ -992,6 +993,7 @@ impl GitStorage {
             format_4_branch,
             state: Mutex::new(GitStorageState { base_commit }),
             manifest_listings: Mutex::new(None),
+            pack_listings: Mutex::new(None),
         })
     }
 
@@ -1140,37 +1142,45 @@ impl GitStorage {
     }
 
     fn chunk_entries_at(&self, commit: &str, kind: ObjectKind, id: &str) -> Result<CarrierListing> {
-        if matches!(kind, ObjectKind::Manifest)
-            && self
-                .state
-                .lock()
-                .map_err(|_| anyhow::anyhow!("carrier state lock poisoned"))?
-                .base_commit
-                .as_deref()
-                == Some(commit)
-            && let Some(listing) = self.cached_manifest_chunk_entries(commit, id)?
+        if self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("carrier state lock poisoned"))?
+            .base_commit
+            .as_deref()
+            == Some(commit)
+            && let Some(listing) = self.cached_chunk_entries(commit, kind, id)?
         {
             return Ok(listing);
         }
         carrier_chunk_entries(self.root(), commit, kind, id)
     }
 
-    /// Read the bounded manifest subtree once for this immutable carrier
+    /// Read a bounded object subtree once for this immutable carrier
     /// commit. Large trees keep the per-object path and its existing bounds.
-    fn cached_manifest_chunk_entries(
+    fn cached_chunk_entries(
         &self,
         commit: &str,
+        kind: ObjectKind,
         id: &str,
     ) -> Result<Option<CarrierListing>> {
         validate_id(id)?;
-        let mut cache = self
-            .manifest_listings
+        let kind_directory = kind.directory();
+        let listings = match kind {
+            ObjectKind::Manifest => &self.manifest_listings,
+            ObjectKind::Pack => &self.pack_listings,
+        };
+        let mut cache = listings
             .lock()
-            .map_err(|_| anyhow::anyhow!("carrier manifest cache lock poisoned"))?;
+            .map_err(|_| anyhow::anyhow!("carrier object listing cache lock poisoned"))?;
         if cache.as_ref().is_none_or(|cached| cached.commit != commit) {
+            let disabled = || CarrierListingCache {
+                commit: commit.to_owned(),
+                directories: None,
+            };
             let mut child = GitRepository::owned_work_tree(self.root())
                 .git()
-                .args(["ls-tree", "-r", "-z", commit, "--", "manifests"])
+                .args(["ls-tree", "-r", "-z", commit, "--", kind_directory])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()?;
@@ -1178,16 +1188,18 @@ impl GitStorage {
             child
                 .stdout
                 .take()
-                .context("open manifest tree listing")?
+                .context("open carrier object tree listing")?
                 .take(MAX_CARRIER_LISTING_BYTES + 1)
                 .read_to_end(&mut listing)?;
             if listing.len() as u64 > MAX_CARRIER_LISTING_BYTES {
                 let _ = child.kill();
                 let _ = child.wait();
+                *cache = Some(disabled());
                 return Ok(None);
             }
             let output = child.wait_with_output()?;
             if !output.status.success() {
+                *cache = Some(disabled());
                 return Ok(None);
             }
             let mut by_directory: HashMap<String, Vec<u8>> = HashMap::new();
@@ -1196,37 +1208,47 @@ impl GitStorage {
                 .filter(|entry| !entry.is_empty())
             {
                 let Some(tab) = entry.iter().position(|byte| *byte == b'\t') else {
+                    *cache = Some(disabled());
                     return Ok(None);
                 };
                 let path = &entry[tab + 1..];
                 let mut parts = path.splitn(4, |byte| *byte == b'/');
-                let (Some(b"manifests"), Some(prefix), Some(object)) =
+                let (Some(listed_kind), Some(prefix), Some(object)) =
                     (parts.next(), parts.next(), parts.next())
                 else {
                     continue;
                 };
-                let mut directory = Vec::with_capacity(11 + prefix.len() + object.len());
-                directory.extend_from_slice(b"manifests/");
+                if listed_kind != kind_directory.as_bytes() {
+                    continue;
+                }
+                let mut directory =
+                    Vec::with_capacity(kind_directory.len() + 2 + prefix.len() + object.len());
+                directory.extend_from_slice(kind_directory.as_bytes());
+                directory.push(b'/');
                 directory.extend_from_slice(prefix);
                 directory.push(b'/');
                 directory.extend_from_slice(object);
                 let Ok(directory) = String::from_utf8(directory) else {
+                    *cache = Some(disabled());
                     return Ok(None);
                 };
                 let grouped = by_directory.entry(directory).or_default();
                 grouped.extend_from_slice(entry);
                 grouped.push(0);
             }
-            *cache = Some(ManifestListingCache {
+            *cache = Some(CarrierListingCache {
                 commit: commit.to_owned(),
-                directories: by_directory,
+                directories: Some(by_directory),
             });
         }
-        let directory = format!("manifests/{}/{id}", &id[..2]);
-        let Some(raw) = cache
+        let Some(directories) = cache
             .as_ref()
-            .and_then(|cached| cached.directories.get(&directory))
+            .and_then(|cached| cached.directories.as_ref())
         else {
+            return Ok(None);
+        };
+        let directory = format!("{kind_directory}/{}/{id}", &id[..2]);
+        let Some(raw) = directories.get(&directory) else {
             return Ok(Some(CarrierListing::Absent));
         };
         if raw.len() as u64 > MAX_CARRIER_LISTING_BYTES {
@@ -2843,6 +2865,7 @@ mod tests {
             format_4_branch: false,
             state: Mutex::new(GitStorageState { base_commit: None }),
             manifest_listings: Mutex::new(None),
+            pack_listings: Mutex::new(None),
         };
         let id = "ab".repeat(32);
         let read =
