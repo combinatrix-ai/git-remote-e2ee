@@ -94,17 +94,17 @@ old ciphertext fails authentication on import. Walks that reach further back
 reject the repetition. A writer can equally publish an undecryptable pack, so
 this adds nothing to what an authorized writer can already break.
 
-### Planted links in directory storage (audit #23)
+### Links in directory storage (audit #23)
 
-Directory storage may live in a shared or synchronized folder, so others can
-replace its subdirectories with symbolic links or swap the folder itself. The
-client could then create files outside the storage directory. Fixed-name files
-(`HEAD`, `FORMAT`, `README.md`) are replaced by rename, which replaces a link
-rather than writing through it; `HEAD.lock` is opened without truncation; other
-files get random or content-hash names and contain ciphertext. The attacker
-cannot choose a name that collides with an existing file or choose its
-content, so the effect is stray files elsewhere. This is accepted, and shared
-folders remain supported.
+Directory storage treats the stored ciphertext as untrusted, but its location
+on the local filesystem is the operator's to manage. The client follows
+symbolic links on that path like any other program, so storage reached through
+a link works normally. If the storage directory or one of its subdirectories
+is replaced by a link to somewhere else, by mistake or by anyone allowed to
+write there, the client writes there instead; for example, a push replaces a
+file named `HEAD` in the directory the link points to. Keeping that path free
+of such links is the operator's responsibility, and the client does not defend
+against it.
 
 ### Corrupted ciphertext carried forward (audit #13)
 
