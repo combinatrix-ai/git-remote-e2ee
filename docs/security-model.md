@@ -127,6 +127,19 @@ file named `HEAD` in the directory the link points to. Keeping that path free
 of such links is the operator's responsibility, and the client does not defend
 against it.
 
+### Other local accounts and the continuity floor
+
+Anyone who can write the continuity floor can move it back and hide a
+rollback from that machine. Earlier versions refused to use a floor whose file
+or any parent directory another account could write, or that an ACL or a
+foreign symbolic link exposed. Under the trust boundary every account on the
+machine is local, and the check stopped legitimate setups: a hosted VM whose
+home is `2770 root:nogroup`, and Linux state directories created under umask
+002. The client now creates new floor directories with mode 0700 and floor
+files with mode 0600 but does not inspect existing paths. Device key files are
+still refused when other accounts can read them, because that protects the
+key's secrecy rather than the floor.
+
 ### Corrupted ciphertext carried forward (audit #13)
 
 A push builds the next carrier commit on top of existing ciphertext without
