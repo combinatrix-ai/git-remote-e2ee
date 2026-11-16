@@ -8,9 +8,7 @@ use git_remote_e2ee::continuity::default_state_dir;
 use git_remote_e2ee::crypto::{KeyFile, PublicDevice};
 use git_remote_e2ee::gitcmd::GitRepository;
 use git_remote_e2ee::policy::{DeviceRoles, validate_device_label};
-use git_remote_e2ee::repository::{
-    EncryptedRepository, InitializeError, RecoveryOptions, RecoveryReport,
-};
+use git_remote_e2ee::repository::{EncryptedRepository, InitializeError, RecoveryReport};
 use git_remote_e2ee::storage::{FilesystemStorage, GitStorage};
 use git_remote_e2ee::url::{
     StorageUrl, redact_carrier_address, safe_diagnostic, safe_diagnostic_with_args,
@@ -131,14 +129,6 @@ enum Command {
         /// to the repository Git selects for the current directory
         #[arg(long)]
         repo: Option<PathBuf>,
-        #[arg(long)]
-        publish: bool,
-        #[arg(long, requires = "publish")]
-        base: Option<String>,
-        #[arg(long, requires = "publish")]
-        discard_newer: bool,
-        #[arg(long, requires = "publish")]
-        accept_stale_floor: bool,
     },
 }
 
@@ -429,26 +419,11 @@ fn run() -> Result<()> {
                 );
             }
         }
-        Command::Recover {
-            target,
-            key,
-            repo,
-            publish,
-            base,
-            discard_newer,
-            accept_stale_floor,
-        } => {
+        Command::Recover { target, key, repo } => {
             let local = GitRepository::resolve(repo.as_deref())?
                 .context("recover needs a Git repository; run it inside one or pass --repo")?;
             let target = Target::resolve(&target, key, Some(&local))?;
-            let options = RecoveryOptions {
-                publish,
-                base: base.as_deref(),
-                discard_newer,
-                accept_stale_floor,
-            };
-            let report =
-                with_repository!(&target, |repository| repository.recover(&local, options)?);
+            let report = with_repository!(&target, |repository| repository.recover(&local)?);
             print_recovery_report(&report);
         }
     }
@@ -566,17 +541,8 @@ fn format_recovery_report(report: &RecoveryReport) -> String {
     if report.conflict {
         lines.push("conflict: authenticated descendants form a fork".to_owned());
     }
-    if let Some(base) = &report.default_base {
-        lines.push(format!("default base: {base}"));
-    }
-    if let Some(warning) = &report.warning {
-        lines.push(format!("warning: {warning}"));
-    }
     if let Some(blocked) = &report.blocked_reason {
         lines.push(format!("recovery refused: {blocked}"));
-    }
-    if let Some(manifest) = &report.published_manifest {
-        lines.push(format!("published recovery manifest: {manifest}"));
     }
     lines.join("\n")
 }
@@ -601,7 +567,7 @@ mod tests {
     use git_remote_e2ee::repository::{RecoveryClass, RecoveryReport};
 
     #[test]
-    fn recover_cli_defaults_to_report_and_accepts_explicit_publication_flags() {
+    fn recover_cli_has_no_publication_flags() {
         let cli = Cli::try_parse_from([
             "git-e2ee",
             "recover",
@@ -610,36 +576,15 @@ mod tests {
             "/tmp/key.json",
         ])
         .unwrap();
-        match cli.command {
-            Command::Recover {
-                publish,
-                accept_stale_floor,
-                ..
-            } => {
-                assert!(!publish);
-                assert!(!accept_stale_floor);
-            }
-            _ => panic!("parsed a different command"),
-        }
-
-        assert!(
-            Cli::try_parse_from(["git-e2ee", "recover", "origin", "--discard-newer",]).is_err()
-        );
-        let cli = Cli::try_parse_from([
-            "git-e2ee",
-            "recover",
-            "e2ee::https://host/carrier.git",
+        assert!(matches!(cli.command, Command::Recover { .. }));
+        for flag in [
             "--publish",
-            "--base",
-            "deadbeef",
+            "--base=deadbeef",
             "--discard-newer",
             "--accept-stale-floor",
-        ])
-        .unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::Recover { publish: true, .. }
-        ));
+        ] {
+            assert!(Cli::try_parse_from(["git-e2ee", "recover", "origin", flag]).is_err());
+        }
     }
 
     #[test]
@@ -652,13 +597,10 @@ mod tests {
             floor_id: None,
             floor_generation: None,
             candidates: Vec::new(),
-            default_base: None,
             replays: Vec::new(),
             conflict: false,
             freshness_unverified: true,
-            warning: None,
             blocked_reason: None,
-            published_manifest: None,
         };
         let output = format_recovery_report(&report);
         assert!(output.contains("claimed signer (signature not verified): device-id"));

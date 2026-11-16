@@ -256,56 +256,41 @@ compare-and-swap race. Inspect the winning state and run the command again.
 ## Recover from a broken HEAD
 
 If a storage writer replaces `HEAD` with an invalid manifest, normal fetches
-and pushes stop. Run recovery from a Git repository that has already pinned a
-known good state for that remote. The default command prints a report and does
-not publish. If the storage head has an authenticated chain continuous with
-this machine's existing floor, the report updates that floor even when a
-required pack is missing:
+and pushes stop. `recover` explains what happened without changing storage:
 
 ```console
 cd /work/my-clone
 git-e2ee recover origin
 ```
 
-The local floor is this machine's
-`$XDG_STATE_HOME/git-e2ee/<repository-root>/continuity.json`, so run recovery
-on a machine that previously used the repository. A machine that never did has
-no floor, so recovery reports that freshness and fork identity are unverified
-and will not publish.
+It classifies the storage head (valid, invalid, unverifiable, unsupported,
+unavailable, or discontinuous) and lists the authenticated states it found
+after this machine's continuity floor, any replays, and any fork. If the
+storage head has an authenticated chain continuous with the floor, the report
+also advances that floor. The floor is this machine's
+`$XDG_STATE_HOME/git-e2ee/<repository-root>/continuity.json`; a machine that
+never used the repository has none, and the report says freshness and fork
+identity are unverified. A signer read from an invalid head is labelled only
+as a claim until its signature is verified.
 
-Review the offered manifest IDs, generations, verified signers, replays, and
-any fork report. Recovery is allowed only when the current head is demonstrably
-invalid. It refuses valid, unverifiable, unsupported, unavailable, and
-discontinuous heads. A signer extracted from an invalid head is labelled only
-as a claim until its signature is verified. Read-only devices can inspect the
-report but cannot publish recovery.
+To resume work after an invalid head, move to new storage from a healthy clone
+instead of repairing the old one in place:
 
-To publish from the default base, add `--publish`:
+1. On a writer machine with a complete, up-to-date clone, rename the old
+   remote (for example `git remote rename origin broken`), then run
+   `git-e2ee init` against new storage. This creates a new repository root and
+   administrator key; do not reuse the old key, because every machine's
+   continuity floor for the old root still points at the old history.
+2. Push every branch and tag from that clone to the new remote.
+3. Enroll the other devices as in the first setup: each runs `keygen` for the
+   new repository root and `device-export`, and you `device-add` the ones you
+   want to keep. Membership starts from your current decision, not from what
+   the broken storage recorded.
+4. On each other device, point the remote and `e2ee-key` at the new storage
+   and key, and fetch.
 
-```console
-git-e2ee recover origin --publish
-```
-
-The default base is the newest authenticated descendant found after the local
-floor, or the floor if there is no descendant. Recovery refuses conflicting
-authenticated descendants. Selecting an older offered base requires both
-`--base <manifest-id>` and `--discard-newer`; this can omit legitimate changes
-or a revocation. A lost compare-and-swap fails. Start a new command and review
-the fresh report before trying again.
-
-The directory backend has no carrier commit history, so it can offer only the
-local floor. Publishing requires `--accept-stale-floor` and prints this warning:
-
-> Updates after this floor may be omitted. This may also omit revocations and
-> disclose subsequently published content to devices excluded by a newer
-> policy.
-
-Carrier recovery restores required ciphertext from prior outer commits when
-available, checks each content ID, verifies the selected refs' complete Git
-object graph in temporary local storage, then publishes a normal fast-forward
-carrier commit. If required ciphertext is no longer available, recovery stops.
-After successful recovery, run the usual `git fetch` or `git pull` to update
-your local remote-tracking refs.
+Commit IDs and history are preserved. Changes that existed only in the broken
+storage and on no healthy clone are lost.
 
 ## Limits today
 

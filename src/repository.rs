@@ -17,14 +17,14 @@ use crate::error::{
     ObjectUnavailable, Unsupported,
 };
 use crate::git;
-use crate::gitcmd::{self, GitRepository};
+use crate::gitcmd::GitRepository;
 use crate::manifest::{
     Manifest, ManifestAuthorization, ManifestHeader, OpenedManifest, PackDescriptor, open_manifest,
     pack_aad, peek_manifest_header, seal_manifest, unwrap_generation_key, unwrap_predecessor_key,
     verify_manifest, wrap_predecessor_key,
 };
 use crate::policy::{DeviceRecord, DeviceRoles, PolicyState};
-use crate::storage::{HeadObservation, ObjectKind, Storage, StorageOccupied, StoredHead};
+use crate::storage::{ObjectKind, Storage, StorageOccupied, StoredHead};
 use crate::trace;
 use crate::url::safe_diagnostic;
 
@@ -34,7 +34,6 @@ const MAX_RECOVERY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_RECOVERY_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_RECOVERY_CRYPTO_OPERATIONS: u64 = 1_000_000;
 const MAX_REJECTED_HEADS: usize = 16;
-const STALE_FLOOR_WARNING: &str = "Updates after this floor may be omitted. This may also omit revocations and disclose subsequently published content to devices excluded by a newer policy.";
 
 #[derive(Debug, thiserror::Error)]
 pub enum PushRejection {
@@ -125,13 +124,10 @@ pub struct RecoveryReport {
     pub floor_id: Option<String>,
     pub floor_generation: Option<u64>,
     pub candidates: Vec<RecoveryCandidate>,
-    pub default_base: Option<String>,
     pub replays: Vec<String>,
     pub conflict: bool,
     pub freshness_unverified: bool,
-    pub warning: Option<String>,
     pub blocked_reason: Option<String>,
-    pub published_manifest: Option<String>,
 }
 
 impl RecoveryReport {
@@ -140,7 +136,6 @@ impl RecoveryReport {
         self.head_id = self.head_id.map(|text| safe_diagnostic(&text));
         self.claimed_signer = self.claimed_signer.map(|text| safe_diagnostic(&text));
         self.floor_id = self.floor_id.map(|text| safe_diagnostic(&text));
-        self.default_base = self.default_base.map(|text| safe_diagnostic(&text));
         self.replays = self
             .replays
             .into_iter()
@@ -154,18 +149,9 @@ impl RecoveryReport {
                 .map(|text| safe_diagnostic(&text));
             candidate.verified_signer = safe_diagnostic(&candidate.verified_signer);
         }
-        self.warning = self.warning.map(|text| safe_diagnostic(&text));
         self.blocked_reason = self.blocked_reason.map(|text| safe_diagnostic(&text));
-        self.published_manifest = self.published_manifest.map(|text| safe_diagnostic(&text));
         self
     }
-}
-
-pub struct RecoveryOptions<'a> {
-    pub publish: bool,
-    pub base: Option<&'a str>,
-    pub discard_newer: bool,
-    pub accept_stale_floor: bool,
 }
 
 /// This checkout's import progress for one repository root. It records work
@@ -226,11 +212,6 @@ struct OpenedState {
     policy: PolicyState,
     generation_key: SecretKey,
     verified_signer: String,
-}
-
-struct CommitHead<'a> {
-    previous: Option<&'a OpenedState>,
-    observation: Option<&'a HeadObservation>,
 }
 
 /// What a push does to one destination ref.
@@ -1009,20 +990,14 @@ impl<S: Storage> EncryptedRepository<S> {
         Ok(current.manifest.clone())
     }
 
-    pub fn recover(
-        &self,
-        repo: &GitRepository,
-        options: RecoveryOptions<'_>,
-    ) -> Result<RecoveryReport> {
-        self.recover_inner(repo, options)
-            .map(RecoveryReport::sanitized)
+    /// Diagnoses a storage head that normal operations refuse and reports
+    /// the authenticated states reachable from this machine's floor. It never
+    /// publishes: restore service by pushing a healthy clone to new storage.
+    pub fn recover(&self, repo: &GitRepository) -> Result<RecoveryReport> {
+        self.recover_inner(repo).map(RecoveryReport::sanitized)
     }
 
-    fn recover_inner(
-        &self,
-        repo: &GitRepository,
-        options: RecoveryOptions<'_>,
-    ) -> Result<RecoveryReport> {
+    fn recover_inner(&self, repo: &GitRepository) -> Result<RecoveryReport> {
         let floor_guard = self.lock_floor()?;
         let checkout = self.open_checkout(repo)?;
         let local_floor = floor_guard.read()?;
@@ -1034,13 +1009,10 @@ impl<S: Storage> EncryptedRepository<S> {
             floor_id: local_floor.as_ref().map(|floor| floor.head_id.clone()),
             floor_generation: local_floor.as_ref().map(|floor| floor.generation),
             candidates: Vec::new(),
-            default_base: None,
             replays: Vec::new(),
             conflict: false,
             freshness_unverified: local_floor.is_none(),
-            warning: None,
             blocked_reason: None,
-            published_manifest: None,
         };
         let observation = match self.storage.observe_head() {
             Ok(observation) => observation,
@@ -1049,9 +1021,6 @@ impl<S: Storage> EncryptedRepository<S> {
                     return Err(error).context("bounded recovery discovery failed");
                 }
                 report.reason = format!("storage head is unavailable: {error:#}");
-                if options.publish {
-                    report.blocked_reason = Some(report.reason.clone());
-                }
                 return Ok(report);
             }
         };
@@ -1412,111 +1381,6 @@ impl<S: Storage> EncryptedRepository<S> {
             .map(|(candidate, _)| candidate.clone())
             .collect();
         report.replays = replay_ids.into_iter().collect();
-        let default_offer = offers.last().context("recovery floor offer is missing")?;
-        report.default_base = Some(default_offer.0.manifest_id.clone());
-        if !carrier_history {
-            report.warning = Some(STALE_FLOOR_WARNING.to_owned());
-        }
-        if !options.publish {
-            return Ok(report);
-        }
-
-        let selected_id = options.base.unwrap_or(&default_offer.0.manifest_id);
-        let selected = match offers
-            .iter()
-            .find(|(candidate, _)| candidate.manifest_id == selected_id)
-        {
-            Some(selected) => selected,
-            None => {
-                report.blocked_reason = Some(format!(
-                    "selected base {selected_id} is not an authenticated recovery offer"
-                ));
-                return Ok(report);
-            }
-        };
-        if selected.0.generation < default_offer.0.generation && !options.discard_newer {
-            report.blocked_reason = Some(format!(
-                "choosing older base {} requires --discard-newer",
-                selected.0.manifest_id
-            ));
-            return Ok(report);
-        }
-        if !carrier_history && !options.accept_stale_floor {
-            report.blocked_reason = Some(format!(
-                "directory recovery requires --accept-stale-floor. {}",
-                STALE_FLOOR_WARNING
-            ));
-            return Ok(report);
-        }
-        let base_state = selected
-            .1
-            .first()
-            .filter(|entry| entry.id == selected.0.manifest_id)
-            .context("selected recovery base is missing from its validated chain")?;
-        if !base_state.policy.is_active_writer(&self.key.device_id()?) {
-            report.blocked_reason =
-                Some("device is not an active writer under the selected base policy".to_owned());
-            return Ok(report);
-        }
-        if let Err(error) = self.restore_base_objects(&selected.1) {
-            report.blocked_reason = Some(format!("required ciphertext is unavailable: {error:#}"));
-            return Ok(report);
-        }
-        if let Err(error) = self.verify_base_graph(&selected.1) {
-            report.blocked_reason = Some(format!(
-                "selected base does not resolve to a complete local object graph: {error:#}"
-            ));
-            return Ok(report);
-        }
-        let required_manifests: Vec<_> = selected.1.iter().map(|entry| entry.id.clone()).collect();
-        let required_packs: Vec<_> = selected
-            .1
-            .iter()
-            .flat_map(|entry| entry.manifest.new_packs.iter().map(|pack| pack.id.clone()))
-            .collect();
-        self.storage
-            .prepare_recovery(&required_manifests, &required_packs)?;
-
-        let next_key = random_key();
-        let generation = base_state.manifest.generation + 1;
-        let next = Manifest {
-            format_version: base_state.manifest.format_version,
-            repository_root: base_state.manifest.repository_root.clone(),
-            generation,
-            previous: Some(base_state.id.clone()),
-            policy_id: base_state.policy.id.clone(),
-            policy_generation: base_state.policy.body.generation,
-            authorization: ManifestAuthorization::Writer,
-            total_pack_count: base_state.manifest.total_pack_count,
-            refs: base_state.manifest.refs.clone(),
-            new_packs: Vec::new(),
-            predecessor_key_wrap: Some(wrap_predecessor_key(
-                &next_key,
-                &base_state.generation_key,
-                &base_state.manifest.repository_root,
-                generation,
-                &base_state.id,
-            )?),
-            introduced_policy: None,
-        };
-        let recovered_id = self.commit_manifest_with_observation(
-            CommitHead {
-                previous: Some(base_state),
-                observation: Some(&observation),
-            },
-            &base_state.policy,
-            None,
-            &next_key,
-            ManifestAuthorization::Writer,
-            next.clone(),
-        )?;
-        floor_guard.advance(ContinuityFloor::at(
-            &recovered_id,
-            &next,
-            base_state.policy.to_bytes()?,
-        ))?;
-        report.published_manifest = Some(recovered_id);
-        report.blocked_reason = None;
         Ok(report)
     }
 
@@ -1535,72 +1399,6 @@ impl<S: Storage> EncryptedRepository<S> {
             }
         }
         Ok(())
-    }
-
-    fn restore_base_objects(&self, chain: &[OpenedState]) -> Result<()> {
-        for state in chain {
-            self.ensure_object_available(ObjectKind::Manifest, &state.id)?;
-            for descriptor in &state.manifest.new_packs {
-                self.ensure_object_available(ObjectKind::Pack, &descriptor.id)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn verify_base_graph(&self, chain: &[OpenedState]) -> Result<()> {
-        let temporary = tempfile::tempdir()?;
-        let init = gitcmd::without_repository()
-            .args(["init", "--bare", "--quiet"])
-            .arg(temporary.path())
-            .output()?;
-        if !init.status.success() {
-            bail!(
-                "git init for recovery connectivity check failed: {}",
-                String::from_utf8_lossy(&init.stderr).trim()
-            )
-        }
-        let scratch = GitRepository::owned_git_dir(temporary.path());
-        scratch.ensure_no_promisor()?;
-        self.import_chain_packs(&scratch, &self.pack_inventory(chain, None)?)?;
-        let refs = &chain
-            .first()
-            .context("selected recovery chain is empty")?
-            .manifest
-            .refs;
-        git::ensure_refs_connected_since(&scratch, refs, &BTreeMap::new())
-    }
-
-    fn ensure_object_available(&self, kind: ObjectKind, id: &str) -> Result<()> {
-        if self.storage_object_matches(kind, id)? {
-            return Ok(());
-        }
-        // Room for one corrupt maximal copy before the valid one.
-        let restore_budget = kind.max_bytes().saturating_mul(2);
-        if self
-            .storage
-            .restore_historical_object(kind, id, restore_budget)?
-            && self.storage_object_matches(kind, id)?
-        {
-            return Ok(());
-        }
-        bail!("required {:?} object {id} is missing or corrupt", kind)
-    }
-
-    fn storage_object_matches(&self, kind: ObjectKind, id: &str) -> Result<bool> {
-        let mut reader = match self.storage.open_object(kind, id) {
-            Ok(reader) => reader,
-            Err(_) => return Ok(false),
-        };
-        let mut hasher = Sha256::new();
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let read = reader.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read]);
-        }
-        Ok(hex::encode(hasher.finalize()) == id)
     }
 
     fn current_chain(&self) -> Result<Vec<OpenedState>> {
@@ -1878,45 +1676,17 @@ impl<S: Storage> EncryptedRepository<S> {
         authorization: ManifestAuthorization,
         manifest: Manifest,
     ) -> Result<String> {
-        self.commit_manifest_with_observation(
-            CommitHead {
-                previous,
-                observation: None,
-            },
-            policy,
-            parent_policy,
-            generation_key,
-            authorization,
-            manifest,
-        )
-    }
-
-    fn commit_manifest_with_observation(
-        &self,
-        head: CommitHead<'_>,
-        policy: &PolicyState,
-        parent_policy: Option<&PolicyState>,
-        generation_key: &[u8; 32],
-        authorization: ManifestAuthorization,
-        manifest: Manifest,
-    ) -> Result<String> {
         let id = self.seal_and_store_manifest(
-            head.previous,
+            previous,
             policy,
             parent_policy,
             generation_key,
             authorization,
             manifest,
         )?;
-        let cas_timer = trace::Span::new("manifest_compare_and_swap_publish");
-        if let Some(observation) = head.observation {
-            self.storage
-                .compare_and_swap_observed_head(observation, &id)?;
-        } else {
-            self.storage
-                .compare_and_swap_head(head.previous.map(|state| state.id.as_str()), &id)?;
-        }
-        drop(cas_timer);
+        let _cas_timer = trace::Span::new("manifest_compare_and_swap_publish");
+        self.storage
+            .compare_and_swap_head(previous.map(|state| state.id.as_str()), &id)?;
         Ok(id)
     }
 
@@ -2310,13 +2080,10 @@ mod tests {
             floor_id: None,
             floor_generation: None,
             candidates: Vec::new(),
-            default_base: None,
             replays: Vec::new(),
             conflict: false,
             freshness_unverified: false,
-            warning: None,
             blocked_reason: None,
-            published_manifest: None,
         }
         .sanitized();
         assert_eq!(report.reason, "bad\\n\\u{1b}]52;c;payload\\u{7}");
