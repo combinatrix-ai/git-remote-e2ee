@@ -325,9 +325,14 @@ direct-parent relationship before accepting the manifest.
 
 A pack descriptor contains ciphertext ID, plaintext size, creation generation,
 and a dense generation-local ordinal beginning at zero. Its subkey and AAD bind
-that generation and ordinal. Descriptor IDs must be unique across the whole
-authenticated chain, so a chain that repeats a pack ID is invalid, and
-plaintext size must be nonzero.
+that generation and ordinal. Descriptor IDs must be unique within every chain
+segment a client authenticates or imports from, and plaintext size must be
+nonzero. A returning client that validates only the segment above its floor
+does not re-read older descriptors, so it cannot reject a signed successor
+that repeats an older pack ID; such a descriptor still cannot be used, because
+its ciphertext was sealed under a different generation and ordinal and fails
+authentication when imported. A client that walks further back, for a full
+bootstrap, a re-import, or `verify`, rejects the repetition.
 
 The manifest chain is the append-only pack inventory. Manifests do not repeat
 historical descriptors, avoiding quadratic cumulative-inventory metadata.

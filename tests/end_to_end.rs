@@ -168,6 +168,64 @@ fn returning_client_authenticates_only_the_new_manifest_segment() {
 }
 
 #[test]
+fn import_after_list_reads_only_the_unimported_generations() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let destination = temporary.path().join("destination");
+    initialize_git(&source);
+    initialize_git(&destination);
+    let owner = KeyFile::generate();
+    let storage = temporary.path().join("storage");
+    let writer = EncryptedRepository::new(
+        FilesystemStorage::new(&storage),
+        owner.clone(),
+        temporary.path().join("writer-state"),
+    );
+    writer.initialize("owner").unwrap();
+    let push = |value: &str| {
+        commit(&source, value, value.trim());
+        writer
+            .push_ref(
+                &GitRepository::open(&source).unwrap(),
+                "refs/heads/main",
+                RefChange::Update {
+                    source: "refs/heads/main",
+                    force: false,
+                },
+            )
+            .unwrap();
+    };
+    push("one\n");
+    let reads = Arc::new(AtomicUsize::new(0));
+    let reader = EncryptedRepository::new(
+        CountingManifestStorage {
+            inner: FilesystemStorage::new(&storage),
+            reads: reads.clone(),
+        },
+        owner,
+        temporary.path().join("reader-state"),
+    );
+    let checkout = GitRepository::open(&destination).unwrap();
+    reader.fetch_into(&checkout, "e2ee").unwrap();
+    push("two\n");
+    push("three\n");
+
+    // The helper's `list` moves the machine floor to the newest head before
+    // Git asks for the packs.
+    reader.observe_manifest(&checkout).unwrap();
+    reads.store(0, Ordering::SeqCst);
+    let latest = reader.import_packs(&checkout).unwrap();
+    assert_eq!(latest.generation, 3);
+    // The anchored head, then the one unimported predecessor: no genesis walk.
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
+    reader.fetch_into(&checkout, "e2ee").unwrap();
+    assert_eq!(
+        git(&destination, &["show", "refs/remotes/e2ee/main:note.md"]),
+        "three"
+    );
+}
+
+#[test]
 fn anchorless_floor_from_an_earlier_release_is_checked_and_upgraded() {
     let temporary = tempfile::tempdir().unwrap();
     let state = temporary.path().join("state");

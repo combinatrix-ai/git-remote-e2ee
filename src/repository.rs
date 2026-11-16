@@ -212,6 +212,12 @@ impl Checkout {
     }
 }
 
+/// One manifest's pack descriptors and the generation key that opens them.
+struct PackInventoryEntry {
+    manifest: Manifest,
+    generation_key: SecretKey,
+}
+
 #[derive(Clone)]
 struct OpenedState {
     id: String,
@@ -757,7 +763,7 @@ impl<S: Storage> EncryptedRepository<S> {
             &current.manifest,
             current.policy.to_bytes()?,
         ))?;
-        self.import_chain_packs(repo, &chain, None)?;
+        self.import_chain_packs(repo, &self.pack_inventory(&chain, None)?)?;
         git::ensure_refs_connected_since(repo, &current.manifest.refs, &BTreeMap::new())?;
         checkout.write(CheckoutProgress {
             format_version: CHECKOUT_PROGRESS_FORMAT,
@@ -809,7 +815,12 @@ impl<S: Storage> EncryptedRepository<S> {
         let chain = self.pinned_chain(&floor)?;
         let current = chain.first().context("manifest chain is empty")?;
         let progress = checkout.read()?;
-        self.import_chain_packs(repo, &chain, progress.imported_generation)?;
+        // The floor may already stand past this checkout's import progress,
+        // for example after the helper's `list` observed newer generations.
+        self.import_chain_packs(
+            repo,
+            &self.pack_inventory(&chain, progress.imported_generation)?,
+        )?;
         let connectivity_timer = trace::Span::new("inner_ref_connectivity_check");
         if git::ensure_refs_connected_since(repo, &current.manifest.refs, &progress.verified_refs)
             .is_err()
@@ -818,9 +829,7 @@ impl<S: Storage> EncryptedRepository<S> {
             // are still local: deleting a remote-tracking ref and pruning
             // removes them. Re-import the whole authenticated chain and check
             // the full graph; recorded progress is unchanged until that passes.
-            let complete_chain = self.current_chain()?;
-            validate_pinned_head(&complete_chain, floor.read()?.as_ref())?;
-            self.import_chain_packs(repo, &complete_chain, None)?;
+            self.import_chain_packs(repo, &self.pack_inventory(&chain, None)?)?;
             git::ensure_refs_connected_since(repo, &current.manifest.refs, &BTreeMap::new())?;
         }
         drop(connectivity_timer);
@@ -832,19 +841,71 @@ impl<S: Storage> EncryptedRepository<S> {
         Ok(current.manifest.clone())
     }
 
-    /// Imports, oldest first, the packs of every chain entry newer than
-    /// `after_generation`. Chain authentication already rejects a pack ID
-    /// that repeats in the traversed segment or its anchored manifest.
+    /// Returns, newest first, the pack inventory of every generation newer
+    /// than `after_generation`. Entries come from the authenticated `chain`
+    /// and, where it stops short, from the manifests its oldest entry reaches
+    /// through `previous` links. Those links are content IDs inside manifests
+    /// this machine already authenticated, and each predecessor key must match
+    /// its header's commitment, so storage cannot substitute history. The walk
+    /// follows the real chain only, so it needs no cumulative budget.
+    fn pack_inventory(
+        &self,
+        chain: &[OpenedState],
+        after_generation: Option<u64>,
+    ) -> Result<Vec<PackInventoryEntry>> {
+        let needed = |generation: u64| after_generation.is_none_or(|after| generation > after);
+        let mut entries: Vec<PackInventoryEntry> = chain
+            .iter()
+            .filter(|entry| needed(entry.manifest.generation))
+            .map(|entry| PackInventoryEntry {
+                manifest: entry.manifest.clone(),
+                generation_key: entry.generation_key.clone(),
+            })
+            .collect();
+        let oldest = chain.last().context("manifest chain is empty")?;
+        let mut manifest = oldest.manifest.clone();
+        let mut generation_key = oldest.generation_key.clone();
+        let mut budget = RecoveryBudget::full_check();
+        while let Some(previous_id) = manifest.previous.clone() {
+            if !needed(manifest.generation - 1) {
+                break;
+            }
+            let (_, encrypted, header) = self.read_manifest_material(&previous_id, &mut budget)?;
+            let parent_key = unwrap_predecessor_key(&generation_key, &manifest, &header)?;
+            let opened = open_manifest(&encrypted, &parent_key)?;
+            if opened.header != header
+                || opened.manifest.repository_root != manifest.repository_root
+                || opened.manifest.generation + 1 != manifest.generation
+            {
+                bail!(
+                    "historical manifest {previous_id} does not precede its authenticated successor"
+                )
+            }
+            manifest = opened.manifest;
+            generation_key = parent_key;
+            entries.push(PackInventoryEntry {
+                manifest: manifest.clone(),
+                generation_key: generation_key.clone(),
+            });
+        }
+        let mut seen = HashSet::new();
+        for entry in &entries {
+            for pack in &entry.manifest.new_packs {
+                if !seen.insert(pack.id.as_str()) {
+                    bail!("manifest chain repeats pack {}", pack.id)
+                }
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Imports the packs of `inventory`, oldest first.
     fn import_chain_packs(
         &self,
         repo: &GitRepository,
-        chain: &[OpenedState],
-        after_generation: Option<u64>,
+        inventory: &[PackInventoryEntry],
     ) -> Result<()> {
-        for entry in chain.iter().rev() {
-            if after_generation.is_some_and(|generation| entry.manifest.generation <= generation) {
-                continue;
-            }
+        for entry in inventory.iter().rev() {
             for descriptor in &entry.manifest.new_packs {
                 let decrypt_timer = trace::Span::new("pack_decrypt_to_index_pack");
                 self.import_chain_pack(repo, entry, descriptor)?;
@@ -859,7 +920,7 @@ impl<S: Storage> EncryptedRepository<S> {
     /// can say whether the plaintext is a valid pack.
     fn open_chain_pack(
         &self,
-        entry: &OpenedState,
+        entry: &PackInventoryEntry,
         descriptor: &PackDescriptor,
         plaintext: impl io::Write,
     ) -> Result<()> {
@@ -879,7 +940,7 @@ impl<S: Storage> EncryptedRepository<S> {
     fn import_chain_pack(
         &self,
         repo: &GitRepository,
-        entry: &OpenedState,
+        entry: &PackInventoryEntry,
         descriptor: &PackDescriptor,
     ) -> Result<()> {
         let expected_size = pack_stream_ciphertext_size(descriptor.plaintext_size)?;
@@ -908,7 +969,7 @@ impl<S: Storage> EncryptedRepository<S> {
     }
 
     fn chain_pack_material(
-        entry: &OpenedState,
+        entry: &PackInventoryEntry,
         descriptor: &PackDescriptor,
     ) -> Result<(SecretKey, Vec<u8>)> {
         let pack_key = derive_subkey(
@@ -933,16 +994,10 @@ impl<S: Storage> EncryptedRepository<S> {
     /// Git, so it does not prove the packs are valid Git packs.
     pub fn verify_ciphertext(&self) -> Result<Manifest> {
         let floor = self.lock_floor()?;
-        let chain = self.current_chain()?;
-        validate_pinned_head(&chain, floor.read()?.as_ref())?;
+        let chain = self.pinned_chain(&floor)?;
         let current = chain.first().context("manifest chain is empty")?;
-        floor.advance(ContinuityFloor::at(
-            &current.id,
-            &current.manifest,
-            current.policy.to_bytes()?,
-        ))?;
         let mut count = 0_u64;
-        for entry in chain.iter().rev() {
+        for entry in self.pack_inventory(&chain, None)?.iter().rev() {
             for descriptor in &entry.manifest.new_packs {
                 self.open_chain_pack(entry, descriptor, io::sink())?;
                 count += 1;
@@ -1506,11 +1561,7 @@ impl<S: Storage> EncryptedRepository<S> {
         }
         let scratch = GitRepository::owned_git_dir(temporary.path());
         scratch.ensure_no_promisor()?;
-        for entry in chain.iter().rev() {
-            for descriptor in &entry.manifest.new_packs {
-                self.import_chain_pack(&scratch, entry, descriptor)?;
-            }
-        }
+        self.import_chain_packs(&scratch, &self.pack_inventory(chain, None)?)?;
         let refs = &chain
             .first()
             .context("selected recovery chain is empty")?
