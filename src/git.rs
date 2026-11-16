@@ -615,6 +615,39 @@ fn resolve_tag_chain(
     }
 }
 
+/// Applies the tree-tag budget that every fresh fetch enforces to the ref set
+/// a push is about to publish, so a writer cannot publish a state that fresh
+/// clones must reject. Refs whose objects this repository lacks cannot be
+/// evaluated here and are left to readers, which check them on fetch.
+pub fn ensure_publishable_tree_tags(
+    repo: &GitRepository,
+    objects: &mut Objects<'_>,
+    refs: &BTreeMap<String, String>,
+) -> Result<()> {
+    ensure_publishable_tree_tags_with_budget(repo, objects, refs, TreeListingBudget::standard())
+}
+
+fn ensure_publishable_tree_tags_with_budget(
+    repo: &GitRepository,
+    objects: &mut Objects<'_>,
+    refs: &BTreeMap<String, String>,
+    mut budget: TreeListingBudget,
+) -> Result<()> {
+    let mut checked_trees = HashSet::new();
+    for (reference, object) in refs {
+        if InnerRefKind::of(reference)? != InnerRefKind::Tag || !objects.exists(object)? {
+            continue;
+        }
+        let Ok(target) = resolve_tag_chain(objects, reference, object, "published") else {
+            continue;
+        };
+        if target.kind == GitObjectType::Tree && checked_trees.insert(target.oid.clone()) {
+            ensure_tree_connected(repo, objects, reference, &target.oid, &mut budget)?;
+        }
+    }
+    Ok(())
+}
+
 struct TreeListingBudget {
     entries: usize,
     roots: usize,
@@ -777,8 +810,9 @@ fn git_text(repo: &GitRepository, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        TreeListingBudget, ensure_refs_connected_since, ensure_refs_connected_with_budget,
-        has_complete_object_graph,
+        Objects, TreeListingBudget, ensure_publishable_tree_tags,
+        ensure_publishable_tree_tags_with_budget, ensure_refs_connected_since,
+        ensure_refs_connected_with_budget, has_complete_object_graph,
     };
     use crate::gitcmd::GitRepository;
     use std::collections::BTreeMap;
@@ -965,6 +999,32 @@ mod tests {
         let error =
             ensure_refs_connected_with_budget(&repo, &distinct_refs, &BTreeMap::new(), budget)
                 .unwrap_err();
+        assert!(error.to_string().contains("tree-root limit"), "{error:#}");
+    }
+
+    #[test]
+    fn publication_applies_the_fresh_fetch_tree_tag_budget() {
+        let temporary = tempfile::tempdir().unwrap();
+        repository_with_commit(temporary.path());
+        let empty = make_tree(temporary.path(), "");
+        let first = make_tree(temporary.path(), &format!("040000 tree {empty}\ta\n"));
+        let second = make_tree(temporary.path(), &format!("040000 tree {empty}\tb\n"));
+        let refs = BTreeMap::from([
+            ("refs/tags/first".to_owned(), first),
+            ("refs/tags/second".to_owned(), second),
+            // Another writer's tag this repository never fetched is skipped.
+            ("refs/tags/unknown".to_owned(), "1".repeat(40)),
+        ]);
+        let repo = GitRepository::open(temporary.path()).unwrap();
+        let mut objects = Objects::new(&repo);
+        ensure_publishable_tree_tags(&repo, &mut objects, &refs).unwrap();
+
+        let budget = TreeListingBudget {
+            max_roots: 1,
+            ..TreeListingBudget::standard()
+        };
+        let error = ensure_publishable_tree_tags_with_budget(&repo, &mut objects, &refs, budget)
+            .unwrap_err();
         assert!(error.to_string().contains("tree-root limit"), "{error:#}");
     }
 

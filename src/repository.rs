@@ -593,6 +593,9 @@ impl<S: Storage> EncryptedRepository<S> {
         next_refs: BTreeMap<String, String>,
         pack_refs: &BTreeMap<String, String>,
     ) -> Result<String> {
+        git::ensure_publishable_tree_tags(repo, objects, &next_refs).context(
+            "publishing these refs would exceed the tree-tag limits a fresh fetch enforces",
+        )?;
         let next_key = random_key();
         let generation = current
             .manifest
