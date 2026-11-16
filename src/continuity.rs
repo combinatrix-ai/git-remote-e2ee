@@ -301,6 +301,7 @@ mod tests {
         assert_eq!(guard.read().unwrap().unwrap().head_id, "head-1");
     }
 
+    #[cfg(unix)]
     #[test]
     fn new_floor_paths_stay_private_under_permissive_umask() {
         use std::os::unix::fs::PermissionsExt;
