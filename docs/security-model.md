@@ -79,7 +79,20 @@ is collected, so lifting the budget lets storage make a client spend time and
 memory proportional to the chain it presents. Returning devices start from
 their floor's cached manifest and stay within the budget. A fresh device whose
 legitimate history exceeds it lifts the budget only through an explicit
-`bootstrap --force-full-check`.
+`bootstrap --force-full-check`. Pack imports and `verify` extend an authenticated
+chain backwards through content-addressed `previous` links and key
+commitments, which storage cannot lengthen, so they need no cumulative budget.
+Recovery discovery stays bounded and cannot examine a longer history.
+
+### Repeated pack IDs
+
+A signed writer could name an older pack ID again in a new manifest. A
+returning device reads only the segment above its floor and cannot see the
+earlier use, but the repeated descriptor is useless: the pack's key and
+authenticated data bind the generation and ordinal it was sealed under, so the
+old ciphertext fails authentication on import. Walks that reach further back
+reject the repetition. A writer can equally publish an undecryptable pack, so
+this adds nothing to what an authorized writer can already break.
 
 ### Planted links in directory storage (audit #23)
 

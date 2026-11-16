@@ -167,6 +167,64 @@ fn returning_client_authenticates_only_the_new_manifest_segment() {
 }
 
 #[test]
+fn import_after_list_reads_only_the_unimported_generations() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let destination = temporary.path().join("destination");
+    initialize_git(&source);
+    initialize_git(&destination);
+    let owner = KeyFile::generate();
+    let storage = temporary.path().join("storage");
+    let writer = EncryptedRepository::new(
+        FilesystemStorage::new(&storage),
+        owner.clone(),
+        temporary.path().join("writer-state"),
+    );
+    writer.initialize("owner").unwrap();
+    let push = |value: &str| {
+        commit(&source, value, value.trim());
+        writer
+            .push_ref(
+                &GitRepository::open(&source).unwrap(),
+                "refs/heads/main",
+                RefChange::Update {
+                    source: "refs/heads/main",
+                    force: false,
+                },
+            )
+            .unwrap();
+    };
+    push("one\n");
+    let reads = Arc::new(AtomicUsize::new(0));
+    let reader = EncryptedRepository::new(
+        CountingManifestStorage {
+            inner: FilesystemStorage::new(&storage),
+            reads: reads.clone(),
+        },
+        owner,
+        temporary.path().join("reader-state"),
+    );
+    let checkout = GitRepository::open(&destination).unwrap();
+    reader.fetch_into(&checkout, "e2ee").unwrap();
+    push("two\n");
+    push("three\n");
+
+    // The helper's `list` moves the machine floor to the newest head before
+    // Git asks for the packs.
+    reader.observe_manifest(&checkout).unwrap();
+    reads.store(0, Ordering::SeqCst);
+    let latest = reader.import_packs(&checkout).unwrap();
+    assert_eq!(latest.generation, 3);
+    // The anchored head, then the one unimported predecessor: no genesis walk.
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
+    reader.fetch_into(&checkout, "e2ee").unwrap();
+    assert_eq!(
+        git(&destination, &["show", "refs/remotes/e2ee/main:note.md"]),
+        "three"
+    );
+}
+
+#[test]
 fn anchorless_floor_from_an_earlier_release_is_checked_and_upgraded() {
     let temporary = tempfile::tempdir().unwrap();
     let state = temporary.path().join("state");
@@ -2348,6 +2406,60 @@ fn an_oversized_storage_head_is_reported_invalid() {
     let report = recover_report(&repository, &repo).unwrap();
     assert_eq!(report.classification, RecoveryClass::Invalid);
     assert_eq!(machine_floor(&repo)["head_id"], floor);
+}
+
+#[test]
+fn writer_must_fetch_retained_tags_before_changing_tags() {
+    let temporary = tempfile::tempdir().unwrap();
+    let first_writer = temporary.path().join("first-writer");
+    let second_writer = temporary.path().join("second-writer");
+    initialize_git(&first_writer);
+    initialize_git(&second_writer);
+    let encrypted = EncryptedRepository::new(
+        FilesystemStorage::new(temporary.path().join("remote")),
+        KeyFile::generate(),
+        support::state_dir(),
+    );
+    encrypted.initialize("owner").unwrap();
+    let push = |repo: &Path, reference: &'static str| {
+        encrypted.push_ref(
+            &GitRepository::open(repo).unwrap(),
+            reference,
+            RefChange::Update {
+                source: reference,
+                force: false,
+            },
+        )
+    };
+    commit(&first_writer, "main\n", "main");
+    push(&first_writer, "refs/heads/main").unwrap();
+    encrypted
+        .fetch_into(&GitRepository::open(&second_writer).unwrap(), "encrypted")
+        .unwrap();
+
+    // Tag a tree the second writer never fetched.
+    commit(&first_writer, "tagged only\n", "tagged only");
+    git(&first_writer, &["tag", "first-tree", "HEAD^{tree}"]);
+    push(&first_writer, "refs/tags/first-tree").unwrap();
+
+    git(
+        &second_writer,
+        &["switch", "-q", "-c", "other", "refs/remotes/encrypted/main"],
+    );
+    commit(&second_writer, "other\n", "other");
+    git(&second_writer, &["tag", "second-tree", "HEAD^{tree}"]);
+    let (before, _) = encrypted.current_manifest().unwrap();
+    let error = format!(
+        "{:#}",
+        push(&second_writer, "refs/tags/second-tree").unwrap_err()
+    );
+    assert!(error.contains("fetch first"), "{error}");
+    assert_eq!(encrypted.current_manifest().unwrap().0, before);
+
+    encrypted
+        .fetch_into(&GitRepository::open(&second_writer).unwrap(), "encrypted")
+        .unwrap();
+    push(&second_writer, "refs/tags/second-tree").unwrap();
 }
 
 #[test]

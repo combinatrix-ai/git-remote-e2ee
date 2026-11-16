@@ -321,7 +321,10 @@ storage and on no healthy clone are lost.
   expanded entries per operation. Tree tags require Git 2.36 or newer.
 - Recovery discovery has fixed limits of 2,048 carrier commits, 256 distinct
   heads, 64 MiB of manifest data, and 1,000,000 estimated cryptographic
-  operations. It fails closed if any limit is exhausted.
+  operations. It fails closed if any limit is exhausted. These limits cover
+  each walk back to genesis, so recovery cannot examine a history longer than
+  the normal traversal limits. Fetch, push, and `verify` on a device with a
+  floor are not affected.
 - Shallow and partial clones are not supported. Pushing from a shallow
   repository is refused before anything is published; run
   `git fetch --unshallow` first. A fresh clone downloads and verifies the
