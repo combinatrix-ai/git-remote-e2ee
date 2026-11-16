@@ -491,7 +491,7 @@ floor. Explicit `bootstrap --force-full-check` authenticates the full chain
 without these cumulative limits, while retaining per-object limits; its time
 and memory costs grow with history length.
 
-A returning client whose protected machine floor contains the authenticated
+A returning client whose machine floor contains the authenticated
 manifest and policy traverses from `HEAD` to that exact manifest ID, validates
 each new hop using the cached policy, and imports only the deltas of generations
 newer than its recorded import progress. If the floor lacks that state (a
