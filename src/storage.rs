@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -662,6 +662,13 @@ pub struct GitStorage {
     /// starting a second storage beside it.
     format_4_branch: bool,
     state: Mutex<GitStorageState>,
+    manifest_listings: Mutex<Option<CarrierListingCache>>,
+    pack_listings: Mutex<Option<CarrierListingCache>>,
+}
+
+struct CarrierListingCache {
+    commit: String,
+    directories: Option<HashMap<String, Vec<u8>>>,
 }
 
 struct GitStorageState {
@@ -737,6 +744,7 @@ struct GitChunkReader {
 
 impl GitChunkReader {
     fn new(repo: &Path, chunks: Vec<(String, String)>) -> Result<Self> {
+        let _timer = trace::Span::new("carrier_cat_file_start");
         Ok(Self {
             cat: CatFile::batch(&GitRepository::owned_work_tree(repo))?,
             chunks,
@@ -1017,6 +1025,8 @@ impl GitStorage {
             trusted_local,
             format_4_branch,
             state: Mutex::new(GitStorageState { base_commit }),
+            manifest_listings: Mutex::new(None),
+            pack_listings: Mutex::new(None),
         })
     }
 
@@ -1165,7 +1175,124 @@ impl GitStorage {
     }
 
     fn chunk_entries_at(&self, commit: &str, kind: ObjectKind, id: &str) -> Result<CarrierListing> {
+        if self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("carrier state lock poisoned"))?
+            .base_commit
+            .as_deref()
+            == Some(commit)
+            && let Some(listing) = self.cached_chunk_entries(commit, kind, id)?
+        {
+            return Ok(listing);
+        }
         carrier_chunk_entries(self.root(), commit, kind, id)
+    }
+
+    /// Read a bounded object subtree once for this immutable carrier
+    /// commit. Large trees keep the per-object path and its existing bounds.
+    fn cached_chunk_entries(
+        &self,
+        commit: &str,
+        kind: ObjectKind,
+        id: &str,
+    ) -> Result<Option<CarrierListing>> {
+        validate_id(id)?;
+        let kind_directory = kind.directory();
+        let listings = match kind {
+            ObjectKind::Manifest => &self.manifest_listings,
+            ObjectKind::Pack => &self.pack_listings,
+        };
+        let mut cache = listings
+            .lock()
+            .map_err(|_| anyhow::anyhow!("carrier object listing cache lock poisoned"))?;
+        if cache.as_ref().is_none_or(|cached| cached.commit != commit) {
+            let disabled = || CarrierListingCache {
+                commit: commit.to_owned(),
+                directories: None,
+            };
+            let mut child = GitRepository::owned_work_tree(self.root())
+                .git()
+                .args(["ls-tree", "-r", "-z", commit, "--", kind_directory])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
+            let mut listing = Vec::new();
+            child
+                .stdout
+                .take()
+                .context("open carrier object tree listing")?
+                .take(MAX_CARRIER_LISTING_BYTES + 1)
+                .read_to_end(&mut listing)?;
+            if listing.len() as u64 > MAX_CARRIER_LISTING_BYTES {
+                let _ = child.kill();
+                let _ = child.wait();
+                *cache = Some(disabled());
+                return Ok(None);
+            }
+            let output = child.wait_with_output()?;
+            if !output.status.success() {
+                *cache = Some(disabled());
+                return Ok(None);
+            }
+            let mut by_directory: HashMap<String, Vec<u8>> = HashMap::new();
+            for entry in listing
+                .split(|byte| *byte == 0)
+                .filter(|entry| !entry.is_empty())
+            {
+                let Some(tab) = entry.iter().position(|byte| *byte == b'\t') else {
+                    *cache = Some(disabled());
+                    return Ok(None);
+                };
+                let path = &entry[tab + 1..];
+                let mut parts = path.splitn(4, |byte| *byte == b'/');
+                let (Some(listed_kind), Some(prefix), Some(object)) =
+                    (parts.next(), parts.next(), parts.next())
+                else {
+                    continue;
+                };
+                if listed_kind != kind_directory.as_bytes() {
+                    continue;
+                }
+                let mut directory =
+                    Vec::with_capacity(kind_directory.len() + 2 + prefix.len() + object.len());
+                directory.extend_from_slice(kind_directory.as_bytes());
+                directory.push(b'/');
+                directory.extend_from_slice(prefix);
+                directory.push(b'/');
+                directory.extend_from_slice(object);
+                let Ok(directory) = String::from_utf8(directory) else {
+                    *cache = Some(disabled());
+                    return Ok(None);
+                };
+                let grouped = by_directory.entry(directory).or_default();
+                grouped.extend_from_slice(entry);
+                grouped.push(0);
+            }
+            *cache = Some(CarrierListingCache {
+                commit: commit.to_owned(),
+                directories: Some(by_directory),
+            });
+        }
+        let Some(directories) = cache
+            .as_ref()
+            .and_then(|cached| cached.directories.as_ref())
+        else {
+            return Ok(None);
+        };
+        let directory = format!("{kind_directory}/{}/{id}", &id[..2]);
+        let Some(raw) = directories.get(&directory) else {
+            return Ok(Some(CarrierListing::Absent));
+        };
+        if raw.len() as u64 > MAX_CARRIER_LISTING_BYTES {
+            return Ok(Some(CarrierListing::Malformed(
+                "carrier object listing exceeds its size budget",
+            )));
+        }
+        Ok(Some(match parse_chunk_listing(raw, &directory) {
+            Ok(chunks) => CarrierListing::Chunks(chunks),
+            Err(reason) => CarrierListing::Malformed(reason),
+        }))
     }
 
     /// Commits in `window` whose tree changed the stored copy of `id`, newest
@@ -1769,6 +1896,7 @@ fn carrier_chunk_entries(
     kind: ObjectKind,
     id: &str,
 ) -> Result<CarrierListing> {
+    let _timer = trace::Span::new("carrier_chunk_listing");
     validate_id(id)?;
     let directory = format!("{}/{}/{id}", kind.directory(), &id[..2]);
     let mut child = GitRepository::owned_work_tree(repo)
@@ -2914,6 +3042,8 @@ mod tests {
             trusted_local: false,
             format_4_branch: false,
             state: Mutex::new(GitStorageState { base_commit: None }),
+            manifest_listings: Mutex::new(None),
+            pack_listings: Mutex::new(None),
         };
         let id = "ab".repeat(32);
         let read = |commit: &str| {
@@ -2926,5 +3056,62 @@ mod tests {
             read(&unknown_commit).is_err(),
             "git ls-tree failing on an unreadable commit must not read as an absent copy"
         );
+    }
+
+    #[test]
+    fn cached_carrier_listings_preserve_valid_malformed_and_absent_results() {
+        let checkout = tempfile::tempdir().unwrap();
+        checkout_git(checkout.path(), &["init", "--quiet"]);
+        let id = "ab".repeat(32);
+        let manifest = checkout.path().join(format!("manifests/ab/{id}/00000000"));
+        let pack = checkout.path().join(format!("packs/ab/{id}/00000001"));
+        fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        fs::create_dir_all(pack.parent().unwrap()).unwrap();
+        fs::write(manifest, b"manifest").unwrap();
+        fs::write(pack, b"pack").unwrap();
+        checkout_git(checkout.path(), &["add", "manifests", "packs"]);
+        let tree = checkout_git(checkout.path(), &["write-tree"]);
+        let commit = checkout_git(
+            checkout.path(),
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@invalid",
+                "commit-tree",
+                "-m",
+                "carrier",
+                &tree,
+            ],
+        );
+        let storage = GitStorage {
+            checkout,
+            location: "unused".to_owned(),
+            remote: "unused".to_owned(),
+            branch: "main".to_owned(),
+            trusted_local: false,
+            format_4_branch: false,
+            state: Mutex::new(GitStorageState {
+                base_commit: Some(commit.clone()),
+            }),
+            manifest_listings: Mutex::new(None),
+            pack_listings: Mutex::new(None),
+        };
+        assert!(matches!(
+            storage.chunk_entries_at(&commit, ObjectKind::Manifest, &id).unwrap(),
+            CarrierListing::Chunks(chunks) if chunks.len() == 1
+        ));
+        assert!(matches!(
+            storage
+                .chunk_entries_at(&commit, ObjectKind::Pack, &id)
+                .unwrap(),
+            CarrierListing::Malformed(_)
+        ));
+        assert!(matches!(
+            storage
+                .chunk_entries_at(&commit, ObjectKind::Pack, &"cd".repeat(32))
+                .unwrap(),
+            CarrierListing::Absent
+        ));
     }
 }
