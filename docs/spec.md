@@ -325,9 +325,14 @@ direct-parent relationship before accepting the manifest.
 
 A pack descriptor contains ciphertext ID, plaintext size, creation generation,
 and a dense generation-local ordinal beginning at zero. Its subkey and AAD bind
-that generation and ordinal. Descriptor IDs must be unique across the whole
-authenticated chain, so a chain that repeats a pack ID is invalid, and
-plaintext size must be nonzero.
+that generation and ordinal. Descriptor IDs must be unique within every chain
+segment a client authenticates or imports from, and plaintext size must be
+nonzero. A returning client that validates only the segment above its floor
+does not re-read older descriptors, so it cannot reject a signed successor
+that repeats an older pack ID; such a descriptor still cannot be used, because
+its ciphertext was sealed under a different generation and ordinal and fails
+authentication when imported. A client that walks further back, for a full
+bootstrap, a re-import, or `verify`, rejects the repetition.
 
 The manifest chain is the append-only pack inventory. Manifests do not repeat
 historical descriptors, avoiding quadratic cumulative-inventory metadata.
@@ -478,16 +483,23 @@ A fresh clone traverses manifest and key links from `HEAD` to genesis,
 validates each hop, collects pack deltas, decrypts packs with their creation
 generation keys, and imports them oldest-first.
 
-Every normal read, including listing, fetch, push, and verification, applies a
-fixed cumulative budget before retaining or decrypting each predecessor. This
-version limits traversal to 64 MiB of encrypted manifest data and 1,000,000
-estimated cryptographic operations. An over-limit chain is rejected without
-advancing the machine continuity floor.
+Every normal traversal applies a fixed cumulative budget before retaining or
+decrypting each predecessor. This version limits each traversal to 64 MiB of
+encrypted manifest data and 1,000,000 estimated cryptographic operations.
+An over-limit traversal is rejected without advancing the machine continuity
+floor. Explicit `bootstrap --force-full-check` authenticates the full chain
+without these cumulative limits, while retaining per-object limits; its time
+and memory costs grow with history length.
 
-A returning client traverses from `HEAD` to its pinned manifest, validates each
-new hop, and imports only the deltas of generations newer than its recorded
-import progress. Import progress is local cache state, not an authorization
-source.
+A returning client whose protected machine floor contains the authenticated
+manifest and policy traverses from `HEAD` to that exact manifest ID, validates
+each new hop using the cached policy, and imports only the deltas of generations
+newer than its recorded import progress. If the floor lacks that state (a
+format 1 floor written by an earlier release), it traverses to genesis, MUST
+reach the pinned manifest ID, and then rewrites the floor in the current
+format. Import progress is local cache state, not an authorization source. The
+floor's cached manifest and policy are the trusted validation anchor and MUST
+be updated atomically with its ID and generation.
 
 After importing the required deltas, the client MUST verify that every current
 ref resolves to a complete local Git object graph before moving remote-tracking
@@ -633,9 +645,10 @@ Unreachable losing objects require later GC.
 ## 11. Continuity and invitations
 
 Each machine pins, per repository root, the root, manifest ID and generation,
-and policy generation (section 9). The policy ID is not stored separately:
-the pinned manifest ID binds it through the manifest's sealed header. The
-floor advances after any successful validation or publication on the machine.
+policy generation, and the authenticated manifest and policy needed to resume
+validation (section 9). The pinned manifest ID binds the cached policy through
+the manifest's sealed header. The floor advances after manifest-chain
+authentication or publication, even if a later pack import fails.
 It rejects rollback, a non-descendant manifest, policy rollback/sideways
 movement, root substitution, and generation gaps. Floor updates are serialized
 and monotonic across concurrent processes.
@@ -673,8 +686,8 @@ least `max(N, 4)`.
 Large-content storage is `sum(pack ciphertext sizes)`, independent of `N`.
 Envelope metadata is linear in the padded reader count per generation and
 accumulates as approximately `O(generations * P * G)`. A membership transition
-also carries the signed policy history inside its encrypted body. Fresh clone
-work is linear in manifest generations until checkpoint compaction exists.
+also carries the signed policy history inside its encrypted body. Full
+bootstrap work is linear in manifest generations.
 
 ## 13. Security limits
 

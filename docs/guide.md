@@ -322,13 +322,24 @@ your local remote-tracking refs.
   Later operations reuse its objects and fetch only new carrier objects.
   `GIT_REMOTE_E2EE_CACHE_DIR` overrides the cache parent directory.
 - Normal manifest traversal stops after 64 MiB of encrypted manifest data or
-  1,000,000 estimated cryptographic operations. A repository with a longer
-  legitimate history cannot be opened by this version.
+  1,000,000 estimated cryptographic operations. Returning devices use their
+  authenticated local floor as a validation anchor. For a fresh checkout with
+  a longer legitimate history, run `git-e2ee bootstrap origin --force-full-check`
+  inside an initialized Git repository with its key configured or passed as
+  `--key`. This verifies and imports the full history; it does not skip
+  cryptographic validation. Time and memory use grow with history length.
+- A device upgraded from a release whose floor did not cache its authenticated
+  manifest and policy authenticates the chain from genesis once, checks that
+  it reaches the pinned head, and rewrites the floor. If that walk exceeds the
+  normal limits, run `bootstrap --force-full-check` on that device.
 - Tree-tag connectivity checks stop after 256 distinct tree roots or 4,000,000
   expanded entries per operation. Tree tags require Git 2.36 or newer.
 - Recovery discovery has fixed limits of 2,048 carrier commits, 256 distinct
   heads, 64 MiB of manifest data, and 1,000,000 estimated cryptographic
-  operations. It fails closed if any limit is exhausted.
+  operations. It fails closed if any limit is exhausted. These limits cover
+  each walk back to genesis, so recovery cannot examine a history longer than
+  the normal traversal limits. Fetch, push, and `verify` on a device with a
+  floor are not affected.
 - Shallow and partial clones are not supported. Pushing from a shallow
   repository is refused before anything is published; run
   `git fetch --unshallow` first. A fresh clone downloads and verifies the

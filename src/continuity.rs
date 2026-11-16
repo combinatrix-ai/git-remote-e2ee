@@ -12,7 +12,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::manifest::Manifest;
 
-const FLOOR_FORMAT: u32 = 1;
+const FLOOR_FORMAT: u32 = 2;
+/// Written by releases before the floor cached its authenticated anchor. Such
+/// a floor still pins the head, so the next operation authenticates the chain
+/// from genesis, checks that it reaches the pinned head, and rewrites the floor
+/// in the current format.
+const ANCHORLESS_FLOOR_FORMAT: u32 = 1;
 
 /// `$XDG_STATE_HOME/git-e2ee`, or `~/.local/state/git-e2ee`. Only binaries
 /// call this; the library takes its state directory explicitly.
@@ -43,16 +48,20 @@ pub(crate) struct ContinuityFloor {
     pub head_id: String,
     pub generation: u64,
     pub policy_generation: u64,
+    pub anchor_manifest: Option<Manifest>,
+    pub anchor_policy: Option<Vec<u8>>,
 }
 
 impl ContinuityFloor {
-    pub fn at(head_id: &str, manifest: &Manifest) -> Self {
+    pub fn at(head_id: &str, manifest: &Manifest, policy: Vec<u8>) -> Self {
         Self {
             format_version: FLOOR_FORMAT,
             repository_root: manifest.repository_root.clone(),
             head_id: head_id.to_owned(),
             generation: manifest.generation,
             policy_generation: manifest.policy_generation,
+            anchor_manifest: Some(manifest.clone()),
+            anchor_policy: Some(policy),
         }
     }
 }
@@ -102,6 +111,9 @@ impl FloorGuard {
         let floor: Option<ContinuityFloor> = read_json(&self.path)?;
         if let Some(floor) = &floor
             && floor.format_version != FLOOR_FORMAT
+            && !(floor.format_version == ANCHORLESS_FLOOR_FORMAT
+                && floor.anchor_manifest.is_none()
+                && floor.anchor_policy.is_none())
         {
             bail!(
                 "unsupported continuity floor format {}",
@@ -488,6 +500,8 @@ pub(crate) fn testing_write_floor(
         head_id: head_id.to_owned(),
         generation,
         policy_generation: 1,
+        anchor_manifest: None,
+        anchor_policy: None,
     })?;
     Ok(guard.path.clone())
 }

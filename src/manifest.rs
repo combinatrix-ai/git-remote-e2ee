@@ -46,7 +46,7 @@ pub enum EnvelopeAuditEntry {
     Dummy,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
     pub format_version: u32,
     pub repository_root: String,

@@ -113,6 +113,167 @@ struct FixedHistoryStorage {
     manifests: BTreeMap<String, Vec<u8>>,
 }
 
+#[derive(Clone)]
+struct CountingManifestStorage {
+    inner: FilesystemStorage,
+    reads: Arc<AtomicUsize>,
+}
+
+impl Storage for CountingManifestStorage {
+    fn begin_object(&self, kind: ObjectKind) -> Result<Box<dyn ObjectStage>> {
+        self.inner.begin_object(kind)
+    }
+
+    fn open_object(&self, kind: ObjectKind, id: &str) -> Result<Box<dyn Read + Send>> {
+        if matches!(kind, ObjectKind::Manifest) {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.open_object(kind, id)
+    }
+
+    fn read_head(&self) -> Result<Option<String>> {
+        self.inner.read_head()
+    }
+
+    fn compare_and_swap_head(&self, expected: Option<&str>, next: &str) -> Result<()> {
+        self.inner.compare_and_swap_head(expected, next)
+    }
+}
+
+#[test]
+fn returning_client_authenticates_only_the_new_manifest_segment() {
+    let temporary = tempfile::tempdir().unwrap();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let owner = KeyFile::generate();
+    let repository = EncryptedRepository::new(
+        CountingManifestStorage {
+            inner: FilesystemStorage::new(temporary.path().join("storage")),
+            reads: reads.clone(),
+        },
+        owner.clone(),
+        temporary.path().join("state"),
+    );
+    repository.initialize("owner").unwrap();
+    let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
+    repository
+        .add_device(
+            reader.public_device().unwrap(),
+            "reader",
+            DeviceRoles::reader(),
+        )
+        .unwrap();
+    reads.store(0, Ordering::SeqCst);
+    repository.list_devices().unwrap();
+    assert_eq!(reads.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn import_after_list_reads_only_the_unimported_generations() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let destination = temporary.path().join("destination");
+    initialize_git(&source);
+    initialize_git(&destination);
+    let owner = KeyFile::generate();
+    let storage = temporary.path().join("storage");
+    let writer = EncryptedRepository::new(
+        FilesystemStorage::new(&storage),
+        owner.clone(),
+        temporary.path().join("writer-state"),
+    );
+    writer.initialize("owner").unwrap();
+    let push = |value: &str| {
+        commit(&source, value, value.trim());
+        writer
+            .push_ref(
+                &GitRepository::open(&source).unwrap(),
+                "refs/heads/main",
+                RefChange::Update {
+                    source: "refs/heads/main",
+                    force: false,
+                },
+            )
+            .unwrap();
+    };
+    push("one\n");
+    let reads = Arc::new(AtomicUsize::new(0));
+    let reader = EncryptedRepository::new(
+        CountingManifestStorage {
+            inner: FilesystemStorage::new(&storage),
+            reads: reads.clone(),
+        },
+        owner,
+        temporary.path().join("reader-state"),
+    );
+    let checkout = GitRepository::open(&destination).unwrap();
+    reader.fetch_into(&checkout, "e2ee").unwrap();
+    push("two\n");
+    push("three\n");
+
+    // The helper's `list` moves the machine floor to the newest head before
+    // Git asks for the packs.
+    reader.observe_manifest(&checkout).unwrap();
+    reads.store(0, Ordering::SeqCst);
+    let latest = reader.import_packs(&checkout).unwrap();
+    assert_eq!(latest.generation, 3);
+    // The anchored head, then the one unimported predecessor: no genesis walk.
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
+    reader.fetch_into(&checkout, "e2ee").unwrap();
+    assert_eq!(
+        git(&destination, &["show", "refs/remotes/e2ee/main:note.md"]),
+        "three"
+    );
+}
+
+#[test]
+fn anchorless_floor_from_an_earlier_release_is_checked_and_upgraded() {
+    let temporary = tempfile::tempdir().unwrap();
+    let state = temporary.path().join("state");
+    let owner = KeyFile::generate();
+    let repository = EncryptedRepository::new(
+        FilesystemStorage::new(temporary.path().join("storage")),
+        owner.clone(),
+        &state,
+    );
+    let genesis = repository.initialize("owner").unwrap();
+    let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
+    repository
+        .add_device(
+            reader.public_device().unwrap(),
+            "reader",
+            DeviceRoles::reader(),
+        )
+        .unwrap();
+    let floor_path = state.join(&owner.repository_root).join("continuity.json");
+    let current: serde_json::Value =
+        serde_json::from_slice(&fs::read(&floor_path).unwrap()).unwrap();
+    let write_v1 = |head_id: &serde_json::Value, generation: &serde_json::Value| {
+        let v1 = serde_json::json!({
+            "format_version": 1,
+            "repository_root": current["repository_root"],
+            "head_id": head_id,
+            "generation": generation,
+            "policy_generation": current["policy_generation"],
+        });
+        fs::write(&floor_path, serde_json::to_vec(&v1).unwrap()).unwrap();
+    };
+
+    write_v1(&current["head_id"], &current["generation"]);
+    repository.list_devices().unwrap();
+    let upgraded: serde_json::Value =
+        serde_json::from_slice(&fs::read(&floor_path).unwrap()).unwrap();
+    assert_eq!(upgraded["format_version"], 2);
+    assert_eq!(upgraded["head_id"], current["head_id"]);
+    assert!(upgraded["anchor_manifest"].is_object());
+    assert!(upgraded["anchor_policy"].is_array());
+
+    // A v1 floor that pins a head storage no longer reaches is still a fork.
+    write_v1(&serde_json::json!("f".repeat(64)), &current["generation"]);
+    assert!(repository.list_devices().is_err());
+    write_v1(&serde_json::json!(genesis), &serde_json::json!(0));
+    repository.list_devices().unwrap();
+}
+
 impl Storage for FixedHistoryStorage {
     fn begin_object(&self, kind: ObjectKind) -> Result<Box<dyn ObjectStage>> {
         self.inner.begin_object(kind)

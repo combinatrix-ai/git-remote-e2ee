@@ -95,10 +95,20 @@ pub struct PolicyState {
     pub id: String,
     pub body: PolicyBody,
     exact_body: Vec<u8>,
+    exact_object: Vec<u8>,
     signatures: Vec<PolicySignature>,
 }
 
 impl PolicyState {
+    /// Preserve the exact signed policy body when caching an authenticated
+    /// chain anchor in the local continuity floor.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        if object_id(&self.exact_object) != self.id {
+            bail!("cached policy serialization changed its content ID")
+        }
+        Ok(self.exact_object.clone())
+    }
+
     pub fn genesis(key: &KeyFile, owner_label: &str) -> Result<(Self, Vec<u8>)> {
         let public = key.public_device()?;
         let body = PolicyBody {
@@ -156,6 +166,7 @@ impl PolicyState {
             id: object_id(&bytes),
             body,
             exact_body,
+            exact_object: bytes.clone(),
             signatures: vec![signature],
         };
         Ok((state, bytes))
@@ -199,6 +210,7 @@ impl PolicyState {
             id: object_id(bytes),
             body,
             exact_body,
+            exact_object: bytes.to_vec(),
             signatures: object.signatures,
         })
     }

@@ -119,6 +119,48 @@ fn init_inside_a_repository_creates_a_key_and_adds_origin() {
 }
 
 #[test]
+fn explicit_full_bootstrap_imports_and_connects_a_fresh_checkout() {
+    let sandbox = Sandbox::new();
+    let source = sandbox.repository("source");
+    success(&sandbox.e2ee(&source, &["init", "e2ee::dir:../storage"]));
+    sandbox.git(&source, &["push", "-q", "origin", "main"]);
+    let tip = sandbox.git(&source, &["rev-parse", "HEAD"]);
+    let key = sandbox.keys().pop().unwrap();
+
+    let destination = sandbox.path().join("destination");
+    fs::create_dir_all(&destination).unwrap();
+    sandbox.git(&destination, &["init", "-q", "-b", "main"]);
+    sandbox.git(
+        &destination,
+        &["remote", "add", "origin", "e2ee::dir:../storage"],
+    );
+    let key_arg = key.to_string_lossy().into_owned();
+    let missing_opt_in = sandbox.e2ee(&destination, &["bootstrap", "origin", "--key", &key_arg]);
+    assert!(!missing_opt_in.status.success());
+    assert!(String::from_utf8_lossy(&missing_opt_in.stderr).contains("--force-full-check"));
+
+    let result = success(&sandbox.e2ee(
+        &destination,
+        &[
+            "bootstrap",
+            "origin",
+            "--key",
+            &key_arg,
+            "--force-full-check",
+        ],
+    ));
+    assert!(result.contains("bootstrapped generation 1"), "{result}");
+    assert_eq!(
+        sandbox.git(&destination, &["rev-parse", "refs/remotes/origin/main"]),
+        tip
+    );
+    sandbox.git(
+        &destination,
+        &["fsck", "--no-reflogs", "--connectivity-only"],
+    );
+}
+
+#[test]
 fn init_refuses_an_existing_remote_before_creating_anything() {
     let sandbox = Sandbox::new();
     let repo = sandbox.repository("notes");

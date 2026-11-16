@@ -212,6 +212,12 @@ impl Checkout {
     }
 }
 
+/// One manifest's pack descriptors and the generation key that opens them.
+struct PackInventoryEntry {
+    manifest: Manifest,
+    generation_key: SecretKey,
+}
+
 #[derive(Clone)]
 struct OpenedState {
     id: String,
@@ -268,15 +274,31 @@ pub struct PushOutcome {
 struct RecoveryBudget {
     crypto_operations: u64,
     bytes_read: u64,
+    full_check: bool,
 }
 
 impl RecoveryBudget {
+    fn bounded() -> Self {
+        Self {
+            crypto_operations: 0,
+            bytes_read: 0,
+            full_check: false,
+        }
+    }
+
+    fn full_check() -> Self {
+        Self {
+            full_check: true,
+            ..Self::bounded()
+        }
+    }
+
     fn charge_bytes(&mut self, byte_count: u64) -> Result<()> {
         self.bytes_read = self
             .bytes_read
             .checked_add(byte_count)
             .context("manifest chain byte budget overflow")?;
-        if self.bytes_read > MAX_RECOVERY_BYTES {
+        if !self.full_check && self.bytes_read > MAX_RECOVERY_BYTES {
             bail!(BudgetExhausted(
                 "manifest chain byte budget exhausted".to_owned()
             ))
@@ -293,7 +315,7 @@ impl RecoveryBudget {
             .crypto_operations
             .checked_add(operations)
             .context("manifest chain crypto budget overflow")?;
-        if self.crypto_operations > MAX_RECOVERY_CRYPTO_OPERATIONS {
+        if !self.full_check && self.crypto_operations > MAX_RECOVERY_CRYPTO_OPERATIONS {
             bail!(BudgetExhausted(
                 "manifest chain cryptographic-operation budget exhausted".to_owned()
             ))
@@ -346,18 +368,26 @@ impl<S: Storage> EncryptedRepository<S> {
     /// floor is refreshed once before the failure counts as a rollback.
     fn pinned_chain(&self, floor: &FloorGuard) -> Result<Vec<OpenedState>> {
         let pinned = floor.read()?;
-        let chain = self.current_chain()?;
+        let chain = match self.current_chain_from_floor(pinned.as_ref()) {
+            Ok(chain) => chain,
+            Err(error) if !self.storage.refresh()? => return Err(error),
+            Err(_) => self.current_chain_from_floor(pinned.as_ref())?,
+        };
         let chain = match validate_pinned_head(&chain, pinned.as_ref()) {
             Ok(()) => chain,
             Err(error) if !self.storage.refresh()? => return Err(error),
             Err(_) => {
-                let chain = self.current_chain()?;
+                let chain = self.current_chain_from_floor(pinned.as_ref())?;
                 validate_pinned_head(&chain, pinned.as_ref())?;
                 chain
             }
         };
         let head = chain.first().context("manifest chain is empty")?;
-        floor.advance(ContinuityFloor::at(&head.id, &head.manifest))?;
+        floor.advance(ContinuityFloor::at(
+            &head.id,
+            &head.manifest,
+            head.policy.to_bytes()?,
+        ))?;
         Ok(chain)
     }
 
@@ -378,7 +408,11 @@ impl<S: Storage> EncryptedRepository<S> {
                 }
             })?;
         floor
-            .advance(ContinuityFloor::at(&id, &genesis))
+            .advance(ContinuityFloor::at(
+                &id,
+                &genesis,
+                genesis.introduced_policy.clone().expect("genesis policy"),
+            ))
             .map_err(|error| InitializeError::AfterPublication {
                 id: id.clone(),
                 error,
@@ -487,7 +521,11 @@ impl<S: Storage> EncryptedRepository<S> {
             ManifestAuthorization::PolicyTransition,
             next.clone(),
         )?;
-        floor.advance(ContinuityFloor::at(&manifest_id, &next))?;
+        floor.advance(ContinuityFloor::at(
+            &manifest_id,
+            &next,
+            next_policy.to_bytes()?,
+        ))?;
         Ok((manifest_id, next_policy.id))
     }
 
@@ -673,7 +711,11 @@ impl<S: Storage> EncryptedRepository<S> {
             ManifestAuthorization::Writer,
             next.clone(),
         )?;
-        floor.advance(ContinuityFloor::at(&next_id, &next))?;
+        floor.advance(ContinuityFloor::at(
+            &next_id,
+            &next,
+            current.policy.to_bytes()?,
+        ))?;
         let checkout = self.open_checkout(repo)?;
         let mut progress = checkout.read()?;
         if progress.verified_refs == current.manifest.refs && git::has_complete_object_graph(repo) {
@@ -702,6 +744,44 @@ impl<S: Storage> EncryptedRepository<S> {
             }
         }
         Ok(manifest)
+    }
+
+    /// Explicit first-use recovery for a legitimate chain beyond the normal
+    /// cumulative traversal budget. It still authenticates every manifest,
+    /// imports every pack, and checks the complete advertised Git graphs.
+    /// The machine floor advances after chain authentication; remote refs move
+    /// only after every required pack and Git graph check succeeds.
+    pub fn bootstrap_into(&self, repo: &GitRepository, remote_name: &str) -> Result<Manifest> {
+        repo.ensure_no_promisor()?;
+        let floor = self.lock_floor()?;
+        let checkout = self.open_checkout(repo)?;
+        let chain = self.current_chain_full()?;
+        validate_pinned_head(&chain, floor.read()?.as_ref())?;
+        let current = chain.first().context("manifest chain is empty")?;
+        floor.advance(ContinuityFloor::at(
+            &current.id,
+            &current.manifest,
+            current.policy.to_bytes()?,
+        ))?;
+        self.import_chain_packs(repo, &self.pack_inventory(&chain, None)?)?;
+        git::ensure_refs_connected_since(repo, &current.manifest.refs, &BTreeMap::new())?;
+        checkout.write(CheckoutProgress {
+            format_version: CHECKOUT_PROGRESS_FORMAT,
+            imported_generation: Some(current.manifest.generation),
+            verified_refs: current.manifest.refs.clone(),
+        })?;
+        for (reference, object) in &current.manifest.refs {
+            match git::InnerRefKind::of(reference)? {
+                git::InnerRefKind::Branch => {
+                    let short = reference.strip_prefix("refs/heads/").unwrap();
+                    git::update_ref(repo, &format!("refs/remotes/{remote_name}/{short}"), object)?;
+                }
+                git::InnerRefKind::Tag => {
+                    git::create_tag_if_absent_or_matching(repo, reference, object)?;
+                }
+            }
+        }
+        Ok(current.manifest.clone())
     }
 
     pub fn observe_manifest(&self, repo: &GitRepository) -> Result<Manifest> {
@@ -735,7 +815,12 @@ impl<S: Storage> EncryptedRepository<S> {
         let chain = self.pinned_chain(&floor)?;
         let current = chain.first().context("manifest chain is empty")?;
         let progress = checkout.read()?;
-        self.import_chain_packs(repo, &chain, progress.imported_generation)?;
+        // The floor may already stand past this checkout's import progress,
+        // for example after the helper's `list` observed newer generations.
+        self.import_chain_packs(
+            repo,
+            &self.pack_inventory(&chain, progress.imported_generation)?,
+        )?;
         let connectivity_timer = trace::Span::new("inner_ref_connectivity_check");
         if git::ensure_refs_connected_since(repo, &current.manifest.refs, &progress.verified_refs)
             .is_err()
@@ -744,7 +829,7 @@ impl<S: Storage> EncryptedRepository<S> {
             // are still local: deleting a remote-tracking ref and pruning
             // removes them. Re-import the whole authenticated chain and check
             // the full graph; recorded progress is unchanged until that passes.
-            self.import_chain_packs(repo, &chain, None)?;
+            self.import_chain_packs(repo, &self.pack_inventory(&chain, None)?)?;
             git::ensure_refs_connected_since(repo, &current.manifest.refs, &BTreeMap::new())?;
         }
         drop(connectivity_timer);
@@ -756,19 +841,71 @@ impl<S: Storage> EncryptedRepository<S> {
         Ok(current.manifest.clone())
     }
 
-    /// Imports, oldest first, the packs of every chain entry newer than
-    /// `after_generation`. Chain authentication already rejects a pack ID
-    /// that repeats anywhere in the chain.
+    /// Returns, newest first, the pack inventory of every generation newer
+    /// than `after_generation`. Entries come from the authenticated `chain`
+    /// and, where it stops short, from the manifests its oldest entry reaches
+    /// through `previous` links. Those links are content IDs inside manifests
+    /// this machine already authenticated, and each predecessor key must match
+    /// its header's commitment, so storage cannot substitute history. The walk
+    /// follows the real chain only, so it needs no cumulative budget.
+    fn pack_inventory(
+        &self,
+        chain: &[OpenedState],
+        after_generation: Option<u64>,
+    ) -> Result<Vec<PackInventoryEntry>> {
+        let needed = |generation: u64| after_generation.is_none_or(|after| generation > after);
+        let mut entries: Vec<PackInventoryEntry> = chain
+            .iter()
+            .filter(|entry| needed(entry.manifest.generation))
+            .map(|entry| PackInventoryEntry {
+                manifest: entry.manifest.clone(),
+                generation_key: entry.generation_key.clone(),
+            })
+            .collect();
+        let oldest = chain.last().context("manifest chain is empty")?;
+        let mut manifest = oldest.manifest.clone();
+        let mut generation_key = oldest.generation_key.clone();
+        let mut budget = RecoveryBudget::full_check();
+        while let Some(previous_id) = manifest.previous.clone() {
+            if !needed(manifest.generation - 1) {
+                break;
+            }
+            let (_, encrypted, header) = self.read_manifest_material(&previous_id, &mut budget)?;
+            let parent_key = unwrap_predecessor_key(&generation_key, &manifest, &header)?;
+            let opened = open_manifest(&encrypted, &parent_key)?;
+            if opened.header != header
+                || opened.manifest.repository_root != manifest.repository_root
+                || opened.manifest.generation + 1 != manifest.generation
+            {
+                bail!(
+                    "historical manifest {previous_id} does not precede its authenticated successor"
+                )
+            }
+            manifest = opened.manifest;
+            generation_key = parent_key;
+            entries.push(PackInventoryEntry {
+                manifest: manifest.clone(),
+                generation_key: generation_key.clone(),
+            });
+        }
+        let mut seen = HashSet::new();
+        for entry in &entries {
+            for pack in &entry.manifest.new_packs {
+                if !seen.insert(pack.id.as_str()) {
+                    bail!("manifest chain repeats pack {}", pack.id)
+                }
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Imports the packs of `inventory`, oldest first.
     fn import_chain_packs(
         &self,
         repo: &GitRepository,
-        chain: &[OpenedState],
-        after_generation: Option<u64>,
+        inventory: &[PackInventoryEntry],
     ) -> Result<()> {
-        for entry in chain.iter().rev() {
-            if after_generation.is_some_and(|generation| entry.manifest.generation <= generation) {
-                continue;
-            }
+        for entry in inventory.iter().rev() {
             for descriptor in &entry.manifest.new_packs {
                 let decrypt_timer = trace::Span::new("pack_decrypt_to_index_pack");
                 self.import_chain_pack(repo, entry, descriptor)?;
@@ -783,7 +920,7 @@ impl<S: Storage> EncryptedRepository<S> {
     /// can say whether the plaintext is a valid pack.
     fn open_chain_pack(
         &self,
-        entry: &OpenedState,
+        entry: &PackInventoryEntry,
         descriptor: &PackDescriptor,
         plaintext: impl io::Write,
     ) -> Result<()> {
@@ -803,7 +940,7 @@ impl<S: Storage> EncryptedRepository<S> {
     fn import_chain_pack(
         &self,
         repo: &GitRepository,
-        entry: &OpenedState,
+        entry: &PackInventoryEntry,
         descriptor: &PackDescriptor,
     ) -> Result<()> {
         let expected_size = pack_stream_ciphertext_size(descriptor.plaintext_size)?;
@@ -832,7 +969,7 @@ impl<S: Storage> EncryptedRepository<S> {
     }
 
     fn chain_pack_material(
-        entry: &OpenedState,
+        entry: &PackInventoryEntry,
         descriptor: &PackDescriptor,
     ) -> Result<(SecretKey, Vec<u8>)> {
         let pack_key = derive_subkey(
@@ -860,7 +997,7 @@ impl<S: Storage> EncryptedRepository<S> {
         let chain = self.pinned_chain(&floor)?;
         let current = chain.first().context("manifest chain is empty")?;
         let mut count = 0_u64;
-        for entry in chain.iter().rev() {
+        for entry in self.pack_inventory(&chain, None)?.iter().rev() {
             for descriptor in &entry.manifest.new_packs {
                 self.open_chain_pack(entry, descriptor, io::sink())?;
                 count += 1;
@@ -919,10 +1056,7 @@ impl<S: Storage> EncryptedRepository<S> {
             }
         };
         report.head_id = observation.head_id.clone();
-        let mut budget = RecoveryBudget {
-            crypto_operations: 0,
-            bytes_read: 0,
-        };
+        let mut budget = RecoveryBudget::bounded();
         let current_chain = match observation.head_id.as_deref() {
             Some(head) => self.chain_from(
                 head,
@@ -945,7 +1079,11 @@ impl<S: Storage> EncryptedRepository<S> {
                     match validate_pinned_head(&chain, local_floor.as_ref()) {
                         Ok(()) => {
                             let head = chain.first().context("manifest chain is empty")?;
-                            floor_guard.advance(ContinuityFloor::at(&head.id, &head.manifest))?;
+                            floor_guard.advance(ContinuityFloor::at(
+                                &head.id,
+                                &head.manifest,
+                                head.policy.to_bytes()?,
+                            ))?;
                             report.floor_id = Some(head.id.clone());
                             report.floor_generation = Some(head.manifest.generation);
                             match self.check_chain_ciphertext_presence(&chain) {
@@ -1372,7 +1510,11 @@ impl<S: Storage> EncryptedRepository<S> {
             ManifestAuthorization::Writer,
             next.clone(),
         )?;
-        floor_guard.advance(ContinuityFloor::at(&recovered_id, &next))?;
+        floor_guard.advance(ContinuityFloor::at(
+            &recovered_id,
+            &next,
+            base_state.policy.to_bytes()?,
+        ))?;
         report.published_manifest = Some(recovered_id);
         report.blocked_reason = None;
         Ok(report)
@@ -1419,11 +1561,7 @@ impl<S: Storage> EncryptedRepository<S> {
         }
         let scratch = GitRepository::owned_git_dir(temporary.path());
         scratch.ensure_no_promisor()?;
-        for entry in chain.iter().rev() {
-            for descriptor in &entry.manifest.new_packs {
-                self.import_chain_pack(&scratch, entry, descriptor)?;
-            }
-        }
+        self.import_chain_packs(&scratch, &self.pack_inventory(chain, None)?)?;
         let refs = &chain
             .first()
             .context("selected recovery chain is empty")?
@@ -1466,15 +1604,56 @@ impl<S: Storage> EncryptedRepository<S> {
     }
 
     fn current_chain(&self) -> Result<Vec<OpenedState>> {
+        self.current_chain_with_budget(RecoveryBudget::bounded())
+    }
+
+    fn current_chain_from_floor(
+        &self,
+        floor: Option<&ContinuityFloor>,
+    ) -> Result<Vec<OpenedState>> {
+        let Some(floor) = floor else {
+            return self.current_chain();
+        };
+        let (manifest, policy_bytes) = match (&floor.anchor_manifest, &floor.anchor_policy) {
+            (Some(manifest), Some(policy)) => (manifest, policy),
+            // An anchorless floor from an earlier release still pins its
+            // head; the caller checks that the genesis walk reaches it.
+            (None, None) => return self.current_chain(),
+            _ => bail!("continuity floor caches only part of its authenticated anchor"),
+        };
+        let policy = PolicyState::parse(policy_bytes)?;
+        if manifest.repository_root != floor.repository_root
+            || manifest.generation != floor.generation
+            || manifest.policy_generation != floor.policy_generation
+            || manifest.policy_id != policy.id
+            || policy.body.repository_root != floor.repository_root
+            || policy.body.generation != floor.policy_generation
+        {
+            bail!("cached continuity anchor does not match its floor")
+        }
+        let head = self
+            .storage
+            .read_head()?
+            .context("encrypted repository is not initialized")?;
+        let mut budget = RecoveryBudget::bounded();
+        self.chain_from_anchor(
+            &head,
+            &mut |id, budget| self.read_manifest_material(id, budget),
+            &mut budget,
+            Some((&floor.head_id, manifest, &policy)),
+        )
+    }
+
+    fn current_chain_full(&self) -> Result<Vec<OpenedState>> {
+        self.current_chain_with_budget(RecoveryBudget::full_check())
+    }
+
+    fn current_chain_with_budget(&self, mut budget: RecoveryBudget) -> Result<Vec<OpenedState>> {
         let _timer = trace::Span::new("manifest_chain_authentication");
         let head = self
             .storage
             .read_head()?
             .context("encrypted repository is not initialized")?;
-        let mut budget = RecoveryBudget {
-            crypto_operations: 0,
-            bytes_read: 0,
-        };
         self.chain_from(
             &head,
             &mut |id, budget| self.read_manifest_material(id, budget),
@@ -1491,6 +1670,19 @@ impl<S: Storage> EncryptedRepository<S> {
     where
         F: FnMut(&str, &mut RecoveryBudget) -> Result<(String, Vec<u8>, ManifestHeader)>,
     {
+        self.chain_from_anchor(head, read_material, budget, None)
+    }
+
+    fn chain_from_anchor<F>(
+        &self,
+        head: &str,
+        read_material: &mut F,
+        budget: &mut RecoveryBudget,
+        anchor: Option<(&str, &Manifest, &PolicyState)>,
+    ) -> Result<Vec<OpenedState>>
+    where
+        F: FnMut(&str, &mut RecoveryBudget) -> Result<(String, Vec<u8>, ManifestHeader)>,
+    {
         let (mut id, mut encrypted, mut header) = read_material(head, budget)?;
         budget.charge_crypto(&header)?;
         let mut generation_key = unwrap_generation_key(&header, &self.key)?;
@@ -1503,6 +1695,38 @@ impl<S: Storage> EncryptedRepository<S> {
                 return Err(proven_invalid(anyhow::anyhow!(
                     "manifest chain contains a cycle"
                 )));
+            }
+            if let Some((anchor_id, anchor_manifest, anchor_policy)) = anchor
+                && id == anchor_id
+            {
+                if opened.manifest != *anchor_manifest {
+                    return Err(proven_invalid(anyhow::anyhow!(
+                        "continuity anchor content does not match the pinned manifest"
+                    )));
+                }
+                let seed = OpenedState {
+                    id,
+                    manifest: opened.manifest,
+                    header: opened.header,
+                    policy: anchor_policy.clone(),
+                    generation_key,
+                    verified_signer: opened.claimed_signer_id,
+                };
+                return self
+                    .verify_opened_chain_from(unverified, Some(seed))
+                    .map_err(proven_invalid);
+            }
+            if let Some((_, anchor_manifest, _)) = anchor {
+                if opened.manifest.generation < anchor_manifest.generation {
+                    bail!(
+                        "remote manifest rolled back from generation {} to {}",
+                        anchor_manifest.generation,
+                        opened.manifest.generation
+                    )
+                }
+                if opened.manifest.generation == anchor_manifest.generation {
+                    bail!("remote manifest history forked from the locally pinned head")
+                }
             }
             let Some(previous_id) = opened.manifest.previous.clone() else {
                 if opened.manifest.generation != 0 {
@@ -1530,19 +1754,26 @@ impl<S: Storage> EncryptedRepository<S> {
                 )));
             }
         }
-        self.verify_opened_chain(unverified).map_err(proven_invalid)
+        self.verify_opened_chain_from(unverified, None)
+            .map_err(proven_invalid)
     }
 
     /// Authenticates opened manifests oldest first against their policies and
     /// checks that their refs are ones Git can take literally.
     /// Every failure here is a property of authenticated bytes.
-    fn verify_opened_chain(
+    fn verify_opened_chain_from(
         &self,
         unverified: Vec<(String, OpenedManifest, SecretKey)>,
+        anchor: Option<OpenedState>,
     ) -> Result<Vec<OpenedState>> {
-        let mut chain_oldest_first: Vec<OpenedState> = Vec::with_capacity(unverified.len());
+        let mut chain_oldest_first: Vec<OpenedState> =
+            Vec::with_capacity(unverified.len() + usize::from(anchor.is_some()));
         let mut seen_pack_ids = HashSet::new();
-        for (index, (id, opened, generation_key)) in unverified.into_iter().rev().enumerate() {
+        if let Some(anchor) = anchor {
+            seen_pack_ids.extend(anchor.manifest.new_packs.iter().map(|pack| pack.id.clone()));
+            chain_oldest_first.push(anchor);
+        }
+        for (id, opened, generation_key) in unverified.into_iter().rev() {
             let manifest = &opened.manifest;
             git::validate_inner_refs(&manifest.refs)?;
             for pack in &manifest.new_packs {
@@ -1550,7 +1781,7 @@ impl<S: Storage> EncryptedRepository<S> {
                     bail!("manifest chain repeats pack {}", pack.id)
                 }
             }
-            let (policy, parent_policy) = if index == 0 {
+            let (policy, parent_policy) = if chain_oldest_first.is_empty() {
                 let policy_bytes = manifest
                     .introduced_policy
                     .as_deref()
@@ -1613,8 +1844,12 @@ impl<S: Storage> EncryptedRepository<S> {
         let mut bytes = Vec::new();
         let mut buffer = [0_u8; 64 * 1024];
         loop {
-            let remaining = MAX_RECOVERY_BYTES - budget.bytes_read;
-            let limit = buffer.len().min(remaining.saturating_add(1) as usize);
+            let limit = if budget.full_check {
+                buffer.len()
+            } else {
+                let remaining = MAX_RECOVERY_BYTES.saturating_sub(budget.bytes_read);
+                buffer.len().min(remaining.saturating_add(1) as usize)
+            };
             let read = reader.read(&mut buffer[..limit])?;
             if read == 0 {
                 break;
@@ -1993,6 +2228,7 @@ mod tests {
         let mut budget = RecoveryBudget {
             crypto_operations: 0,
             bytes_read: 0,
+            full_check: false,
         };
         let id = "0".repeat(64);
         let error = repository
@@ -2009,6 +2245,18 @@ mod tests {
     }
 
     #[test]
+    fn explicit_full_check_counts_work_without_enforcing_normal_cumulative_limits() {
+        let mut bounded = RecoveryBudget::bounded();
+        bounded.bytes_read = MAX_RECOVERY_BYTES;
+        assert!(bounded.charge_bytes(1).unwrap_err().is::<BudgetExhausted>());
+
+        let mut full = RecoveryBudget::full_check();
+        full.bytes_read = MAX_RECOVERY_BYTES;
+        full.charge_bytes(1).unwrap();
+        assert_eq!(full.bytes_read, MAX_RECOVERY_BYTES + 1);
+    }
+
+    #[test]
     fn oversized_manifest_read_charges_the_limit_byte() {
         let temporary = tempfile::tempdir().unwrap();
         let repository = EncryptedRepository::new(
@@ -2021,6 +2269,7 @@ mod tests {
         let mut budget = RecoveryBudget {
             crypto_operations: 0,
             bytes_read: 0,
+            full_check: false,
         };
         let error = repository
             .read_manifest_material(&"0".repeat(64), &mut budget)
@@ -2042,6 +2291,7 @@ mod tests {
         let mut budget = RecoveryBudget {
             crypto_operations: 0,
             bytes_read: MAX_RECOVERY_BYTES - 3,
+            full_check: false,
         };
         let error = repository
             .read_manifest_material(&"0".repeat(64), &mut budget)

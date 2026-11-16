@@ -82,6 +82,21 @@ enum Command {
         #[arg(long)]
         key: Option<PathBuf>,
     },
+    /// Explicitly authenticate and import a complete history beyond normal traversal limits
+    Bootstrap {
+        target: String,
+        #[arg(long)]
+        key: Option<PathBuf>,
+        /// Git repository to populate; defaults to the current repository
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Remote-tracking ref name when TARGET is a URL
+        #[arg(long, default_value = "origin")]
+        name: String,
+        /// Permit the full manifest chain to exceed normal cumulative limits
+        #[arg(long)]
+        force_full_check: bool,
+    },
     DeviceAdd {
         target: String,
         /// Public device file from `git-e2ee device-export`
@@ -330,6 +345,34 @@ fn run() -> Result<()> {
                 manifest.generation,
                 manifest.refs.len(),
                 manifest.total_pack_count
+            );
+        }
+        Command::Bootstrap {
+            target,
+            key,
+            repo,
+            name,
+            force_full_check,
+        } => {
+            if !force_full_check {
+                bail!("bootstrap requires --force-full-check")
+            }
+            let local = GitRepository::resolve(repo.as_deref())?
+                .context("bootstrap needs a Git repository; run it inside one or pass --repo")?;
+            let remote_name = if target.starts_with("e2ee::") || target.contains(['/', ':']) {
+                name.as_str()
+            } else {
+                target.as_str()
+            };
+            let target = Target::resolve(&target, key, Some(&local))?;
+            let manifest = with_repository!(&target, |repository| repository
+                .bootstrap_into(&local, remote_name)?);
+            println!(
+                "bootstrapped generation {} ({} refs, {} packs) into {}",
+                manifest.generation,
+                manifest.refs.len(),
+                manifest.total_pack_count,
+                safe_diagnostic(remote_name)
             );
         }
         Command::DeviceAdd {
