@@ -19,6 +19,7 @@ rounds=${BENCH_ROUNDS:-5}
 work=$(mktemp -d "${TMPDIR:-/tmp}/e2ee-cold-fetch.XXXXXX")
 trap 'rm -rf -- "$work"' EXIT
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+unset GIT_REMOTE_E2EE_CACHE_DIR
 export XDG_STATE_HOME="$work/setup-state" XDG_CACHE_HOME="$work/setup-cache"
 git init --bare -q "$work/carrier.git"
 "$bin_dir/git-e2ee" keygen --output "$work/key.json" >/dev/null
@@ -35,7 +36,7 @@ for ((generation = 1; generation <= generations; generation++)); do
   PATH="$bin_dir:$PATH" git -C "$work/source" push -q origin HEAD:refs/heads/main
 done
 expected=$(git -C "$work/source" rev-parse HEAD)
-printf 'run\twall_seconds\tmanifest_ms\tref_id\n'
+printf 'run\twall_seconds\tmanifest_total_ms\tref_id\n'
 for ((run = 1; run <= rounds; run++)); do
   git init -q "$work/fresh-$run"
   git -C "$work/fresh-$run" remote add origin "e2ee::file://$work/carrier.git"
@@ -47,7 +48,12 @@ for ((run = 1; run <= rounds; run++)); do
   actual=$(git -C "$work/fresh-$run" rev-parse refs/remotes/origin/main)
   [[ $actual == "$expected" ]] || { echo "wrong fetched ref" >&2; exit 1; }
   git -C "$work/fresh-$run" fsck --no-reflogs --unreachable >/dev/null 2>"$work/fsck-$run"
-  manifest_ms=$(sed -n 's/.*phase=manifest_chain_authentication elapsed_ms=\([0-9]*\).*/\1/p' "$work/trace-$run" | tail -1)
+  manifest_ms=$(awk '/phase=manifest_chain_authentication elapsed_ms=/ {
+    sub(/.*elapsed_ms=/, "")
+    sub(/[^0-9].*/, "")
+    total += $0
+    found = 1
+  } END { if (found) print total }' "$work/trace-$run")
   [[ -n $manifest_ms ]] || { echo "missing manifest trace" >&2; exit 1; }
   wall=$(awk -v start="$started" -v end="$ended" 'BEGIN {printf "%.3f", end-start}')
   printf '%s\t%s\t%s\t%s\n' "$run" "$wall" "$manifest_ms" "$actual"

@@ -2878,4 +2878,60 @@ mod tests {
             "git ls-tree failing on an unreadable commit must not read as an absent copy"
         );
     }
+
+    #[test]
+    fn cached_carrier_listings_preserve_valid_malformed_and_absent_results() {
+        let checkout = tempfile::tempdir().unwrap();
+        checkout_git(checkout.path(), &["init", "--quiet"]);
+        let id = "ab".repeat(32);
+        let manifest = checkout.path().join(format!("manifests/ab/{id}/00000000"));
+        let pack = checkout.path().join(format!("packs/ab/{id}/00000001"));
+        fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        fs::create_dir_all(pack.parent().unwrap()).unwrap();
+        fs::write(manifest, b"manifest").unwrap();
+        fs::write(pack, b"pack").unwrap();
+        checkout_git(checkout.path(), &["add", "manifests", "packs"]);
+        let tree = checkout_git(checkout.path(), &["write-tree"]);
+        let commit = checkout_git(
+            checkout.path(),
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@invalid",
+                "commit-tree",
+                "-m",
+                "carrier",
+                &tree,
+            ],
+        );
+        let storage = GitStorage {
+            checkout,
+            location: "unused".to_owned(),
+            remote: "unused".to_owned(),
+            branch: "main".to_owned(),
+            format_4_branch: false,
+            state: Mutex::new(GitStorageState {
+                base_commit: Some(commit.clone()),
+            }),
+            manifest_listings: Mutex::new(None),
+            pack_listings: Mutex::new(None),
+        };
+        assert!(matches!(
+            storage.chunk_entries_at(&commit, ObjectKind::Manifest, &id).unwrap(),
+            CarrierListing::Chunks(chunks) if chunks.len() == 1
+        ));
+        assert!(matches!(
+            storage
+                .chunk_entries_at(&commit, ObjectKind::Pack, &id)
+                .unwrap(),
+            CarrierListing::Malformed(_)
+        ));
+        assert!(matches!(
+            storage
+                .chunk_entries_at(&commit, ObjectKind::Pack, &"cd".repeat(32))
+                .unwrap(),
+            CarrierListing::Absent
+        ));
+    }
 }
