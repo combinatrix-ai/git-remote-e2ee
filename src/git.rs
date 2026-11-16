@@ -617,30 +617,51 @@ fn resolve_tag_chain(
 
 /// Applies the tree-tag budget that every fresh fetch enforces to the ref set
 /// a push is about to publish, so a writer cannot publish a state that fresh
-/// clones must reject. Refs whose objects this repository lacks cannot be
-/// evaluated here and are left to readers, which check them on fetch.
+/// clones must reject. The budget covers every retained tag, so a push that
+/// adds or moves a tag needs every tag object locally; otherwise it must
+/// fetch first.
 pub fn ensure_publishable_tree_tags(
     repo: &GitRepository,
     objects: &mut Objects<'_>,
-    refs: &BTreeMap<String, String>,
+    current_refs: &BTreeMap<String, String>,
+    next_refs: &BTreeMap<String, String>,
 ) -> Result<()> {
-    ensure_publishable_tree_tags_with_budget(repo, objects, refs, TreeListingBudget::standard())
+    ensure_publishable_tree_tags_with_budget(
+        repo,
+        objects,
+        current_refs,
+        next_refs,
+        TreeListingBudget::standard(),
+    )
 }
 
 fn ensure_publishable_tree_tags_with_budget(
     repo: &GitRepository,
     objects: &mut Objects<'_>,
-    refs: &BTreeMap<String, String>,
+    current_refs: &BTreeMap<String, String>,
+    next_refs: &BTreeMap<String, String>,
     mut budget: TreeListingBudget,
 ) -> Result<()> {
+    let is_tag =
+        |reference: &str| InnerRefKind::of(reference).map(|kind| kind == InnerRefKind::Tag);
+    let mut tag_changed = false;
+    for (reference, object) in next_refs {
+        if is_tag(reference)? && current_refs.get(reference) != Some(object) {
+            tag_changed = true;
+        }
+    }
+    if !tag_changed {
+        return Ok(());
+    }
     let mut checked_trees = HashSet::new();
-    for (reference, object) in refs {
-        if InnerRefKind::of(reference)? != InnerRefKind::Tag || !objects.exists(object)? {
+    for (reference, object) in next_refs {
+        if !is_tag(reference)? {
             continue;
         }
-        let Ok(target) = resolve_tag_chain(objects, reference, object, "published") else {
-            continue;
-        };
+        let target = resolve_tag_chain(objects, reference, object, "published")
+            .with_context(|| {
+                format!("fetch first: tag {reference} is not complete locally, so the tree-tag limit cannot be checked")
+            })?;
         if target.kind == GitObjectType::Tree && checked_trees.insert(target.oid.clone()) {
             ensure_tree_connected(repo, objects, reference, &target.oid, &mut budget)?;
         }
@@ -1009,23 +1030,34 @@ mod tests {
         let empty = make_tree(temporary.path(), "");
         let first = make_tree(temporary.path(), &format!("040000 tree {empty}\ta\n"));
         let second = make_tree(temporary.path(), &format!("040000 tree {empty}\tb\n"));
-        let refs = BTreeMap::from([
+        let current = BTreeMap::from([("refs/tags/first".to_owned(), first.clone())]);
+        let next = BTreeMap::from([
             ("refs/tags/first".to_owned(), first),
             ("refs/tags/second".to_owned(), second),
-            // Another writer's tag this repository never fetched is skipped.
-            ("refs/tags/unknown".to_owned(), "1".repeat(40)),
         ]);
         let repo = GitRepository::open(temporary.path()).unwrap();
         let mut objects = Objects::new(&repo);
-        ensure_publishable_tree_tags(&repo, &mut objects, &refs).unwrap();
+        ensure_publishable_tree_tags(&repo, &mut objects, &current, &next).unwrap();
 
         let budget = TreeListingBudget {
             max_roots: 1,
             ..TreeListingBudget::standard()
         };
-        let error = ensure_publishable_tree_tags_with_budget(&repo, &mut objects, &refs, budget)
-            .unwrap_err();
+        let error =
+            ensure_publishable_tree_tags_with_budget(&repo, &mut objects, &current, &next, budget)
+                .unwrap_err();
         assert!(error.to_string().contains("tree-root limit"), "{error:#}");
+
+        // A retained tag this repository never fetched blocks a tag change...
+        let mut unknown = next.clone();
+        unknown.insert("refs/tags/unknown".to_owned(), "1".repeat(40));
+        let mut retained = current.clone();
+        retained.insert("refs/tags/unknown".to_owned(), "1".repeat(40));
+        let error =
+            ensure_publishable_tree_tags(&repo, &mut objects, &retained, &unknown).unwrap_err();
+        assert!(format!("{error:#}").contains("fetch first"), "{error:#}");
+        // ...but not a push that leaves every tag as it was.
+        ensure_publishable_tree_tags(&repo, &mut objects, &unknown, &unknown).unwrap();
     }
 
     #[test]
