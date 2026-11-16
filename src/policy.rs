@@ -101,7 +101,7 @@ pub struct PolicyState {
 
 impl PolicyState {
     /// Preserve the exact signed policy body when caching an authenticated
-    /// chain anchor locally or embedding it in a checkpoint manifest.
+    /// chain anchor in the local continuity floor.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         if object_id(&self.exact_object) != self.id {
             bail!("cached policy serialization changed its content ID")

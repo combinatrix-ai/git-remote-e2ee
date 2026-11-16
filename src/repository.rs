@@ -553,87 +553,6 @@ impl<S: Storage> EncryptedRepository<S> {
         Ok(())
     }
 
-    /// Publish a signed, self-contained Git pack snapshot while retaining the
-    /// existing manifest ancestry for devices that have not imported it yet.
-    pub fn create_checkpoint(&self, repo: &GitRepository) -> Result<String> {
-        repo.ensure_no_promisor()?;
-        let floor = self.lock_floor()?;
-        let chain = self.current_chain_full()?;
-        validate_pinned_head(&chain, floor.read()?.as_ref())?;
-        let current = chain.first().context("manifest chain is empty")?;
-        self.require_admin(&current.policy)?;
-        git::ensure_refs_connected_since(repo, &current.manifest.refs, &BTreeMap::new())?;
-
-        let generation = current
-            .manifest
-            .generation
-            .checked_add(1)
-            .context("manifest generation overflow")?;
-        let next_key = random_key();
-        let mut new_packs = Vec::new();
-        if !current.manifest.refs.is_empty() {
-            let ordinal = 0;
-            let pack_key = derive_subkey(
-                &next_key,
-                &current.manifest.repository_root,
-                generation,
-                SubkeyKind::Pack,
-                ordinal,
-            )?;
-            let mut source =
-                git::start_incremental_pack(repo, &current.manifest.refs, &BTreeMap::new())?;
-            let mut stage = self.storage.begin_object(ObjectKind::Pack)?;
-            let sealed = seal_pack_stream(
-                &pack_key,
-                &mut source,
-                &mut stage,
-                &pack_aad(&current.manifest.repository_root, generation, ordinal),
-            )?;
-            source.finish()?;
-            stage.finish(&sealed.object_id)?;
-            new_packs.push(PackDescriptor {
-                id: sealed.object_id,
-                plaintext_size: sealed.plaintext_size,
-                generation,
-                ordinal,
-            });
-        }
-        let next = Manifest {
-            format_version: current.manifest.format_version,
-            repository_root: current.manifest.repository_root.clone(),
-            generation,
-            previous: Some(current.id.clone()),
-            policy_id: current.policy.id.clone(),
-            policy_generation: current.policy.body.generation,
-            authorization: ManifestAuthorization::Checkpoint,
-            total_pack_count: current
-                .manifest
-                .total_pack_count
-                .checked_add(new_packs.len() as u64)
-                .context("checkpoint pack count overflow")?,
-            refs: current.manifest.refs.clone(),
-            new_packs,
-            predecessor_key_wrap: Some(wrap_predecessor_key(
-                &next_key,
-                &current.generation_key,
-                &current.manifest.repository_root,
-                generation,
-                &current.id,
-            )?),
-            introduced_policy: Some(current.policy.to_bytes()?),
-        };
-        let id = self.commit_manifest(
-            Some(current),
-            &current.policy,
-            None,
-            &next_key,
-            ManifestAuthorization::Checkpoint,
-            next.clone(),
-        )?;
-        floor.advance(ContinuityFloor::at(&id, &next, current.policy.to_bytes()?))?;
-        Ok(id)
-    }
-
     /// Preflights every change of one helper push batch against the same
     /// pinned head and publishes the accepted ones as at most one successor
     /// generation with at most one pack. An `Err` means no change was checked
@@ -835,85 +754,6 @@ impl<S: Storage> EncryptedRepository<S> {
             current.policy.to_bytes()?,
         ))?;
         self.import_chain_packs(repo, &chain, None)?;
-        git::ensure_refs_connected_since(repo, &current.manifest.refs, &BTreeMap::new())?;
-        checkout.write(CheckoutProgress {
-            format_version: CHECKOUT_PROGRESS_FORMAT,
-            imported_generation: Some(current.manifest.generation),
-            verified_refs: current.manifest.refs.clone(),
-        })?;
-        for (reference, object) in &current.manifest.refs {
-            match git::InnerRefKind::of(reference)? {
-                git::InnerRefKind::Branch => {
-                    let short = reference.strip_prefix("refs/heads/").unwrap();
-                    git::update_ref(repo, &format!("refs/remotes/{remote_name}/{short}"), object)?;
-                }
-                git::InnerRefKind::Tag => {
-                    git::create_tag_if_absent_or_matching(repo, reference, object)?;
-                }
-            }
-        }
-        Ok(current.manifest.clone())
-    }
-
-    /// Start a new checkout from a checkpoint ID delivered through a trusted
-    /// channel. The ID is the trust anchor for all preceding history; storage
-    /// must prove that its current head descends from this exact object.
-    pub fn import_checkpoint_into(
-        &self,
-        repo: &GitRepository,
-        remote_name: &str,
-        expected_id: &str,
-    ) -> Result<Manifest> {
-        repo.ensure_no_promisor()?;
-        let floor = self.lock_floor()?;
-        let prior_floor = floor.read()?;
-        let checkout = self.open_checkout(repo)?;
-        let mut budget = RecoveryBudget::bounded();
-        let (_, encrypted, header) = self.read_manifest_material(expected_id, &mut budget)?;
-        budget.charge_crypto(&header)?;
-        let generation_key = unwrap_generation_key(&header, &self.key)?;
-        let opened = open_manifest(&encrypted, &generation_key)?;
-        let checkpoint = &opened.manifest;
-        if checkpoint.authorization != ManifestAuthorization::Checkpoint {
-            bail!("expected ID does not name a checkpoint")
-        }
-        let policy_bytes = checkpoint
-            .introduced_policy
-            .as_deref()
-            .context("checkpoint is missing its policy snapshot")?;
-        let policy = PolicyState::parse(policy_bytes)?;
-        if checkpoint.repository_root != self.key.repository_root
-            || checkpoint.policy_id != policy.id
-            || checkpoint.policy_generation != policy.body.generation
-            || checkpoint.new_packs.len() != usize::from(!checkpoint.refs.is_empty())
-        {
-            bail!("checkpoint snapshot does not match its repository, policy, or refs")
-        }
-        git::validate_inner_refs(&checkpoint.refs)?;
-        verify_manifest(&opened, &policy, None, &generation_key)?;
-
-        let head = self
-            .storage
-            .read_head()?
-            .context("encrypted repository is not initialized")?;
-        let chain = self.chain_from_anchor(
-            &head,
-            &mut |id, budget| self.read_manifest_material(id, budget),
-            &mut budget,
-            Some((expected_id, checkpoint, &policy)),
-        )?;
-        validate_pinned_head(&chain, prior_floor.as_ref())?;
-        let current = chain.first().context("manifest chain is empty")?;
-        floor.advance(ContinuityFloor::at(
-            &current.id,
-            &current.manifest,
-            current.policy.to_bytes()?,
-        ))?;
-        let before_checkpoint = checkpoint
-            .generation
-            .checked_sub(1)
-            .context("genesis cannot be a checkpoint")?;
-        self.import_chain_packs(repo, &chain, Some(before_checkpoint))?;
         git::ensure_refs_connected_since(repo, &current.manifest.refs, &BTreeMap::new())?;
         checkout.write(CheckoutProgress {
             format_version: CHECKOUT_PROGRESS_FORMAT,
@@ -1719,14 +1559,13 @@ impl<S: Storage> EncryptedRepository<S> {
         let Some(floor) = floor else {
             return self.current_chain();
         };
-        let manifest = floor
-            .anchor_manifest
-            .as_ref()
-            .context("continuity floor is missing its authenticated manifest anchor")?;
-        let policy_bytes = floor
-            .anchor_policy
-            .as_ref()
-            .context("continuity floor is missing its authenticated policy anchor")?;
+        let (manifest, policy_bytes) = match (&floor.anchor_manifest, &floor.anchor_policy) {
+            (Some(manifest), Some(policy)) => (manifest, policy),
+            // An anchorless floor from an earlier release still pins its
+            // head; the caller checks that the genesis walk reaches it.
+            (None, None) => return self.current_chain(),
+            _ => bail!("continuity floor caches only part of its authenticated anchor"),
+        };
         let policy = PolicyState::parse(policy_bytes)?;
         if manifest.repository_root != floor.repository_root
             || manifest.generation != floor.generation
@@ -1916,7 +1755,11 @@ impl<S: Storage> EncryptedRepository<S> {
                         policy.validate_successor(&parent.policy)?;
                         (policy, Some(parent.policy.clone()))
                     }
-                    ManifestAuthorization::Checkpoint => (parent.policy.clone(), None),
+                    ManifestAuthorization::Checkpoint => {
+                        bail!(Unsupported(
+                            "checkpoint transitions are reserved but not implemented".to_owned()
+                        ))
+                    }
                 };
                 manifest.validate_successor(&parent.id, &parent.manifest, &policy)?;
                 (policy, parent_policy)

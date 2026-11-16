@@ -328,13 +328,10 @@ your local remote-tracking refs.
   inside an initialized Git repository with its key configured or passed as
   `--key`. This verifies and imports the full history; it does not skip
   cryptographic validation. Time and memory use grow with history length.
-- An administrator with a complete local Git repository can run
-  `git-e2ee checkpoint create origin`. Share the printed checkpoint ID through
-  a trusted channel. A fresh device can run
-  `git-e2ee checkpoint import origin --expected-id <id>` with its enrolled key
-  configured or passed as `--key`. The ID is the trust anchor for preceding
-  history; do not copy it from the untrusted storage being checked. Older
-  ciphertext and carrier history are retained.
+- A device upgraded from a release whose floor did not cache its authenticated
+  manifest and policy authenticates the chain from genesis once, checks that
+  it reaches the pinned head, and rewrites the floor. If that walk exceeds the
+  normal limits, run `bootstrap --force-full-check` on that device.
 - Tree-tag connectivity checks stop after 256 distinct tree roots or 4,000,000
   expanded entries per operation. Tree tags require Git 2.36 or newer.
 - Recovery discovery has fixed limits of 2,048 carrier commits, 256 distinct

@@ -97,11 +97,6 @@ enum Command {
         #[arg(long)]
         force_full_check: bool,
     },
-    /// Publish or import a signed full-history checkpoint
-    Checkpoint {
-        #[command(subcommand)]
-        action: CheckpointCommand,
-    },
     DeviceAdd {
         target: String,
         /// Public device file from `git-e2ee device-export`
@@ -144,30 +139,6 @@ enum Command {
         discard_newer: bool,
         #[arg(long, requires = "publish")]
         accept_stale_floor: bool,
-    },
-}
-
-#[derive(Subcommand)]
-enum CheckpointCommand {
-    /// Publish a checkpoint from a complete local Git repository
-    Create {
-        target: String,
-        #[arg(long)]
-        key: Option<PathBuf>,
-        #[arg(long)]
-        repo: Option<PathBuf>,
-    },
-    /// Import from a checkpoint ID received through a trusted channel
-    Import {
-        target: String,
-        #[arg(long)]
-        expected_id: String,
-        #[arg(long)]
-        key: Option<PathBuf>,
-        #[arg(long)]
-        repo: Option<PathBuf>,
-        #[arg(long, default_value = "origin")]
-        name: String,
     },
 }
 
@@ -404,42 +375,6 @@ fn run() -> Result<()> {
                 safe_diagnostic(remote_name)
             );
         }
-        Command::Checkpoint { action } => match action {
-            CheckpointCommand::Create { target, key, repo } => {
-                let local = GitRepository::resolve(repo.as_deref())?.context(
-                    "checkpoint create needs a complete Git repository; run it inside one or pass --repo",
-                )?;
-                let target = Target::resolve(&target, key, Some(&local))?;
-                let id = with_repository!(&target, |repository| repository
-                    .create_checkpoint(&local)?);
-                println!("created checkpoint {id}");
-                println!("share this exact ID through a trusted channel before import");
-            }
-            CheckpointCommand::Import {
-                target,
-                expected_id,
-                key,
-                repo,
-                name,
-            } => {
-                let local = GitRepository::resolve(repo.as_deref())?.context(
-                    "checkpoint import needs a Git repository; run it inside one or pass --repo",
-                )?;
-                let remote_name = if target.starts_with("e2ee::") || target.contains(['/', ':']) {
-                    name.as_str()
-                } else {
-                    target.as_str()
-                };
-                let target = Target::resolve(&target, key, Some(&local))?;
-                let manifest = with_repository!(&target, |repository| repository
-                    .import_checkpoint_into(&local, remote_name, &expected_id)?);
-                println!(
-                    "imported checkpoint {expected_id} through generation {} into {}",
-                    manifest.generation,
-                    safe_diagnostic(remote_name)
-                );
-            }
-        },
         Command::DeviceAdd {
             target,
             device,

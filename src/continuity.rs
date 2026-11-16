@@ -13,6 +13,11 @@ use serde::{Deserialize, Serialize};
 use crate::manifest::Manifest;
 
 const FLOOR_FORMAT: u32 = 2;
+/// Written by releases before the floor cached its authenticated anchor. Such
+/// a floor still pins the head, so the next operation authenticates the chain
+/// from genesis, checks that it reaches the pinned head, and rewrites the floor
+/// in the current format.
+const ANCHORLESS_FLOOR_FORMAT: u32 = 1;
 
 /// `$XDG_STATE_HOME/git-e2ee`, or `~/.local/state/git-e2ee`. Only binaries
 /// call this; the library takes its state directory explicitly.
@@ -106,6 +111,9 @@ impl FloorGuard {
         let floor: Option<ContinuityFloor> = read_json(&self.path)?;
         if let Some(floor) = &floor
             && floor.format_version != FLOOR_FORMAT
+            && !(floor.format_version == ANCHORLESS_FLOOR_FORMAT
+                && floor.anchor_manifest.is_none()
+                && floor.anchor_policy.is_none())
         {
             bail!(
                 "unsupported continuity floor format {}",

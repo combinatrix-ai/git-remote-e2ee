@@ -376,11 +376,8 @@ Every successor is exactly one of:
 2. **Policy transition**: selected policy is the direct authorized child of the
    parent's policy; signer is an administrator in the parent policy; refs and
    cumulative pack count are unchanged; the delta contains no packs.
-3. **Checkpoint**: selected policy and refs are unchanged; signer is an active
-   administrator in that policy. The manifest embeds the exact current signed
-   policy and adds one self-contained pack of all objects reachable from the
-   current refs (or no pack if there are no refs). Earlier manifests and packs
-   remain available for clients whose floor predates the checkpoint.
+3. **Checkpoint**: reserved for future compaction and garbage collection.
+   Current implementations MUST reject it as unsupported.
 
 For every successor:
 
@@ -492,20 +489,12 @@ and memory costs grow with history length.
 A returning client whose protected machine floor contains the authenticated
 manifest and policy traverses from `HEAD` to that exact manifest ID, validates
 each new hop using the cached policy, and imports only the deltas of generations
-newer than its recorded import progress. If the floor lacks that state, it
-traverses to genesis. Import progress is local cache state, not an authorization
-source. The floor's cached manifest and policy are the trusted validation
-anchor and MUST be updated atomically with its ID and generation.
-
-A fresh device may instead import a checkpoint whose exact manifest ID was
-obtained through an authenticated channel. It validates that manifest's
-signature under its embedded policy, verifies that storage's current head
-descends from the exact checkpoint ID, imports the checkpoint's full-history
-pack followed by newer deltas, and checks the complete current Git graph.
-The out-of-band ID is the authority for the history before the checkpoint;
-the embedded policy alone does not prove its own ancestry. An old but valid
-checkpoint ID does not prove global freshness. Checkpoint publication does
-not delete old manifests, packs, or carrier Git history.
+newer than its recorded import progress. If the floor lacks that state (a
+format 1 floor written by an earlier release), it traverses to genesis, MUST
+reach the pinned manifest ID, and then rewrites the floor in the current
+format. Import progress is local cache state, not an authorization source. The
+floor's cached manifest and policy are the trusted validation anchor and MUST
+be updated atomically with its ID and generation.
 
 After importing the required deltas, the client MUST verify that every current
 ref resolves to a complete local Git object graph before moving remote-tracking
@@ -659,9 +648,8 @@ It rejects rollback, a non-descendant manifest, policy rollback/sideways
 movement, root substitution, and generation gaps. Floor updates are serialized
 and monotonic across concurrent processes.
 
-A fresh device importing a checkpoint MUST receive its exact checkpoint
-manifest ID through an authenticated channel. A future invitation format may
-add structured provenance and freshness information, for example:
+A fresh device should receive an administrator-authorized invitation checkpoint
+through an authenticated channel containing:
 
 ```text
 repository_root
@@ -694,8 +682,7 @@ Large-content storage is `sum(pack ciphertext sizes)`, independent of `N`.
 Envelope metadata is linear in the padded reader count per generation and
 accumulates as approximately `O(generations * P * G)`. A membership transition
 also carries the signed policy history inside its encrypted body. Full
-bootstrap work is linear in manifest generations. A checkpoint import traverses
-only from the current head to its expected checkpoint ID.
+bootstrap work is linear in manifest generations.
 
 ## 13. Security limits
 
@@ -783,7 +770,7 @@ both and can be reused when the original owner key creates the v7 genesis.
 
 ### 14.4 Planned extensions
 
-1. checkpoint garbage collection and carrier history compaction with explicit authority;
+1. checkpoint/compaction and garbage collection with explicit authority;
 2. M-of-N administrator authorization and recovery;
 3. automatic stale-push retry with explicit merge behavior;
 4. S3 backend with conditional-write compatibility tests;

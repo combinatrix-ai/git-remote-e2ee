@@ -145,16 +145,9 @@ impl Manifest {
                 }
             }
             ManifestAuthorization::Checkpoint => {
-                validate_introduced_policy(self, selected_policy, true)?;
-                if self.policy_id != previous.policy_id
-                    || self.policy_generation != previous.policy_generation
-                    || self.refs != previous.refs
-                    || self.new_packs.len() != usize::from(!self.refs.is_empty())
-                {
-                    bail!(
-                        "checkpoint must preserve policy and refs and carry one full-history pack"
-                    )
-                }
+                bail!(Unsupported(
+                    "checkpoint transitions are reserved but not implemented".to_owned()
+                ))
             }
         }
         Ok(())
@@ -258,7 +251,11 @@ pub fn seal_manifest(
         ManifestAuthorization::PolicyTransition => {
             validate_introduced_policy(&manifest, policy, true)?
         }
-        ManifestAuthorization::Checkpoint => validate_introduced_policy(&manifest, policy, true)?,
+        ManifestAuthorization::Checkpoint => {
+            bail!(Unsupported(
+                "checkpoint transitions are reserved but not implemented".to_owned()
+            ))
+        }
     }
     validate_pack_delta(&manifest)?;
 
@@ -594,10 +591,11 @@ pub fn verify_manifest(
                 .filter(|device| device.active() && device.roles.administrator)
                 .context("policy transition manifest was not signed by a parent administrator")?
         }
-        ManifestAuthorization::Checkpoint => selected_policy
-            .device(&content.signer_device_id)
-            .filter(|device| device.active() && device.roles.administrator)
-            .context("checkpoint was not signed by an active administrator")?,
+        ManifestAuthorization::Checkpoint => {
+            bail!(Unsupported(
+                "checkpoint transitions are reserved but not implemented".to_owned()
+            ))
+        }
     };
     verify_domain(
         &authorizing.public.signing_public_key,
