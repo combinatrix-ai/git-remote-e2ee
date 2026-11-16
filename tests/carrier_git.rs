@@ -2306,6 +2306,150 @@ fn carrier_recovery_refuses_to_skip_a_historical_head_with_missing_objects() {
 }
 
 #[test]
+fn carrier_history_reads_skip_corrupt_copies_for_an_older_valid_one() {
+    let temporary = tempfile::tempdir().unwrap();
+    let _cache = isolated_cache(&temporary);
+    let carrier = temporary.path().join("carrier.git");
+    let source = temporary.path().join("source");
+    init_source(&source, "content");
+
+    let owner = KeyFile::generate();
+    init_carrier(temporary.path(), &carrier, &owner);
+    let repository = EncryptedRepository::new(
+        GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
+        owner.clone(),
+        support::state_dir(),
+    );
+    repository
+        .push_ref(
+            &GitRepository::open(&source).unwrap(),
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
+        .unwrap();
+    let (head_id, head) = repository.current_manifest().unwrap();
+    let pack_id = head.new_packs[0].id.clone();
+    let original = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
+    let manifest_bytes = original.get_object(ObjectKind::Manifest, &head_id).unwrap();
+    let pack_bytes = original.get_object(ObjectKind::Pack, &pack_id).unwrap();
+
+    edit_carrier(
+        &carrier,
+        &temporary.path().join("carrier-edit"),
+        |workdir| {
+            for (directory, id) in [("manifests", &head_id), ("packs", &pack_id)] {
+                let chunk = workdir
+                    .join(directory)
+                    .join(&id[..2])
+                    .join(id)
+                    .join("00000000");
+                fs::write(chunk, b"corrupt copy").unwrap();
+            }
+        },
+    );
+
+    let storage = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
+    assert_ne!(
+        storage.get_object(ObjectKind::Pack, &pack_id).unwrap(),
+        pack_bytes
+    );
+    let history = storage
+        .recovery_history(2048, 64 * 1024 * 1024, 256)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        history.commits[0].head_id.as_deref(),
+        Some(head_id.as_str())
+    );
+    assert_eq!(history.manifests[&head_id], manifest_bytes);
+    assert!(history.manifest_bytes_read > manifest_bytes.len() as u64);
+}
+
+fn report_junk_head_after_later_writer_push(recover_as_owner: bool) {
+    let temporary = tempfile::tempdir().unwrap();
+    let _cache = isolated_cache(&temporary);
+    let carrier = temporary.path().join("carrier.git");
+    let owner_checkout = temporary.path().join("owner");
+    let writer_checkout = temporary.path().join("writer");
+    init_source(&owner_checkout, "owner content");
+    init_source(&writer_checkout, "writer content");
+
+    let owner = KeyFile::generate();
+    let writer = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
+    init_carrier(temporary.path(), &carrier, &owner);
+    let open = |key: &KeyFile| {
+        EncryptedRepository::new(
+            GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
+            key.clone(),
+            support::state_dir(),
+        )
+    };
+    open(&owner)
+        .add_device(
+            writer.public_device().unwrap(),
+            "writer",
+            DeviceRoles::collaborator(),
+        )
+        .unwrap();
+    open(&writer)
+        .push_ref(
+            &GitRepository::open(&writer_checkout).unwrap(),
+            "refs/heads/main",
+            RefChange::Update {
+                source: "refs/heads/main",
+                force: false,
+            },
+        )
+        .unwrap();
+    open(&owner)
+        .fetch_into(&GitRepository::open(&owner_checkout).unwrap(), "origin")
+        .unwrap();
+    let (floor_id, _) = open(&owner).current_manifest().unwrap();
+
+    edit_carrier(
+        &carrier,
+        &temporary.path().join("carrier-edit"),
+        |workdir| {
+            fs::write(workdir.join("HEAD"), "junk\n").unwrap();
+        },
+    );
+
+    let (key, checkout) = if recover_as_owner {
+        (&owner, &owner_checkout)
+    } else {
+        (&writer, &writer_checkout)
+    };
+    let report = open(key)
+        .recover(&GitRepository::open(checkout).unwrap())
+        .unwrap();
+    assert_eq!(report.classification, RecoveryClass::Invalid);
+    assert_eq!(report.blocked_reason, None);
+    assert!(
+        report
+            .candidates
+            .iter()
+            .any(|candidate| candidate.manifest_id == floor_id),
+        "{report:?}"
+    );
+    // Heads that predate the writer's enrollment are recognized as replays
+    // of the floor chain without opening their envelopes.
+    assert_eq!(report.replays.len(), 2, "{:?}", report.replays);
+}
+
+#[test]
+fn carrier_recovery_reports_for_the_owner() {
+    report_junk_head_after_later_writer_push(true);
+}
+
+#[test]
+fn carrier_recovery_reports_for_a_writer_added_after_genesis() {
+    report_junk_head_after_later_writer_push(false);
+}
+
+#[test]
 fn library_carrier_open_requires_explicit_trust_for_local_paths() {
     let temporary = tempfile::tempdir().unwrap();
     let _cache = isolated_cache(&temporary);
