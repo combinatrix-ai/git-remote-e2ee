@@ -6,8 +6,9 @@ The model rests on one premise: **remote is untrusted, local is trusted.**
 
 - **Remote** is the storage the repository is pushed to: a Git host used as
   carrier, or the bytes inside a directory used as storage. It may read,
-  withhold, replay, reorder, or alter anything it holds. Everything the client
-  reads from it is verified before use.
+  withhold, replay, reorder, or alter anything it holds. Nothing read from it
+  is accepted as repository state until the cryptographic and continuity
+  checks succeed.
 - **Local** is the machine running the client and what its user controls: the
   device key, the continuity floor and other client state, the carrier cache,
   Git checkouts and configuration, and the filesystem paths the user points
