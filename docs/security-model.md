@@ -1,5 +1,25 @@
 # Security model
 
+## Trust boundary
+
+The model rests on one premise: **remote is untrusted, local is trusted.**
+
+- **Remote** is the storage the repository is pushed to: a Git host used as
+  carrier, or the bytes inside a directory used as storage. It may read,
+  withhold, replay, reorder, or alter anything it holds. Everything the client
+  reads from it is verified before use.
+- **Local** is the machine running the client and what its user controls: the
+  device key, the continuity floor and other client state, the carrier cache,
+  Git checkouts and configuration, and the filesystem paths the user points
+  the client at, including where directory storage lives and any links on
+  that path. The client does not defend against its own machine. If local is
+  compromised or misconfigured, the guarantees below do not hold.
+
+Every entry under [Considered attacks](#considered-attacks) is judged against
+this premise.
+
+## Guarantees
+
 The storage provider is treated as malicious. `git-remote-e2ee` aims to
 guarantee:
 
