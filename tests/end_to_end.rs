@@ -20,8 +20,7 @@ use git_remote_e2ee::manifest::{
 };
 use git_remote_e2ee::policy::{DeviceRoles, PolicyState};
 use git_remote_e2ee::repository::{
-    EncryptedRepository, PushMode, PushRejection, RecoveryClass, RecoveryOptions, RefChange,
-    RefOutcome, RefPush,
+    EncryptedRepository, PushMode, PushRejection, RecoveryClass, RefChange, RefOutcome, RefPush,
 };
 use git_remote_e2ee::storage::{
     CasConflict, FilesystemStorage, ObjectKind, ObjectStage, RecoveryCommit, RecoveryHistory,
@@ -303,19 +302,11 @@ fn manifest_with_header(header: serde_json::Value) -> Vec<u8> {
     .unwrap()
 }
 
-fn publish_recovery<S: Storage>(
+fn recover_report<S: Storage>(
     repository: &EncryptedRepository<S>,
     repo: &Path,
 ) -> Result<git_remote_e2ee::repository::RecoveryReport> {
-    repository.recover(
-        &GitRepository::open(repo).unwrap(),
-        RecoveryOptions {
-            publish: true,
-            base: None,
-            discard_newer: false,
-            accept_stale_floor: true,
-        },
-    )
+    repository.recover(&GitRepository::open(repo).unwrap())
 }
 
 #[test]
@@ -348,7 +339,7 @@ fn recovery_budget_exhaustion_inside_candidate_discovery_is_fatal() {
         support::state_dir(),
     );
 
-    let error = publish_recovery(&recovery, &repo).unwrap_err();
+    let error = recover_report(&recovery, &repo).unwrap_err();
     assert!(
         format!("{error:#}").contains("byte budget exhausted"),
         "{error:#}"
@@ -386,9 +377,8 @@ fn recovery_refuses_to_skip_a_discontinuous_historical_head() {
         support::state_dir(),
     );
 
-    let report = publish_recovery(&recovery, &repo).unwrap();
+    let report = recover_report(&recovery, &repo).unwrap();
     assert_eq!(report.classification, RecoveryClass::Invalid);
-    assert!(report.published_manifest.is_none());
     let blocked = report.blocked_reason.unwrap();
     assert!(
         blocked.contains(&format!(
@@ -425,7 +415,7 @@ fn recover_refuses_a_head_with_a_future_manifest_schema() {
         .compare_and_swap_head(Some(&junk_id), &future_id)
         .unwrap();
 
-    let report = publish_recovery(
+    let report = recover_report(
         &EncryptedRepository::new(storage.clone(), key, support::state_dir()),
         &repo,
     )
@@ -436,7 +426,6 @@ fn recover_refuses_a_head_with_a_future_manifest_schema() {
         "{}",
         report.reason
     );
-    assert!(report.published_manifest.is_none());
     assert_eq!(
         storage.read_head().unwrap().as_deref(),
         Some(future_id.as_str())
@@ -1088,12 +1077,8 @@ fn a_signed_ref_that_is_not_an_object_id_is_rejected_before_git_resolves_it() {
     );
     assert_eq!(machine_floor(&destination)["generation"], 1);
 
-    // The head is proven invalid, so a writer can replace it.
-    let report = publish_recovery(&repository, &destination).unwrap();
+    let report = recover_report(&repository, &destination).unwrap();
     assert_eq!(report.classification, RecoveryClass::Invalid);
-    assert!(report.published_manifest.is_some(), "{report:?}");
-    let recovered = repository.fetch_into(&destination_repo, "e2ee").unwrap();
-    assert_eq!(recovered.refs["refs/heads/main"], published);
 }
 
 #[test]
@@ -1128,15 +1113,7 @@ fn rejected_head_evidence_escapes_controls_from_an_invalid_signed_ref() {
     .unwrap();
 
     let report = repository
-        .recover(
-            &GitRepository::open(&source).unwrap(),
-            RecoveryOptions {
-                publish: false,
-                base: None,
-                discard_newer: false,
-                accept_stale_floor: false,
-            },
-        )
+        .recover(&GitRepository::open(&source).unwrap())
         .unwrap();
     assert_eq!(report.classification, RecoveryClass::Invalid);
     assert!(report.reason.contains("\\u{1b}"), "{}", report.reason);
@@ -1960,15 +1937,7 @@ fn recovery_pins_an_authenticated_revocation_even_when_a_pack_is_missing() {
     writer.revoke_device(&reader.device_id().unwrap()).unwrap();
     let (revocation, manifest) = writer.current_manifest().unwrap();
     let report = valid_observer
-        .recover(
-            &GitRepository::open(&destination).unwrap(),
-            RecoveryOptions {
-                publish: false,
-                base: None,
-                discard_newer: false,
-                accept_stale_floor: false,
-            },
-        )
+        .recover(&GitRepository::open(&destination).unwrap())
         .unwrap();
     assert_eq!(report.classification, RecoveryClass::Valid);
     assert_eq!(report.floor_id.as_deref(), Some(revocation.as_str()));
@@ -1976,15 +1945,7 @@ fn recovery_pins_an_authenticated_revocation_even_when_a_pack_is_missing() {
 
     fs::remove_file(remote.join("packs").join(&pack_id[..2]).join(pack_id)).unwrap();
     let report = missing_observer
-        .recover(
-            &GitRepository::open(&destination).unwrap(),
-            RecoveryOptions {
-                publish: false,
-                base: None,
-                discard_newer: false,
-                accept_stale_floor: false,
-            },
-        )
+        .recover(&GitRepository::open(&destination).unwrap())
         .unwrap();
     assert_eq!(report.classification, RecoveryClass::Unavailable);
     assert_eq!(report.floor_id.as_deref(), Some(revocation.as_str()));
@@ -2000,7 +1961,7 @@ fn recovery_pins_an_authenticated_revocation_even_when_a_pack_is_missing() {
 }
 
 #[test]
-fn recover_replaces_reader_signed_junk_from_the_directory_floor() {
+fn recover_reports_reader_signed_junk_above_the_directory_floor() {
     let temporary = tempfile::tempdir().unwrap();
     let source = temporary.path().join("source");
     let returning = temporary.path().join("returning");
@@ -2087,68 +2048,24 @@ fn recover_replaces_reader_signed_junk_from_the_directory_floor() {
         .unwrap();
 
     let recoverer = EncryptedRepository::new(storage.clone(), owner.clone(), support::state_dir());
-    let blocked = recoverer
-        .recover(
-            &GitRepository::open(&returning).unwrap(),
-            RecoveryOptions {
-                publish: true,
-                base: None,
-                discard_newer: false,
-                accept_stale_floor: false,
-            },
-        )
+    let report = recoverer
+        .recover(&GitRepository::open(&returning).unwrap())
         .unwrap();
-    assert_eq!(blocked.classification, RecoveryClass::Invalid);
-    assert_eq!(blocked.default_base.as_deref(), Some(floor_id.as_str()));
+    assert_eq!(report.classification, RecoveryClass::Invalid);
     assert!(
-        blocked
-            .warning
-            .as_deref()
-            .unwrap()
-            .starts_with("Updates after this floor")
+        report
+            .candidates
+            .iter()
+            .any(|candidate| candidate.manifest_id == floor_id),
+        "{report:?}"
     );
-    assert!(
-        blocked
-            .blocked_reason
-            .as_deref()
-            .unwrap()
-            .contains("--accept-stale-floor")
+    assert_eq!(
+        storage.read_head().unwrap().as_deref(),
+        Some(junk_id.as_str())
     );
     assert_eq!(machine_floor(&returning)["head_id"], floor_id);
-
-    let recovered = recoverer
-        .recover(
-            &GitRepository::open(&returning).unwrap(),
-            RecoveryOptions {
-                publish: true,
-                base: None,
-                discard_newer: false,
-                accept_stale_floor: true,
-            },
-        )
-        .unwrap();
-    let recovered_id = recovered.published_manifest.unwrap();
-    let (current_id, current) = recoverer.current_manifest().unwrap();
-    assert_eq!(current_id, recovered_id);
-    assert_eq!(current.previous.as_deref(), Some(floor_id.as_str()));
-    assert_eq!(current.generation, floor_generation + 1);
-    assert_ne!(current_id, junk_id);
-    assert_eq!(machine_floor(&returning)["head_id"], current_id);
     let rejected = fs::read(state_dir(&returning).join("rejected-heads.json")).unwrap();
     assert!(String::from_utf8_lossy(&rejected).contains(&junk_id));
-
-    recoverer
-        .fetch_into(&GitRepository::open(&returning).unwrap(), "encrypted")
-        .unwrap();
-    recoverer
-        .fetch_into(&GitRepository::open(&fresh).unwrap(), "encrypted")
-        .unwrap();
-    assert_eq!(
-        git(&fresh, &["show", "refs/remotes/encrypted/main:note.md"]),
-        "recovery keeps this content"
-    );
-    assert_eq!(machine_floor(&returning)["head_id"], current_id);
-    assert_eq!(machine_floor(&fresh)["head_id"], current_id);
 }
 
 #[test]
@@ -2185,15 +2102,7 @@ fn recover_refuses_a_revoked_devices_unverifiable_head() {
     let revoked_head = storage.read_head().unwrap().unwrap();
 
     let report = reader_repository
-        .recover(
-            &GitRepository::open(&reader_repo).unwrap(),
-            RecoveryOptions {
-                publish: true,
-                base: None,
-                discard_newer: false,
-                accept_stale_floor: true,
-            },
-        )
+        .recover(&GitRepository::open(&reader_repo).unwrap())
         .unwrap();
     assert_eq!(report.classification, RecoveryClass::Unverifiable);
     assert!(report.blocked_reason.unwrap().contains("forbidden"));
@@ -2246,15 +2155,7 @@ fn recover_refuses_unknown_formats_and_missing_floor_objects() {
         .compare_and_swap_head(Some(&floor_id), &unsupported_id)
         .unwrap();
     let unsupported = EncryptedRepository::new(unknown_storage.clone(), key, support::state_dir())
-        .recover(
-            &GitRepository::open(&unknown_repo).unwrap(),
-            RecoveryOptions {
-                publish: true,
-                base: None,
-                discard_newer: false,
-                accept_stale_floor: true,
-            },
-        )
+        .recover(&GitRepository::open(&unknown_repo).unwrap())
         .unwrap();
     assert_eq!(unsupported.classification, RecoveryClass::Unsupported);
     assert_eq!(
@@ -2300,15 +2201,7 @@ fn recover_refuses_unknown_formats_and_missing_floor_objects() {
     )
     .unwrap();
     let unavailable = missing_repository
-        .recover(
-            &GitRepository::open(&missing_repo).unwrap(),
-            RecoveryOptions {
-                publish: false,
-                base: None,
-                discard_newer: false,
-                accept_stale_floor: false,
-            },
-        )
+        .recover(&GitRepository::open(&missing_repo).unwrap())
         .unwrap();
     assert_eq!(unavailable.classification, RecoveryClass::Unavailable);
     let invalid_bytes = b"invalid successor";
@@ -2321,24 +2214,9 @@ fn recover_refuses_unknown_formats_and_missing_floor_objects() {
         .unwrap();
     let refused =
         EncryptedRepository::new(missing_storage.clone(), missing_key, support::state_dir())
-            .recover(
-                &GitRepository::open(&missing_repo).unwrap(),
-                RecoveryOptions {
-                    publish: true,
-                    base: None,
-                    discard_newer: false,
-                    accept_stale_floor: true,
-                },
-            )
+            .recover(&GitRepository::open(&missing_repo).unwrap())
             .unwrap();
     assert_eq!(refused.classification, RecoveryClass::Invalid);
-    assert!(
-        refused
-            .blocked_reason
-            .as_deref()
-            .unwrap()
-            .contains("ciphertext is unavailable")
-    );
     assert_eq!(
         missing_storage.read_head().unwrap().as_deref(),
         Some(invalid_id.as_str())
@@ -2388,15 +2266,7 @@ fn recover_never_overrides_authenticated_rollback() {
         .unwrap();
 
     let report = repository
-        .recover(
-            &GitRepository::open(&returning).unwrap(),
-            RecoveryOptions {
-                publish: true,
-                base: None,
-                discard_newer: true,
-                accept_stale_floor: true,
-            },
-        )
+        .recover(&GitRepository::open(&returning).unwrap())
         .unwrap();
     assert_eq!(report.classification, RecoveryClass::Discontinuous);
     assert!(report.blocked_reason.unwrap().contains("forbidden"));
@@ -2437,15 +2307,7 @@ fn recovery_discovery_budget_exhaustion_fails_closed() {
         support::state_dir(),
     );
     let error = recovery
-        .recover(
-            &GitRepository::open(&repo).unwrap(),
-            RecoveryOptions {
-                publish: false,
-                base: None,
-                discard_newer: false,
-                accept_stale_floor: false,
-            },
-        )
+        .recover(&GitRepository::open(&repo).unwrap())
         .unwrap_err();
     assert!(format!("{error:#}").contains("outer-commit budget exhausted"));
     assert_eq!(
@@ -2456,7 +2318,7 @@ fn recovery_discovery_budget_exhaustion_fails_closed() {
 }
 
 #[test]
-fn an_oversized_storage_head_is_invalid_and_recoverable_from_the_floor() {
+fn an_oversized_storage_head_is_reported_invalid() {
     let temporary = tempfile::tempdir().unwrap();
     let repo = temporary.path().join("repo");
     let storage_path = temporary.path().join("storage");
@@ -2483,13 +2345,9 @@ fn an_oversized_storage_head_is_invalid_and_recoverable_from_the_floor() {
         "{error:#}"
     );
 
-    let recovered = publish_recovery(&repository, &repo).unwrap();
-    assert_eq!(recovered.classification, RecoveryClass::Invalid);
-    let published = recovered.published_manifest.unwrap();
-    let (current_id, current) = repository.current_manifest().unwrap();
-    assert_eq!(current_id, published);
-    assert_eq!(current.previous.as_deref(), Some(floor.as_str()));
-    assert_eq!(machine_floor(&repo)["head_id"], current_id);
+    let report = recover_report(&repository, &repo).unwrap();
+    assert_eq!(report.classification, RecoveryClass::Invalid);
+    assert_eq!(machine_floor(&repo)["head_id"], floor);
 }
 
 #[test]

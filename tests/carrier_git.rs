@@ -19,9 +19,7 @@ use git_remote_e2ee::manifest::{
     unwrap_generation_key, wrap_predecessor_key,
 };
 use git_remote_e2ee::policy::{DeviceRoles, PolicyState};
-use git_remote_e2ee::repository::{
-    EncryptedRepository, PushRejection, RecoveryClass, RecoveryOptions, RefChange,
-};
+use git_remote_e2ee::repository::{EncryptedRepository, PushRejection, RecoveryClass, RefChange};
 use git_remote_e2ee::storage::{CasConflict, GitStorage, ObjectKind, Storage};
 
 static CACHE_ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -1101,17 +1099,14 @@ fn carrier_git_detects_tampered_ciphertext_chunk() {
 }
 
 #[test]
-fn carrier_recovery_chooses_legitimate_descendant_and_restores_deleted_ciphertext() {
+fn carrier_recovery_reports_legitimate_descendant_and_replayed_floor() {
     let temporary = tempfile::tempdir().unwrap();
     let _cache = isolated_cache(&temporary);
     let carrier = temporary.path().join("carrier.git");
     let source = temporary.path().join("source");
     let returning = temporary.path().join("returning");
-    let fresh = temporary.path().join("fresh");
-    let cache_root = temporary.path().join("carrier-cache");
     init_source(&source, "legitimate descendant content");
     init_source(&returning, "returning local content");
-    init_source(&fresh, "fresh local content");
 
     let owner = KeyFile::generate();
     let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
@@ -1226,18 +1221,9 @@ fn carrier_recovery_chooses_legitimate_descendant_and_restores_deleted_ciphertex
     let recovery_storage = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     let recoverer = EncryptedRepository::new(recovery_storage, owner.clone(), &returning_machine);
     let report = recoverer
-        .recover(
-            &GitRepository::open(&returning).unwrap(),
-            RecoveryOptions {
-                publish: false,
-                base: None,
-                discard_newer: false,
-                accept_stale_floor: false,
-            },
-        )
+        .recover(&GitRepository::open(&returning).unwrap())
         .unwrap();
     assert_eq!(report.classification, RecoveryClass::Invalid);
-    assert_eq!(report.default_base.as_deref(), Some(legitimate_id.as_str()));
     assert!(report.replays.contains(&floor_id));
     assert!(
         report
@@ -1245,81 +1231,6 @@ fn carrier_recovery_chooses_legitimate_descendant_and_restores_deleted_ciphertex
             .iter()
             .any(|candidate| candidate.manifest_id == legitimate_id)
     );
-
-    let older_base = recoverer
-        .recover(
-            &GitRepository::open(&returning).unwrap(),
-            RecoveryOptions {
-                publish: true,
-                base: Some(&floor_id),
-                discard_newer: false,
-                accept_stale_floor: false,
-            },
-        )
-        .unwrap();
-    assert!(
-        older_base
-            .blocked_reason
-            .as_deref()
-            .unwrap()
-            .contains("--discard-newer")
-    );
-
-    let recovered = recoverer
-        .recover(
-            &GitRepository::open(&returning).unwrap(),
-            RecoveryOptions {
-                publish: true,
-                base: None,
-                discard_newer: false,
-                accept_stale_floor: false,
-            },
-        )
-        .unwrap();
-    let recovered_id = recovered.published_manifest.unwrap();
-    let (current_id, manifest) = recoverer.current_manifest().unwrap();
-    assert_eq!(current_id, recovered_id);
-    assert_eq!(manifest.previous.as_deref(), Some(legitimate_id.as_str()));
-    assert_eq!(manifest.generation, floor_generation + 2);
-    assert_eq!(manifest.refs["refs/heads/main"], pushed_object);
-    assert!(
-        GitStorage::open_trusted_local(carrier.to_str().unwrap())
-            .unwrap()
-            .open_object(ObjectKind::Pack, &pack_id)
-            .is_ok()
-    );
-    let recovered_storage = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
-    let recovered_bytes = recovered_storage
-        .get_object(ObjectKind::Manifest, &current_id)
-        .unwrap();
-    let recovered_header = peek_manifest_header(&recovered_bytes).unwrap();
-    assert!(unwrap_generation_key(&recovered_header, &reader).is_err());
-
-    recoverer
-        .fetch_into(&GitRepository::open(&returning).unwrap(), "private")
-        .unwrap();
-    recoverer
-        .fetch_into(&GitRepository::open(&fresh).unwrap(), "private")
-        .unwrap();
-    assert_eq!(
-        git(
-            &fresh,
-            &["show", "refs/remotes/private/main:note.md"],
-            false
-        ),
-        "legitimate descendant content"
-    );
-    let carrier_head = Command::new("git")
-        .arg(format!("--git-dir={}", carrier.display()))
-        .args(["show", "refs/heads/main:HEAD"])
-        .output()
-        .unwrap();
-    assert!(carrier_head.status.success());
-    assert_eq!(
-        String::from_utf8(carrier_head.stdout).unwrap().trim(),
-        current_id
-    );
-    assert!(cache_root.exists());
 }
 
 #[test]
@@ -1429,72 +1340,13 @@ fn carrier_recovery_offers_hidden_legitimate_content_descendant() {
         &returning_machine,
     );
     let report = recoverer
-        .recover(
-            &GitRepository::open(&returning).unwrap(),
-            RecoveryOptions {
-                publish: false,
-                base: None,
-                discard_newer: false,
-                accept_stale_floor: false,
-            },
-        )
+        .recover(&GitRepository::open(&returning).unwrap())
         .unwrap();
     assert_eq!(report.classification, RecoveryClass::Invalid);
-    assert_eq!(report.default_base.as_deref(), Some(legitimate_id.as_str()));
     assert!(report.replays.contains(&floor_id));
     assert!(report.candidates.iter().any(|candidate| {
         candidate.manifest_id == legitimate_id && candidate.generation == legitimate.generation
     }));
-
-    let stale_choice = recoverer
-        .recover(
-            &GitRepository::open(&returning).unwrap(),
-            RecoveryOptions {
-                publish: true,
-                base: Some(&floor_id),
-                discard_newer: false,
-                accept_stale_floor: false,
-            },
-        )
-        .unwrap();
-    assert!(
-        stale_choice
-            .blocked_reason
-            .as_deref()
-            .unwrap()
-            .contains("--discard-newer")
-    );
-
-    let recovered = recoverer
-        .recover(
-            &GitRepository::open(&returning).unwrap(),
-            RecoveryOptions {
-                publish: true,
-                base: None,
-                discard_newer: false,
-                accept_stale_floor: false,
-            },
-        )
-        .unwrap();
-    let recovered_id = recovered.published_manifest.unwrap();
-    let (head, manifest) = recoverer.current_manifest().unwrap();
-    assert_eq!(head, recovered_id);
-    assert_eq!(manifest.previous.as_deref(), Some(legitimate_id.as_str()));
-    assert_eq!(manifest.refs["refs/heads/main"], pushed_object);
-    recoverer
-        .fetch_into(&GitRepository::open(&returning).unwrap(), "private")
-        .unwrap();
-    recoverer
-        .fetch_into(&GitRepository::open(&fresh).unwrap(), "private")
-        .unwrap();
-    assert_eq!(
-        git(
-            &fresh,
-            &["show", "refs/remotes/private/main:note.md"],
-            false
-        ),
-        "legitimate descendant content"
-    );
 }
 
 #[test]
@@ -1606,15 +1458,7 @@ fn carrier_recovery_refuses_history_with_a_merge_hiding_a_legitimate_state() {
         support::state_dir(),
     );
     let error = recoverer
-        .recover(
-            &GitRepository::open(&returning).unwrap(),
-            RecoveryOptions {
-                publish: true,
-                base: None,
-                discard_newer: false,
-                accept_stale_floor: false,
-            },
-        )
+        .recover(&GitRepository::open(&returning).unwrap())
         .unwrap_err();
     assert!(format!("{error:#}").contains("merge commit"), "{error:#}");
     let after = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
@@ -1702,15 +1546,7 @@ fn carrier_recovery_refuses_conflicting_authenticated_descendants() {
 
     let recovery_storage = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
     let report = EncryptedRepository::new(recovery_storage, owner, support::state_dir())
-        .recover(
-            &GitRepository::open(&returning).unwrap(),
-            RecoveryOptions {
-                publish: true,
-                base: None,
-                discard_newer: false,
-                accept_stale_floor: false,
-            },
-        )
+        .recover(&GitRepository::open(&returning).unwrap())
         .unwrap();
     assert_eq!(report.classification, RecoveryClass::Invalid);
     assert!(report.conflict);
@@ -1738,107 +1574,6 @@ fn carrier_recovery_refuses_conflicting_authenticated_descendants() {
         .read_head()
         .unwrap();
     assert_eq!(current.as_deref(), Some(junk.as_str()));
-}
-
-#[test]
-fn carrier_recovery_loses_cas_without_retrying_when_another_writer_publishes() {
-    let temporary = tempfile::tempdir().unwrap();
-    let _cache = isolated_cache(&temporary);
-    let carrier = temporary.path().join("carrier.git");
-    let returning = temporary.path().join("returning");
-    init_source(&returning, "local state");
-    git(
-        temporary.path(),
-        &["init", "--bare", "-q", carrier.to_str().unwrap()],
-        false,
-    );
-
-    let owner = KeyFile::generate();
-    let reader = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
-    let repository = EncryptedRepository::new(
-        GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
-        owner.clone(),
-        support::state_dir(),
-    );
-    repository.initialize("owner").unwrap();
-    let (floor_id, _) = repository
-        .add_device(
-            reader.public_device().unwrap(),
-            "device-5",
-            DeviceRoles::reader(),
-        )
-        .unwrap();
-    repository
-        .fetch_into(&GitRepository::open(&returning).unwrap(), "private")
-        .unwrap();
-    let policy_storage = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
-    let policy_encrypted = policy_storage
-        .get_object(ObjectKind::Manifest, &floor_id)
-        .unwrap();
-    let policy_header = peek_manifest_header(&policy_encrypted).unwrap();
-    let policy_key = unwrap_generation_key(&policy_header, &reader).unwrap();
-    let policy_manifest = open_manifest(&policy_encrypted, &policy_key).unwrap();
-    let policy = PolicyState::parse(
-        policy_manifest
-            .manifest()
-            .introduced_policy
-            .as_deref()
-            .unwrap(),
-    )
-    .unwrap();
-
-    let bad_storage = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
-    let junk = create_reader_signed_junk(&bad_storage, &reader, &policy, &floor_id);
-    bad_storage
-        .compare_and_swap_head(Some(&floor_id), &junk)
-        .unwrap();
-    let stale_storage = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
-    let stale_recoverer =
-        EncryptedRepository::new(stale_storage, owner.clone(), support::state_dir());
-    let offered = stale_recoverer
-        .recover(
-            &GitRepository::open(&returning).unwrap(),
-            RecoveryOptions {
-                publish: false,
-                base: None,
-                discard_newer: false,
-                accept_stale_floor: false,
-            },
-        )
-        .unwrap();
-    assert_eq!(offered.classification, RecoveryClass::Invalid);
-    assert_eq!(offered.default_base.as_deref(), Some(floor_id.as_str()));
-
-    let competing_storage = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
-    let winner = create_writer_successor(
-        &competing_storage,
-        &owner,
-        &policy,
-        &floor_id,
-        BTreeMap::new(),
-    );
-    competing_storage
-        .compare_and_swap_head(Some(&junk), &winner)
-        .unwrap();
-
-    let error = stale_recoverer
-        .recover(
-            &GitRepository::open(&returning).unwrap(),
-            RecoveryOptions {
-                publish: true,
-                base: None,
-                discard_newer: false,
-                accept_stale_floor: false,
-            },
-        )
-        .unwrap_err();
-    assert!(error.to_string().contains("concurrently"));
-    let latest = EncryptedRepository::new(
-        GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
-        owner,
-        support::state_dir(),
-    );
-    assert_eq!(latest.current_manifest().unwrap().0, winner);
 }
 
 fn carrier_refs(carrier: &Path) -> String {
@@ -2471,37 +2206,22 @@ fn carrier_recovery_classifies_missing_head_manifest_as_unavailable() {
         },
     );
 
-    let recover = |publish| {
+    let recover = || {
         EncryptedRepository::new(
             GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
             owner.clone(),
             support::state_dir(),
         )
-        .recover(
-            &GitRepository::open(&returning).unwrap(),
-            RecoveryOptions {
-                publish,
-                base: None,
-                discard_newer: false,
-                accept_stale_floor: false,
-            },
-        )
+        .recover(&GitRepository::open(&returning).unwrap())
         .unwrap()
     };
-    let report = recover(false);
+    let report = recover();
     assert_eq!(
         report.classification,
         RecoveryClass::Unavailable,
         "{}",
         report.reason
     );
-
-    let published = recover(true);
-    assert_eq!(published.classification, RecoveryClass::Unavailable);
-    assert!(published.published_manifest.is_none());
-    assert!(published.blocked_reason.is_some());
-    let carrier_head = git(&carrier, &["show", "refs/heads/main:HEAD"], false);
-    assert_eq!(carrier_head, head_id);
 }
 
 #[test]
@@ -2571,18 +2291,9 @@ fn carrier_recovery_refuses_to_skip_a_historical_head_with_missing_objects() {
         owner.clone(),
         support::state_dir(),
     )
-    .recover(
-        &GitRepository::open(&returning).unwrap(),
-        RecoveryOptions {
-            publish: true,
-            base: None,
-            discard_newer: false,
-            accept_stale_floor: false,
-        },
-    )
+    .recover(&GitRepository::open(&returning).unwrap())
     .unwrap();
     assert_eq!(report.classification, RecoveryClass::Invalid);
-    assert!(report.published_manifest.is_none());
     let blocked = report.blocked_reason.unwrap();
     assert!(
         blocked.contains(&format!(
@@ -2594,243 +2305,6 @@ fn carrier_recovery_refuses_to_skip_a_historical_head_with_missing_objects() {
     assert_eq!(carrier_head, junk_id);
 }
 
-#[test]
-fn carrier_history_reads_skip_corrupt_copies_for_an_older_valid_one() {
-    let temporary = tempfile::tempdir().unwrap();
-    let _cache = isolated_cache(&temporary);
-    let carrier = temporary.path().join("carrier.git");
-    let source = temporary.path().join("source");
-    init_source(&source, "content");
-
-    let owner = KeyFile::generate();
-    init_carrier(temporary.path(), &carrier, &owner);
-    let repository = EncryptedRepository::new(
-        GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
-        owner.clone(),
-        support::state_dir(),
-    );
-    repository
-        .push_ref(
-            &GitRepository::open(&source).unwrap(),
-            "refs/heads/main",
-            RefChange::Update {
-                source: "refs/heads/main",
-                force: false,
-            },
-        )
-        .unwrap();
-    let (head_id, head) = repository.current_manifest().unwrap();
-    let pack_id = head.new_packs[0].id.clone();
-    let original = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
-    let manifest_bytes = original.get_object(ObjectKind::Manifest, &head_id).unwrap();
-    let pack_bytes = original.get_object(ObjectKind::Pack, &pack_id).unwrap();
-
-    edit_carrier(
-        &carrier,
-        &temporary.path().join("carrier-edit"),
-        |workdir| {
-            for (directory, id) in [("manifests", &head_id), ("packs", &pack_id)] {
-                let chunk = workdir
-                    .join(directory)
-                    .join(&id[..2])
-                    .join(id)
-                    .join("00000000");
-                fs::write(chunk, b"corrupt copy").unwrap();
-            }
-        },
-    );
-
-    let storage = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
-    assert_ne!(
-        storage.get_object(ObjectKind::Pack, &pack_id).unwrap(),
-        pack_bytes
-    );
-    let history = storage
-        .recovery_history(2048, 64 * 1024 * 1024, 256)
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        history.commits[0].head_id.as_deref(),
-        Some(head_id.as_str())
-    );
-    assert_eq!(history.manifests[&head_id], manifest_bytes);
-    assert!(history.manifest_bytes_read > manifest_bytes.len() as u64);
-
-    assert!(
-        storage
-            .restore_historical_object(ObjectKind::Pack, &pack_id, u64::MAX)
-            .unwrap()
-    );
-    assert_eq!(
-        storage.get_object(ObjectKind::Pack, &pack_id).unwrap(),
-        pack_bytes
-    );
-    assert!(
-        !storage
-            .restore_historical_object(ObjectKind::Pack, &"0".repeat(64), u64::MAX)
-            .unwrap()
-    );
-}
-
-#[test]
-fn carrier_historical_restore_charges_rejected_copies_against_its_byte_budget() {
-    let temporary = tempfile::tempdir().unwrap();
-    let _cache = isolated_cache(&temporary);
-    let carrier = temporary.path().join("carrier.git");
-    let source = temporary.path().join("source");
-    init_source(&source, "content");
-
-    let owner = KeyFile::generate();
-    init_carrier(temporary.path(), &carrier, &owner);
-    let repository = EncryptedRepository::new(
-        GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
-        owner.clone(),
-        support::state_dir(),
-    );
-    repository
-        .push_ref(
-            &GitRepository::open(&source).unwrap(),
-            "refs/heads/main",
-            RefChange::Update {
-                source: "refs/heads/main",
-                force: false,
-            },
-        )
-        .unwrap();
-    let (_, head) = repository.current_manifest().unwrap();
-    let pack_id = head.new_packs[0].id.clone();
-    let pack_bytes = GitStorage::open_trusted_local(carrier.to_str().unwrap())
-        .unwrap()
-        .get_object(ObjectKind::Pack, &pack_id)
-        .unwrap();
-    let corrupt = b"corrupt copy";
-    edit_carrier(
-        &carrier,
-        &temporary.path().join("carrier-edit"),
-        |workdir| {
-            let chunk = workdir
-                .join("packs")
-                .join(&pack_id[..2])
-                .join(&pack_id)
-                .join("00000000");
-            fs::write(chunk, corrupt).unwrap();
-        },
-    );
-
-    let needed = (corrupt.len() + pack_bytes.len()) as u64;
-    let storage = GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap();
-    let error = storage
-        .restore_historical_object(ObjectKind::Pack, &pack_id, needed - 1)
-        .unwrap_err();
-    assert!(
-        error
-            .downcast_ref::<git_remote_e2ee::error::BudgetExhausted>()
-            .is_some(),
-        "{error:#}"
-    );
-    assert!(
-        storage
-            .restore_historical_object(ObjectKind::Pack, &pack_id, needed)
-            .unwrap()
-    );
-    assert_eq!(
-        storage.get_object(ObjectKind::Pack, &pack_id).unwrap(),
-        pack_bytes
-    );
-}
-
-/// The writer joins after genesis, so the heads that predate it are sealed
-/// to readers it never was. Recovery from a malformed HEAD must still work.
-fn recover_junk_head_after_later_writer_push(recover_as_owner: bool) {
-    let temporary = tempfile::tempdir().unwrap();
-    let _cache = isolated_cache(&temporary);
-    let carrier = temporary.path().join("carrier.git");
-    let owner_checkout = temporary.path().join("owner");
-    let writer_checkout = temporary.path().join("writer");
-    init_source(&owner_checkout, "owner content");
-    init_source(&writer_checkout, "writer content");
-
-    let owner = KeyFile::generate();
-    let writer = KeyFile::generate_for_repository(owner.repository_root.clone()).unwrap();
-    init_carrier(temporary.path(), &carrier, &owner);
-    let open = |key: &KeyFile| {
-        EncryptedRepository::new(
-            GitStorage::open_trusted_local(carrier.to_str().unwrap()).unwrap(),
-            key.clone(),
-            support::state_dir(),
-        )
-    };
-    open(&owner)
-        .add_device(
-            writer.public_device().unwrap(),
-            "writer",
-            DeviceRoles::collaborator(),
-        )
-        .unwrap();
-    open(&writer)
-        .push_ref(
-            &GitRepository::open(&writer_checkout).unwrap(),
-            "refs/heads/main",
-            RefChange::Update {
-                source: "refs/heads/main",
-                force: false,
-            },
-        )
-        .unwrap();
-    open(&owner)
-        .fetch_into(&GitRepository::open(&owner_checkout).unwrap(), "origin")
-        .unwrap();
-    let (floor_id, _) = open(&owner).current_manifest().unwrap();
-
-    edit_carrier(
-        &carrier,
-        &temporary.path().join("carrier-edit"),
-        |workdir| {
-            fs::write(workdir.join("HEAD"), "junk\n").unwrap();
-        },
-    );
-
-    let (key, checkout) = if recover_as_owner {
-        (&owner, &owner_checkout)
-    } else {
-        (&writer, &writer_checkout)
-    };
-    let recover = |publish| {
-        open(key)
-            .recover(
-                &GitRepository::open(checkout).unwrap(),
-                RecoveryOptions {
-                    publish,
-                    base: None,
-                    discard_newer: false,
-                    accept_stale_floor: false,
-                },
-            )
-            .unwrap()
-    };
-    let report = recover(false);
-    assert_eq!(report.classification, RecoveryClass::Invalid);
-    assert_eq!(report.blocked_reason, None);
-    assert_eq!(report.default_base.as_deref(), Some(floor_id.as_str()));
-    assert_eq!(report.replays.len(), 2, "{:?}", report.replays);
-
-    let published = recover(true);
-    assert_eq!(published.blocked_reason, None);
-    let recovered_id = published.published_manifest.unwrap();
-    let (head, manifest) = open(key).current_manifest().unwrap();
-    assert_eq!(head, recovered_id);
-    assert_eq!(manifest.previous.as_deref(), Some(floor_id.as_str()));
-}
-
-#[test]
-fn carrier_recovery_works_for_the_owner() {
-    recover_junk_head_after_later_writer_push(true);
-}
-
-#[test]
-fn carrier_recovery_works_for_a_writer_added_after_genesis() {
-    recover_junk_head_after_later_writer_push(false);
-}
 #[test]
 fn library_carrier_open_requires_explicit_trust_for_local_paths() {
     let temporary = tempfile::tempdir().unwrap();

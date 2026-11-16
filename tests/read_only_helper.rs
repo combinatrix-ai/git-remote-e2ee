@@ -9,7 +9,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use git_remote_e2ee::crypto::KeyFile;
 use git_remote_e2ee::policy::DeviceRoles;
-use git_remote_e2ee::repository::{EncryptedRepository, RecoveryClass, RecoveryOptions};
+use git_remote_e2ee::repository::{EncryptedRepository, RecoveryClass};
 use git_remote_e2ee::storage::{FilesystemStorage, GitStorage, ObjectKind, Storage};
 
 static CACHE_ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -256,7 +256,7 @@ fn read_only_devices_use_both_storage_backends_without_publishing() {
 }
 
 #[test]
-fn read_only_device_cannot_publish_recovery() {
+fn read_only_device_can_read_a_recovery_report() {
     let temporary = tempfile::tempdir().unwrap();
     let storage_path = temporary.path().join("storage");
     let reader_repo = temporary.path().join("reader");
@@ -288,24 +288,9 @@ fn read_only_device_cannot_publish_recovery() {
 
     let read_only = EncryptedRepository::new(storage.clone(), reader, support::state_dir());
     let report = read_only
-        .recover(
-            &GitRepository::open(&reader_repo).unwrap(),
-            RecoveryOptions {
-                publish: true,
-                base: None,
-                discard_newer: false,
-                accept_stale_floor: true,
-            },
-        )
+        .recover(&GitRepository::open(&reader_repo).unwrap())
         .unwrap();
     assert_eq!(report.classification, RecoveryClass::Invalid);
-    assert!(
-        report
-            .blocked_reason
-            .as_deref()
-            .unwrap()
-            .contains("not an active writer")
-    );
     assert_eq!(
         storage.read_head().unwrap().as_deref(),
         Some(invalid_id.as_str())

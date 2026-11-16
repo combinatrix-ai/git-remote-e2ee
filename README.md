@@ -194,9 +194,8 @@ Not on the host. Review happens on a machine that has a key: fetch the branch
 and diff locally, or give a CI runner its own read-only device key.
 
 **What if someone corrupts `HEAD`?**
-Clients refuse it and stop. A writer can then run `git-e2ee recover`, which
-shows what it found and continues from the last verified state, or from a newer
-legitimate state it discovers in the carrier history. See the
+Clients refuse it and stop. `git-e2ee recover` reports what it found without
+changing storage. To resume, push a healthy clone to new storage. See the
 [user guide](docs/guide.md#recover-from-a-broken-head).
 
 ## Status and roadmap
@@ -205,7 +204,7 @@ Working today: clone, fetch, pull, and push, including tags and remote branch
 deletion; the directory and Git-host backends; incremental pushes and fetches
 (the Git-host backend keeps a local cache of the carrier); per-device keys with
 read, write, and admin roles; adding and revoking devices; rollback and race
-detection; and explicit recovery from a corrupted `HEAD`.
+detection; and diagnosis of a corrupted `HEAD`.
 
 Planned: M-of-N administrator approval, key recovery and replacement, automatic
 retry after losing a push race, an S3 conditional-write backend, garbage

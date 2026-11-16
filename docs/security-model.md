@@ -47,3 +47,66 @@ cannot decrypt anything newer. This is key regression, not forward secrecy for
 history already published. See [design.md](design.md) and [spec.md](spec.md)
 for the full threat model, and [SECURITY.md](../SECURITY.md) to report an issue.
 
+
+## Considered attacks
+
+Each entry records an attack that was raised, what it can achieve, and the
+decision taken. "Audit #N" refers to findings of the November 2026 audit.
+
+### Corrupted `HEAD` and recovery publication (audit #28)
+
+A storage writer can point `HEAD` at an invalid manifest, which stops fetches
+and pushes. It cannot forge a state clients accept. Earlier versions offered
+`recover --publish` to continue from the last verified state. If storage had
+hidden a later legitimate state that revoked a device, publishing from the
+older base would hand new keys to that device again, and the directory backend
+has no history in which to look for such a state. Recovery publication was
+removed: `recover` only reports, and service resumes by pushing a healthy
+clone to new storage under the membership the operator chooses then.
+
+### Rollback and forks
+
+A machine with a continuity floor rejects any state older than, or diverging
+from, the newest authenticated head it accepted. A machine without a floor
+cannot tell an old or forked history from the real one; that needs an
+external anchor, which is not implemented yet.
+
+### Long manifest chains
+
+Normal operations stop after a fixed cumulative budget of manifest bytes and
+cryptographic operations. Signatures are checked after the chain to the anchor
+is collected, so lifting the budget lets storage make a client spend time and
+memory proportional to the chain it presents. Returning devices start from
+their floor's cached manifest and stay within the budget. A fresh device whose
+legitimate history exceeds it lifts the budget only through an explicit
+`bootstrap --force-full-check`.
+
+### Planted links in directory storage (audit #23)
+
+Directory storage may live in a shared or synchronized folder, so others can
+replace its subdirectories with symbolic links or swap the folder itself. The
+client could then create files outside the storage directory. Fixed-name files
+(`HEAD`, `FORMAT`, `README.md`) are replaced by rename, which replaces a link
+rather than writing through it; `HEAD.lock` is opened without truncation; other
+files get random or content-hash names and contain ciphertext. The attacker
+cannot choose a name that collides with an existing file or choose its
+content, so the effect is stray files elsewhere. This is accepted, and shared
+folders remain supported.
+
+### Corrupted ciphertext carried forward (audit #13)
+
+A push builds the next carrier commit on top of existing ciphertext without
+re-reading it. If storage altered that ciphertext, the alteration is carried
+forward. Readers check every object against its content ID and authenticated
+encryption, so altered data is detected, never accepted; `verify` checks all of
+it on demand. Re-reading all inherited ciphertext on every push would make
+pushes scale with repository size, so it is not done. The effect is denial of
+service, recovered from the same way as a corrupted `HEAD`.
+
+### Disk exhaustion before authentication (audit #1)
+
+The carrier backend fetches the outer Git branch before it can authenticate
+anything, so a hostile host can send large data and fill the local disk. Plain
+`git fetch` behaves the same way, and Git offers no client-side limit on what
+a fetch receives. This is accepted. Put the cache
+(`GIT_REMOTE_E2EE_CACHE_DIR`) on a volume with a quota if this matters.

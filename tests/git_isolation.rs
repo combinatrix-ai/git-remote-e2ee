@@ -223,7 +223,7 @@ fn helper_ref_listing_rejects_effective_promisor_configuration() {
 }
 
 #[test]
-fn recovery_scratch_repository_ignores_an_inherited_git_dir() {
+fn recover_ignores_an_inherited_git_dir() {
     let sandbox = Sandbox::new();
     let (repo, storage) = sandbox.repository_with_invalid_storage_head();
     let bystander = sandbox.path().join("bystander");
@@ -244,15 +244,13 @@ fn recovery_scratch_repository_ignores_an_inherited_git_dir() {
                     &key,
                     "--repo",
                     &repo.to_string_lossy(),
-                    "--publish",
-                    "--accept-stale-floor",
                 ],
             )
             .env("GIT_DIR", &bystander_git)
             .output()
             .unwrap(),
     );
-    assert!(report.contains("published recovery manifest"), "{report}");
+    assert!(report.contains("storage head: invalid"), "{report}");
     assert_eq!(
         object_files(&bystander_git),
         before,
